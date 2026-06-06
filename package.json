@@ -1,0 +1,21 @@
+{
+  "name": "babelqueue-node-adapters",
+  "private": true,
+  "description": "BabelQueue Node.js framework adapters (BullMQ, NestJS) — npm workspaces.",
+  "license": "MIT",
+  "workspaces": [
+    "packages/bullmq",
+    "packages/nestjs"
+  ],
+  "scripts": {
+    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs",
+    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs",
+    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsup": "^8",
+    "tsx": "^4",
+    "typescript": "^5.5"
+  }
+}

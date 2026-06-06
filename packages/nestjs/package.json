@@ -1,0 +1,58 @@
+{
+  "name": "@babelqueue/nestjs",
+  "version": "0.1.0",
+  "description": "NestJS adapter for BabelQueue — a module + injectable publisher over BullMQ.",
+  "keywords": ["babelqueue", "nestjs", "bullmq", "queue", "polyglot", "messaging"],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node-adapters.git",
+    "directory": "packages/nestjs"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@babelqueue/bullmq": "^0.1.0",
+    "@babelqueue/core": "^0.1.0"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^10.0.0 || ^11.0.0",
+    "bullmq": "^5.0.0"
+  },
+  "devDependencies": {
+    "@nestjs/common": "^11.0.0",
+    "bullmq": "^5.34.0",
+    "reflect-metadata": "^0.2.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

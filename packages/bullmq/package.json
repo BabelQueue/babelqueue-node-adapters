@@ -1,0 +1,55 @@
+{
+  "name": "@babelqueue/bullmq",
+  "version": "0.1.0",
+  "description": "BullMQ adapter for BabelQueue — canonical-envelope jobs and a URN-routed processor.",
+  "keywords": ["babelqueue", "bullmq", "queue", "polyglot", "redis", "messaging"],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node-adapters.git",
+    "directory": "packages/bullmq"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@babelqueue/core": "^0.1.0"
+  },
+  "peerDependencies": {
+    "bullmq": "^5.0.0"
+  },
+  "devDependencies": {
+    "bullmq": "^5.34.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
