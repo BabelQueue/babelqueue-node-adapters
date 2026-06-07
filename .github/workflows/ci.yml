@@ -57,6 +57,10 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      # Build first: the nestjs tests import the built @babelqueue/bullmq workspace
+      # package (now linked locally via the ^1.0.0 dependency), so its dist/ must exist.
+      - name: Build
+        run: npm run build
       - name: Coverage
         run: npm run coverage
 
