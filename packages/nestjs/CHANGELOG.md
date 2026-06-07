@@ -6,6 +6,12 @@ All notable changes to `@babelqueue/nestjs` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
+**1.0.0 — the public API is now SemVer-stable** (breaking changes require a MAJOR).
+Now requires `@babelqueue/core ^1.0.0`; the wire envelope is unchanged
+(`schema_version: 1`).
+
 ## [0.1.0] - 2026-06-06
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/nestjs",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "NestJS adapter for BabelQueue — a module + injectable publisher over BullMQ.",
   "keywords": ["babelqueue", "nestjs", "bullmq", "queue", "polyglot", "messaging"],
   "homepage": "https://babelqueue.com",
@@ -41,7 +41,7 @@
   },
   "dependencies": {
     "@babelqueue/bullmq": "^0.1.0",
-    "@babelqueue/core": "^0.1.0"
+    "@babelqueue/core": "^1.0.0"
   },
   "peerDependencies": {
     "@nestjs/common": "^10.0.0 || ^11.0.0",
