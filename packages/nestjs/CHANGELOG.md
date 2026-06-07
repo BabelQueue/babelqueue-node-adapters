@@ -6,6 +6,15 @@ All notable changes to `@babelqueue/nestjs` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-06-07
+
+### Fixed
+- Depend on `@babelqueue/bullmq ^1.0.0` (was `^0.1.0`). The `1.0.0` release bumped
+  the `@babelqueue/core` constraint but left the sibling `@babelqueue/bullmq`
+  constraint at `^0.1.0`, so a fresh `npm install @babelqueue/nestjs` resolved the
+  old `0.1.0` BullMQ adapter (and core `0.1.0`) instead of the `1.x` line. No API
+  or behavior change; the wire envelope is unchanged (`schema_version: 1`).
+
 ## [1.0.0] - 2026-06-07
 
 **1.0.0 — the public API is now SemVer-stable** (breaking changes require a MAJOR).

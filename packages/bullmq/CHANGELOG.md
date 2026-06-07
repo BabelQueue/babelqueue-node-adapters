@@ -6,6 +6,13 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-06-07
+
+### Changed
+- Version-aligned republish in lockstep with `@babelqueue/nestjs 1.0.1` (which
+  corrects its dependency on this package). No API or behavior change; the wire
+  envelope is unchanged (`schema_version: 1`).
+
 ## [1.0.0] - 2026-06-07
 
 **1.0.0 — the public API is now SemVer-stable** (breaking changes require a MAJOR).

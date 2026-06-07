@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/bullmq",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "BullMQ adapter for BabelQueue — canonical-envelope jobs and a URN-routed processor.",
   "keywords": ["babelqueue", "bullmq", "queue", "polyglot", "redis", "messaging"],
   "homepage": "https://babelqueue.com",
