@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { EnvelopeCodec } from "@babelqueue/core";
 import { SqsConsumer, toMessageAttributes, type SqsApi, type SqsMessage } from "../src/index.js";
 
 // The vendored canonical suite (synced from conformance/). The `sqs` block locks the
 // §3 attribute projection + the attempts = ApproximateReceiveCount − 1 reconciliation.
-const dir = join(import.meta.dirname, "conformance");
+// Resolve via import.meta.url (not import.meta.dirname, which is Node 20.11+) so the
+// suite stays on the supported Node 18+ floor.
+const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const sqs = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).sqs as SqsBlock;
 
 interface GoldenAttr {
