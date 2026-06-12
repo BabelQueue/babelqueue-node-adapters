@@ -36,6 +36,12 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # @babelqueue/sqs has no workspace dependents, so publish order is free.
+      - name: Publish @babelqueue/sqs
+        run: npm publish -w @babelqueue/sqs --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

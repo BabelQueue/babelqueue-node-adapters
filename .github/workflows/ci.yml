@@ -64,10 +64,25 @@ jobs:
       - name: Coverage
         run: npm run coverage
 
+  conformance:
+    name: Conformance suite in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify vendored conformance matches the canonical suite
+        # Only @babelqueue/sqs vendors the conformance suite (for its SQS binding
+        # tests); guard its copy against drift from the canonical source.
+        run: |
+          git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/sqs/test/conformance/manifest.json"
+          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/sqs/test/conformance/fixtures"
+          diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/sqs/test/conformance/schema"
+          echo "Vendored conformance is in sync with the canonical suite."
+
   ci-green:
     name: CI green
     runs-on: ubuntu-latest
-    needs: [test, lint, coverage]
+    needs: [test, lint, coverage, conformance]
     if: ${{ always() }}
     steps:
       - name: Fail if any required job did not pass
