@@ -1,0 +1,57 @@
+{
+  "name": "@babelqueue/redis",
+  "version": "1.0.0",
+  "description": "Redis adapter for BabelQueue — a canonical-envelope publisher and a URN-routed consumer over the §1 reliable-queue pattern (RPUSH / BRPOPLPUSH-reserve / LREM-ack) on ioredis.",
+  "keywords": ["babelqueue", "redis", "ioredis", "queue", "polyglot", "messaging"],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node-adapters.git",
+    "directory": "packages/redis"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@babelqueue/core": "^1.0.0"
+  },
+  "peerDependencies": {
+    "ioredis": "^5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ioredis": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -70,11 +70,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Verify vendored conformance matches the canonical suite
-        # @babelqueue/sqs, @babelqueue/azure-service-bus, @babelqueue/pulsar, @babelqueue/kafka and
-        # @babelqueue/artemis each vendor the conformance suite (for their binding tests); guard every copy against drift.
+        # @babelqueue/sqs, @babelqueue/azure-service-bus, @babelqueue/pulsar, @babelqueue/kafka,
+        # @babelqueue/artemis, @babelqueue/redis and @babelqueue/rabbitmq each vendor the conformance
+        # suite (for their binding tests); guard every copy against drift.
         run: |
           git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          for pkg in sqs azure-service-bus pulsar kafka artemis; do
+          for pkg in sqs azure-service-bus pulsar kafka artemis redis rabbitmq; do
             diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/$pkg/test/conformance/manifest.json"
             diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/$pkg/test/conformance/fixtures"
             diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/$pkg/test/conformance/schema"

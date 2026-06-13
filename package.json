@@ -11,13 +11,15 @@
     "packages/azure-service-bus",
     "packages/pulsar",
     "packages/kafka",
-    "packages/artemis"
+    "packages/artemis",
+    "packages/redis",
+    "packages/rabbitmq"
   ],
   "scripts": {
-    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs && npm run build -w @babelqueue/azure-service-bus && npm run build -w @babelqueue/pulsar && npm run build -w @babelqueue/kafka && npm run build -w @babelqueue/artemis",
-    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs && npm run typecheck -w @babelqueue/azure-service-bus && npm run typecheck -w @babelqueue/pulsar && npm run typecheck -w @babelqueue/kafka && npm run typecheck -w @babelqueue/artemis",
+    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs && npm run build -w @babelqueue/azure-service-bus && npm run build -w @babelqueue/pulsar && npm run build -w @babelqueue/kafka && npm run build -w @babelqueue/artemis && npm run build -w @babelqueue/redis && npm run build -w @babelqueue/rabbitmq",
+    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs && npm run typecheck -w @babelqueue/azure-service-bus && npm run typecheck -w @babelqueue/pulsar && npm run typecheck -w @babelqueue/kafka && npm run typecheck -w @babelqueue/artemis && npm run typecheck -w @babelqueue/redis && npm run typecheck -w @babelqueue/rabbitmq",
     "lint": "eslint .",
-    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs && npm run test -w @babelqueue/azure-service-bus && npm run test -w @babelqueue/pulsar && npm run test -w @babelqueue/kafka && npm run test -w @babelqueue/artemis",
+    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs && npm run test -w @babelqueue/azure-service-bus && npm run test -w @babelqueue/pulsar && npm run test -w @babelqueue/kafka && npm run test -w @babelqueue/artemis && npm run test -w @babelqueue/redis && npm run test -w @babelqueue/rabbitmq",
     "coverage": "c8 --check-coverage --statements 90 --lines 90 --functions 90 --branches 70 --include \"packages/*/src/**\" --reporter=text-summary npm test"
   },
   "devDependencies": {

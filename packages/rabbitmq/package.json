@@ -1,0 +1,57 @@
+{
+  "name": "@babelqueue/rabbitmq",
+  "version": "1.0.0",
+  "description": "RabbitMQ adapter for BabelQueue — a canonical-envelope publisher and a URN-routed consumer with the §2 AMQP 0-9-1 property projection (type/correlation_id/message_id + x- headers) over amqplib.",
+  "keywords": ["babelqueue", "rabbitmq", "amqp", "amqplib", "queue", "polyglot", "messaging"],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node-adapters.git",
+    "directory": "packages/rabbitmq"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@babelqueue/core": "^1.0.0"
+  },
+  "peerDependencies": {
+    "amqplib": "^0.10.0"
+  },
+  "peerDependenciesMeta": {
+    "amqplib": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

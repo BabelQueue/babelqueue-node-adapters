@@ -107,6 +107,28 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Publish @babelqueue/redis
+        run: |
+          v=$(node -p "require('./packages/redis/package.json').version")
+          if npm view "@babelqueue/redis@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/redis@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/redis --provenance --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish @babelqueue/rabbitmq
+        run: |
+          v=$(node -p "require('./packages/rabbitmq/package.json').version")
+          if npm view "@babelqueue/rabbitmq@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/rabbitmq@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/rabbitmq --provenance --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
