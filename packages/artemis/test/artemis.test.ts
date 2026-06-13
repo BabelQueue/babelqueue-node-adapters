@@ -66,7 +66,7 @@ function context(message: AmqpMessage, delivery = new FakeDelivery()): { context
 
 // --- projection ---------------------------------------------------------------
 
-test("artemisMessage projects body, correlation, jms-type annotation and bq- properties", () => {
+test("artemisMessage projects body, correlation, jms-type annotation and bq_ properties", () => {
   const env = envelope(2);
   const message = artemisMessage(env);
 
@@ -74,15 +74,15 @@ test("artemisMessage projects body, correlation, jms-type annotation and bq- pro
   assert.equal(message.correlation_id, "trace-1");
   assert.equal(message.creation_time, env.meta.created_at);
   assert.equal(message.message_annotations?.[JMS_TYPE_KEY], URN);
-  assert.equal(message.application_properties?.["bq-schema-version"], "1");
-  assert.equal(message.application_properties?.["bq-source-lang"], env.meta.lang);
-  assert.equal(message.application_properties?.["bq-attempts"], "2");
-  assert.equal(message.application_properties?.["bq-app-id"], "babelqueue");
+  assert.equal(message.application_properties?.["bq_schema_version"], "1");
+  assert.equal(message.application_properties?.["bq_source_lang"], env.meta.lang);
+  assert.equal(message.application_properties?.["bq_attempts"], "2");
+  assert.equal(message.application_properties?.["bq_app_id"], "babelqueue");
 });
 
-test("artemisMessage with a delay sets bq-delay and the scheduled-delivery annotation", () => {
+test("artemisMessage with a delay sets bq_delay and the scheduled-delivery annotation", () => {
   const message = artemisMessage(envelope(), 30000);
-  assert.equal(message.application_properties?.["bq-delay"], "30000");
+  assert.equal(message.application_properties?.["bq_delay"], "30000");
   assert.ok(SCHEDULED_DELIVERY_KEY in (message.message_annotations ?? {}));
 });
 
@@ -107,10 +107,10 @@ test("publish sends the projected message and returns the message id", async () 
   assert.equal(sender.sent[0]!.message_annotations?.[JMS_TYPE_KEY], URN);
 });
 
-test("publish with a delay carries bq-delay", async () => {
+test("publish with a delay carries bq_delay", async () => {
   const sender = new FakeSender();
   await ArtemisPublisher.create(sender, "orders").publish(URN, {}, { delayMs: 15000 });
-  assert.equal(sender.sent[0]!.application_properties?.["bq-delay"], "15000");
+  assert.equal(sender.sent[0]!.application_properties?.["bq_delay"], "15000");
 });
 
 // --- consumer: success + routing + reconcile ----------------------------------

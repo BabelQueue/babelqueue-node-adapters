@@ -16,7 +16,7 @@ import {
 } from "../src/index.js";
 
 // The vendored canonical suite (synced from conformance/). The `artemis` block locks the §7
-// AMQP projection (the x-opt-jms-type annotation / correlation-id + the bq- application
+// AMQP projection (the x-opt-jms-type annotation / correlation-id + the bq_ application
 // properties) + the attempts = max(body, delivery-count) reconciliation (0-based, no −1).
 const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const artemis = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).artemis as ArtemisBlock;

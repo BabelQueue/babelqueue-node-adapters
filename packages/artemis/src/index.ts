@@ -10,7 +10,7 @@
  * this adapter maps onto them (the envelope stays `schema_version: 1`): the envelope JSON is the
  * message **body**; the contract fields are mirrored onto the AMQP a JMS peer reads
  * (`correlation-id` = `trace_id`, `creation-time` = `meta.created_at`, the `x-opt-jms-type`
- * annotation = URN) plus the `bq-` application properties; consume settles per message
+ * annotation = URN) plus the `bq_` application properties; consume settles per message
  * (`accept` after success, `release` for redelivery); **`attempts = max(body, delivery-count)`**
  * (the AMQP counter is 0-based — no −1); terminal failures go to an opt-in `<queue>.dlq` with a
  * `dead_letter` block.
@@ -70,19 +70,21 @@ export const SCHEDULED_DELIVERY_KEY = "x-opt-delivery-time";
 /**
  * Project the envelope onto the AMQP 1.0 message a JMS peer reads: body = envelope JSON,
  * `correlation-id` = `trace_id`, `creation-time` = `meta.created_at`, the `x-opt-jms-type`
- * annotation = URN, plus the string-valued `bq-` application properties. A positive `delayMs`
+ * annotation = URN, plus the string-valued `bq_` application properties. A positive `delayMs`
  * sets the `x-opt-delivery-time` annotation for native scheduled delivery.
  */
 export function artemisMessage(envelope: Envelope, delayMs?: number): AmqpMessage {
   const annotations: Record<string, unknown> = {};
   if (envelope.job) annotations[JMS_TYPE_KEY] = envelope.job;
 
+  // The bq_ property names use underscores, not hyphens: a JMS property name must be a valid
+  // Java identifier, and every Artemis SDK uses the same JMS-legal form for cross-protocol parity.
   const applicationProperties: Record<string, unknown> = {
-    "bq-schema-version": String(envelope.meta.schema_version),
-    "bq-attempts": String(envelope.attempts ?? 0),
-    "bq-app-id": "babelqueue",
+    "bq_schema_version": String(envelope.meta.schema_version),
+    "bq_attempts": String(envelope.attempts ?? 0),
+    "bq_app_id": "babelqueue",
   };
-  if (envelope.meta.lang) applicationProperties["bq-source-lang"] = envelope.meta.lang;
+  if (envelope.meta.lang) applicationProperties["bq_source_lang"] = envelope.meta.lang;
 
   const message: AmqpMessage = {
     body: EnvelopeCodec.encode(envelope),
@@ -94,7 +96,7 @@ export function artemisMessage(envelope: Envelope, delayMs?: number): AmqpMessag
   if (envelope.meta.created_at != null) message.creation_time = envelope.meta.created_at;
 
   if (delayMs != null && delayMs > 0) {
-    applicationProperties["bq-delay"] = String(delayMs);
+    applicationProperties["bq_delay"] = String(delayMs);
     annotations[SCHEDULED_DELIVERY_KEY] = Date.now() + delayMs;
   }
   return message;
