@@ -8,13 +8,14 @@
     "packages/bullmq",
     "packages/nestjs",
     "packages/sqs",
-    "packages/azure-service-bus"
+    "packages/azure-service-bus",
+    "packages/pulsar"
   ],
   "scripts": {
-    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs && npm run build -w @babelqueue/azure-service-bus",
-    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs && npm run typecheck -w @babelqueue/azure-service-bus",
+    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs && npm run build -w @babelqueue/azure-service-bus && npm run build -w @babelqueue/pulsar",
+    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs && npm run typecheck -w @babelqueue/azure-service-bus && npm run typecheck -w @babelqueue/pulsar",
     "lint": "eslint .",
-    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs && npm run test -w @babelqueue/azure-service-bus",
+    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs && npm run test -w @babelqueue/azure-service-bus && npm run test -w @babelqueue/pulsar",
     "coverage": "c8 --check-coverage --statements 90 --lines 90 --functions 90 --branches 70 --include \"packages/*/src/**\" --reporter=text-summary npm test"
   },
   "devDependencies": {
