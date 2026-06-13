@@ -25,20 +25,41 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
-      # Publish bullmq first (nestjs depends on it).
+      # Each publish is idempotent: a monorepo `v*` tag runs all three steps, but
+      # only packages whose version is not already on npm are published — so
+      # releasing one package (e.g. a new @babelqueue/sqs) does NOT 403 on the
+      # unchanged bullmq/nestjs already on the registry. bullmq is listed first
+      # (nestjs depends on it) so a fresh co-release publishes in dependency order.
       - name: Publish @babelqueue/bullmq
-        run: npm publish -w @babelqueue/bullmq --provenance --access public
+        run: |
+          v=$(node -p "require('./packages/bullmq/package.json').version")
+          if npm view "@babelqueue/bullmq@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/bullmq@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/bullmq --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish @babelqueue/nestjs
-        run: npm publish -w @babelqueue/nestjs --provenance --access public
+        run: |
+          v=$(node -p "require('./packages/nestjs/package.json').version")
+          if npm view "@babelqueue/nestjs@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/nestjs@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/nestjs --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      # @babelqueue/sqs has no workspace dependents, so publish order is free.
       - name: Publish @babelqueue/sqs
-        run: npm publish -w @babelqueue/sqs --provenance --access public
+        run: |
+          v=$(node -p "require('./packages/sqs/package.json').version")
+          if npm view "@babelqueue/sqs@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/sqs@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/sqs --provenance --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
