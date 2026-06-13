@@ -70,13 +70,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Verify vendored conformance matches the canonical suite
-        # Only @babelqueue/sqs vendors the conformance suite (for its SQS binding
-        # tests); guard its copy against drift from the canonical source.
+        # @babelqueue/sqs and @babelqueue/azure-service-bus each vendor the conformance
+        # suite (for their binding tests); guard both copies against drift.
         run: |
           git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/sqs/test/conformance/manifest.json"
-          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/sqs/test/conformance/fixtures"
-          diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/sqs/test/conformance/schema"
+          for pkg in sqs azure-service-bus; do
+            diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/$pkg/test/conformance/manifest.json"
+            diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/$pkg/test/conformance/fixtures"
+            diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/$pkg/test/conformance/schema"
+          done
           echo "Vendored conformance is in sync with the canonical suite."
 
   ci-green:
