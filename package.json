@@ -2,18 +2,19 @@
   "name": "babelqueue-node-adapters",
   "private": true,
   "type": "module",
-  "description": "BabelQueue Node.js adapters (BullMQ, NestJS, Amazon SQS) — npm workspaces.",
+  "description": "BabelQueue Node.js adapters (BullMQ, NestJS, Amazon SQS, Azure Service Bus) — npm workspaces.",
   "license": "MIT",
   "workspaces": [
     "packages/bullmq",
     "packages/nestjs",
-    "packages/sqs"
+    "packages/sqs",
+    "packages/azure-service-bus"
   ],
   "scripts": {
-    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs",
-    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs",
+    "build": "npm run build -w @babelqueue/bullmq && npm run build -w @babelqueue/nestjs && npm run build -w @babelqueue/sqs && npm run build -w @babelqueue/azure-service-bus",
+    "typecheck": "npm run typecheck -w @babelqueue/bullmq && npm run typecheck -w @babelqueue/nestjs && npm run typecheck -w @babelqueue/sqs && npm run typecheck -w @babelqueue/azure-service-bus",
     "lint": "eslint .",
-    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs",
+    "test": "npm run test -w @babelqueue/bullmq && npm run test -w @babelqueue/nestjs && npm run test -w @babelqueue/sqs && npm run test -w @babelqueue/azure-service-bus",
     "coverage": "c8 --check-coverage --statements 90 --lines 90 --functions 90 --branches 70 --include \"packages/*/src/**\" --reporter=text-summary npm test"
   },
   "devDependencies": {

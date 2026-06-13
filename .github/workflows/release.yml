@@ -63,6 +63,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Publish @babelqueue/azure-service-bus
+        run: |
+          v=$(node -p "require('./packages/azure-service-bus/package.json').version")
+          if npm view "@babelqueue/azure-service-bus@$v" version >/dev/null 2>&1; then
+            echo "@babelqueue/azure-service-bus@$v already on npm — skipping"
+          else
+            npm publish -w @babelqueue/azure-service-bus --provenance --access public
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
