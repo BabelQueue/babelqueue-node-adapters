@@ -25,5 +25,8 @@
     "tsx": "^4",
     "typescript": "^5.5",
     "typescript-eslint": "^8.60.1"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }
