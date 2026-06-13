@@ -1,0 +1,57 @@
+{
+  "name": "@babelqueue/kafka",
+  "version": "1.0.0",
+  "description": "Apache Kafka adapter for BabelQueue — canonical-envelope publisher and a URN-routed, process-then-commit consumer (SDK-owned retry topics + DLQ).",
+  "keywords": ["babelqueue", "kafka", "apache-kafka", "kafkajs", "queue", "polyglot", "messaging"],
+  "homepage": "https://babelqueue.com",
+  "bugs": {
+    "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BabelQueue/babelqueue-node-adapters.git",
+    "directory": "packages/kafka"
+  },
+  "license": "MIT",
+  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@babelqueue/core": "^1.0.0"
+  },
+  "peerDependencies": {
+    "kafkajs": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "kafkajs": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
