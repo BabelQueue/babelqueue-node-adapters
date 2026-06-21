@@ -29,10 +29,19 @@
  * redelivered (at-least-once) and `getRedeliveryCount()` is incremented; the authoritative
  * attempt count is the body's `bq-attempts`, reconciled to `max(bq-attempts,
  * getRedeliveryCount())` — no −1, because Pulsar's redelivery count is 0-based.
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides as additional native Pulsar **message properties** beside the contract `bq-*`
+ * properties — the contract properties win a key collision (merge-not-clobber), and blanks are
+ * dropped. On consume the inbound `getProperties()` are surfaced as a `Record<string,string>` so
+ * the core's `otel` extract sees the `traceparent` and links the consumer span as a child. A
+ * header-less publish is byte-identical. GR-1: the wire envelope (the payload) is never touched.
  */
 
 import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { mergeInto } from "./headers.js";
 
 // --- Minimal Pulsar shapes (a structural subset of pulsar-client) --------------
 
@@ -96,12 +105,33 @@ export function pulsarProperties(envelope: Envelope): { [key: string]: string } 
   return properties;
 }
 
-/** Project the envelope onto a native Pulsar producer message (payload + properties). */
-export function toPulsarMessage(envelope: Envelope): PulsarProducerMessage {
+/**
+ * Project the envelope onto a native Pulsar producer message (payload + properties). When `extra`
+ * is given, those out-of-band headers (e.g. a `traceparent`, ADR-0028) are merged beside the
+ * contract `bq-*` properties without clobbering them (the contract wins a key collision).
+ */
+export function toPulsarMessage(envelope: Envelope, extra?: HeaderCarrier | null): PulsarProducerMessage {
   return {
     data: Buffer.from(EnvelopeCodec.encode(envelope), "utf8"),
-    properties: pulsarProperties(envelope),
+    properties: mergeInto(pulsarProperties(envelope), extra),
   };
+}
+
+/**
+ * Read a received message's native properties back into a flat {@link HeaderCarrier} via
+ * `getProperties()`. Returns an empty object when there are none. Both the contract `bq-*`
+ * properties and any out-of-band rider (e.g. `traceparent`) surface — the core's `otel` extract
+ * reads only the keys it knows.
+ */
+export function headersOf(message: PulsarReceivedMessage): HeaderCarrier {
+  const props = typeof message.getProperties === "function" ? message.getProperties() : undefined;
+  const out: HeaderCarrier = {};
+  if (!props) return out;
+  for (const key of Object.keys(props)) {
+    const value = props[key];
+    if (value != null && value !== "") out[key] = value;
+  }
+  return out;
 }
 
 // --- Publisher -----------------------------------------------------------------
@@ -112,6 +142,13 @@ export interface PublishOptions {
   traceId?: string;
   /** Schedule native delayed delivery this many milliseconds from now (`deliverAfter`). */
   delayMs?: number;
+  /**
+   * Out-of-band transport headers carried as native Pulsar message properties beside the contract
+   * `bq-*` properties (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s
+   * `publish`. The contract properties win a key collision; an empty/omitted carrier leaves the
+   * message unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one Pulsar topic with the §5 property projection. */
@@ -132,7 +169,7 @@ export class PulsarPublisher {
       queue: topicName(this.producer.getTopic()),
       traceId: options.traceId,
     });
-    const message = toPulsarMessage(envelope);
+    const message = toPulsarMessage(envelope, options.headers);
 
     if (options.delayMs != null && options.delayMs > 0) {
       message.properties = { ...message.properties, "bq-delay": String(options.delayMs) };
@@ -146,8 +183,13 @@ export class PulsarPublisher {
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw Pulsar message. */
-export type BabelHandler = (envelope: Envelope, message: PulsarReceivedMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw Pulsar message, and the out-of-band
+ * {@link HeaderCarrier} read from the message's properties (empty when there are none). Pass
+ * `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of the
+ * producer span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: PulsarReceivedMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -241,7 +283,7 @@ export class PulsarConsumer {
     }
 
     try {
-      await handler(envelope as Envelope, message);
+      await handler(envelope as Envelope, message, headersOf(message));
       await this.consumer.acknowledge(message);
     } catch (error) {
       // Negative-ack releases the message — the broker redelivers and increments the count.

@@ -24,10 +24,24 @@
  * (a failed handler leaves the message for visibility-timeout redelivery); the
  * authoritative attempt count is `ApproximateReceiveCount`, surfaced to handlers as
  * `attempts = count − 1`.
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides as additional String `MessageAttributes` **beside** the contract `bq-*`
+ * attributes where `bq-trace-id` already lives — the contract attributes win a key collision, and
+ * the merged set is bounded by SQS's **10-attribute limit** (contract attributes are seeded first,
+ * so a rider only lands while headroom remains). On consume the inbound `MessageAttributes` are
+ * surfaced as a `Record<string,string>` so the core's `otel` extract sees the `traceparent` and
+ * links the consumer span as a child. A header-less publish is byte-identical. This mirrors the Go
+ * `/sqs` and PHP `SqsTransport` wiring. GR-1: the wire envelope body is never touched.
  */
 
 import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { sanitizeHeaders } from "./headers.js";
+
+/** SQS allows at most 10 user message attributes per message. */
+const MAX_ATTRIBUTES = 10;
 
 // --- Minimal SQS shapes (a structural subset of @aws-sdk/client-sqs) -----------
 
@@ -100,6 +114,44 @@ export function toMessageAttributes(envelope: Envelope): Record<string, SqsMessa
   return attrs;
 }
 
+/**
+ * Overlay the out-of-band `headers` onto the contract attribute projection as String
+ * `MessageAttributes`, without overwriting an existing `bq-*` attribute (the contract wins a key
+ * collision) and skipping blanks. Keys are merged in sorted order and the merge stops at the
+ * 10-attribute SQS ceiling, so unbounded riders can never push the message past the limit (SQS
+ * rejects the whole send otherwise) — the contract attributes are always preserved first. Mirrors
+ * Go's `mergeAttributes` / PHP's `SqsTransport::attributes`.
+ */
+export function mergeAttributes(
+  base: Record<string, SqsMessageAttributeValue>,
+  headers: HeaderCarrier | null | undefined,
+): Record<string, SqsMessageAttributeValue> {
+  const clean = sanitizeHeaders(headers);
+  for (const key of Object.keys(clean).sort()) {
+    if (key in base) continue; // never clobber a contract bq-* attribute
+    if (Object.keys(base).length >= MAX_ATTRIBUTES) break; // respect the SQS 10-attribute cap
+    base[key] = str(clean[key]);
+  }
+  return base;
+}
+
+/**
+ * Map inbound SQS `MessageAttributes` onto a flat {@link HeaderCarrier} (the consume-side
+ * counterpart of {@link mergeAttributes}), reading each attribute's `StringValue`. Returns an empty
+ * object when there are none. Both the contract `bq-*` attributes and any out-of-band rider (e.g.
+ * `traceparent`) surface — the core's `otel` extract reads only the keys it knows.
+ */
+export function headersOf(message: SqsMessage): HeaderCarrier {
+  const attrs = message.MessageAttributes;
+  const out: HeaderCarrier = {};
+  if (!attrs) return out;
+  for (const key of Object.keys(attrs)) {
+    const value = attrs[key]?.StringValue;
+    if (value != null && value !== "") out[key] = value;
+  }
+  return out;
+}
+
 function queueNameFromUrl(queueUrl: string): string {
   const segments = queueUrl.split("/").filter(Boolean);
   return segments[segments.length - 1] ?? "default";
@@ -121,6 +173,13 @@ export interface SqsPublisherOptions {
 export interface PublishOptions {
   /** Reuse an existing trace id (trace continuation). */
   traceId?: string;
+  /**
+   * Out-of-band transport headers carried as String `MessageAttributes` beside the contract `bq-*`
+   * attributes (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s `publish`.
+   * The contract attributes win a key collision and the merged set is capped at SQS's 10-attribute
+   * limit; an empty/omitted carrier leaves the publish unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one SQS queue with the §3 attribute projection. */
@@ -147,7 +206,7 @@ export class SqsPublisher {
     const input: SendMessageInput = {
       QueueUrl: this.queueUrl,
       MessageBody: EnvelopeCodec.encode(envelope),
-      MessageAttributes: toMessageAttributes(envelope),
+      MessageAttributes: mergeAttributes(toMessageAttributes(envelope), options.headers),
     };
     if (this.options.fifo) {
       input.MessageGroupId = this.options.messageGroupId ?? queueNameFromUrl(this.queueUrl);
@@ -162,8 +221,13 @@ export class SqsPublisher {
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw SQS message. */
-export type BabelHandler = (envelope: Envelope, message: SqsMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw SQS message, and the out-of-band
+ * {@link HeaderCarrier} read from the message's `MessageAttributes` (empty when there are none).
+ * Pass `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of
+ * the producer span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: SqsMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -257,7 +321,7 @@ export class SqsConsumer {
     }
 
     try {
-      await handler(envelope, message);
+      await handler(envelope, message, headersOf(message));
       await this.delete(message);
     } catch (error) {
       // Leave the message undeleted — SQS redelivers after the visibility timeout.

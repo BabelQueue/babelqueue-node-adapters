@@ -14,6 +14,7 @@
  */
 
 import { publish } from "@babelqueue/bullmq";
+import type { HeaderCarrier } from "@babelqueue/core";
 import { Module, type DynamicModule, type Provider } from "@nestjs/common";
 import { Queue, type ConnectionOptions, type QueueOptions } from "bullmq";
 
@@ -24,13 +25,19 @@ export const BABELQUEUE_QUEUE = "BABELQUEUE_QUEUE";
 export class BabelQueuePublisher {
   constructor(private readonly queue: Queue) {}
 
-  /** Publish a `(urn, data)` message; returns the message id (`meta.id`). */
+  /**
+   * Publish a `(urn, data)` message; returns the message id (`meta.id`). An optional out-of-band
+   * `headers` carrier (e.g. a W3C `traceparent`, ADR-0028) is carried on the underlying BullMQ
+   * job's native `telemetry.metadata` slot — the canonical envelope is never touched (GR-1). Consume
+   * with the re-exported `processor`, whose handler receives the carried headers as its third
+   * argument.
+   */
   publish(
     urn: string,
     data: Record<string, unknown>,
-    options: { traceId?: string } = {},
+    options: { traceId?: string; headers?: HeaderCarrier } = {},
   ): Promise<string> {
-    return publish(this.queue, urn, data, { traceId: options.traceId });
+    return publish(this.queue, urn, data, { traceId: options.traceId, headers: options.headers });
   }
 }
 

@@ -15,10 +15,29 @@
  *
  * This implements §1 of the broker-bindings contract. `ioredis` is an optional peer — you provide
  * the client (an `ioredis` instance satisfies the adapter structurally).
+ *
+ * **Out-of-band headers (ADR-0028).** A Redis list element *is* the canonical envelope JSON (the
+ * `LREM` ack handle is that exact value), so — unlike AMQP headers or SQS `MessageAttributes` —
+ * there is no native per-message metadata channel. To carry a {@link HeaderCarrier} (e.g. a W3C
+ * `traceparent` for cross-hop span linkage) the adapter owns a tiny JSON *frame* distinct from the
+ * wire envelope:
+ *
+ *     {"__bq_frame":1,"headers":{"traceparent":"00-…"},"body":"<raw wire envelope>"}
+ *
+ * `RPUSH` stores the frame, so the `LREM` ack handle stays byte-for-byte what was pushed and the
+ * reliable-queue semantics (`RPUSH`/`BRPOPLPUSH`/`LREM`) are untouched. Framing is **opt-in and
+ * backward compatible**: only `publish` with a non-empty `headers` carrier writes a frame; a plain
+ * publish stores the **bare** envelope byte-for-byte, exactly as before. The consumer detects
+ * frame-vs-bare by the reserved `__bq_frame` sentinel (a frozen envelope can never carry it), so a
+ * bare value consumes with empty headers and cross-version queues interoperate. This mirrors the
+ * Go `/redis` and PHP `RedisTransport` framing byte-for-byte. GR-1: the wire envelope is never
+ * touched.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { sanitizeHeaders } from "./headers.js";
 
 // --- Minimal Redis shape (a structural subset of ioredis) ----------------------
 
@@ -40,11 +59,81 @@ export function redisValue(envelope: Envelope): string {
   return EnvelopeCodec.encode(envelope);
 }
 
+// --- Header frame (ADR-0028) ---------------------------------------------------
+
+/** The reserved discriminator key + current version of the transport-owned header frame. */
+export const FRAME_KEY = "__bq_frame";
+const FRAME_VERSION = 1;
+
+/** The transport-owned frame the list value carries when out-of-band headers accompany a message. */
+interface HeaderFrame {
+  __bq_frame: number;
+  headers?: HeaderCarrier;
+  body: string;
+}
+
+/**
+ * The pure produce-side decision: the exact string to `RPUSH` for `body` + `headers`. With no
+ * usable headers it returns `body` verbatim (the **bare** form, so a plain publish and a
+ * header-less publish store byte-identical values); otherwise it returns the transport-owned frame
+ * JSON. Kept pure so the framing decision is unit-testable without a broker.
+ */
+export function frameValue(body: string, headers: HeaderCarrier | null | undefined): string {
+  const clean = sanitizeHeaders(headers);
+  if (Object.keys(clean).length === 0) return body;
+  const frame: HeaderFrame = { [FRAME_KEY]: FRAME_VERSION, headers: clean, body };
+  return JSON.stringify(frame);
+}
+
+/**
+ * Interpret a stored Redis list value: `[wire-envelope-body, headers]`. A value is a header frame
+ * iff it is a JSON object carrying the reserved `__bq_frame` sentinel (a frozen wire envelope never
+ * has it); then it yields the unframed body plus the carried headers. Any other value — a bare
+ * envelope, non-JSON, or JSON without the sentinel — is returned verbatim as the body with empty
+ * headers, so older / cross-version queue values consume exactly as before.
+ */
+export function unframe(value: string): [string, HeaderCarrier] {
+  // Cheap reject: a frame is always a JSON object, and the sentinel substring must appear. This
+  // avoids a full parse for the overwhelmingly common bare-envelope case (only short-circuits
+  // negatives).
+  if (value === "" || value[0] !== "{" || !value.includes(`"${FRAME_KEY}"`)) {
+    return [value, {}];
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(value);
+  } catch {
+    return [value, {}];
+  }
+  if (
+    decoded == null ||
+    typeof decoded !== "object" ||
+    !(FRAME_KEY in decoded) ||
+    !(decoded as HeaderFrame)[FRAME_KEY] ||
+    typeof (decoded as HeaderFrame).body !== "string"
+  ) {
+    return [value, {}];
+  }
+  const frame = decoded as HeaderFrame;
+  return [frame.body, sanitizeHeaders(frame.headers)];
+}
+
+/** The out-of-band headers carried by a stored list value (empty for a bare value). */
+export function headersOf(value: string): HeaderCarrier {
+  return unframe(value)[1];
+}
+
 // --- Publisher -----------------------------------------------------------------
 
 /** Options for {@link RedisPublisher.publish}. */
 export interface PublishOptions {
   traceId?: string;
+  /**
+   * Out-of-band transport headers to carry beside the frozen envelope (ADR-0028) — e.g. a W3C
+   * `traceparent` written by `@babelqueue/core/otel`'s `publish`. A non-empty carrier RPUSHes a
+   * transport-owned frame; an empty/omitted carrier stays a byte-identical bare publish.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one Redis list (§1 reliable-queue). */
@@ -59,18 +148,28 @@ export class RedisPublisher {
     return new RedisPublisher(client, queue);
   }
 
-  /** Build + `RPUSH` the canonical envelope; returns the message id (`meta.id`). */
+  /**
+   * Build + `RPUSH` the canonical envelope; returns the message id (`meta.id`). When
+   * `options.headers` carries any out-of-band header (e.g. a `traceparent`, ADR-0028) the value
+   * pushed is a transport-owned frame that wraps the envelope; otherwise the bare envelope is
+   * pushed byte-for-byte (GR-1, no regression).
+   */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
-    await this.client.rpush(this.queue, redisValue(envelope));
+    await this.client.rpush(this.queue, frameValue(redisValue(envelope), options.headers));
     return envelope.meta.id;
   }
 }
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw list element. */
-export type BabelHandler = (envelope: Envelope, raw: string) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw stored list element, and the out-of-band
+ * {@link HeaderCarrier} carried beside it (empty for a bare value). Pass `headers` to
+ * `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of the producer
+ * span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, raw: string, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -133,9 +232,17 @@ export class RedisConsumer {
     }
   }
 
-  /** Route + settle one reserved element. Exposed for testing. */
+  /**
+   * Route + settle one reserved element. Exposed for testing.
+   *
+   * `raw` is the **stored** list value (the `LREM` ack handle); it may be a transport-owned header
+   * frame or a bare envelope. It is unframed first so the envelope is decoded from the verbatim
+   * wire body while the carried out-of-band headers (e.g. a `traceparent`, ADR-0028) are surfaced
+   * to the handler. Settling/dead-lettering still operate on the original stored value.
+   */
   async handle(raw: string): Promise<void> {
-    const decoded = EnvelopeCodec.decode(raw);
+    const [body, headers] = unframe(raw);
+    const decoded = EnvelopeCodec.decode(body);
 
     if (!EnvelopeCodec.accepts(decoded)) {
       this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis."), decoded, raw);
@@ -153,7 +260,7 @@ export class RedisConsumer {
     }
 
     try {
-      await handler(envelope, raw);
+      await handler(envelope, raw, headers);
       await this.settle(raw);
     } catch (error) {
       this.report(error, envelope, raw);

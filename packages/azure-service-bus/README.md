@@ -66,6 +66,24 @@ Service Bus is purely additive.
 The sender/receiver are injected, so the unit tests use fakes — no Azure, no broker. Dual
 ESM + CJS.
 
+## OpenTelemetry tracing (ADR-0028)
+
+Cross-hop **span** linkage rides on the out-of-band `HeaderCarrier` from
+[`@babelqueue/core@^1.4.0`](https://www.npmjs.com/package/@babelqueue/core). Pass the carrier produced by
+`@babelqueue/core/otel`'s `publish` to this adapter's `publish({ headers })`; it is carried on
+native `applicationProperties`, beside the contract `bq-*` properties (the contract wins a key collision). On consume, the consumer surfaces a delivered message's headers to the handler's third argument (and a `headersOf(...)` extractor reads them back),
+so the core's `otel` `wrapHandler` starts the consumer span as a true **child** of the producer span.
+
+```ts
+import { trace } from "@opentelemetry/api";
+import { publish as tracedPublish } from "@babelqueue/core/otel";
+import type { HeaderCarrier } from "@babelqueue/core";
+
+const headers: HeaderCarrier = {};
+await tracedPublish(trace.getTracer("orders"), urn, data,
+  () => adapterPublish(urn, data, { headers }), { headers });
+```
+
 ## License
 
 MIT

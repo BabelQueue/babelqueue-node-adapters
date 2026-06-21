@@ -17,10 +17,21 @@
  *
  * This implements §7 of the broker-bindings contract. `rhea` is an optional peer — you provide
  * the sender/receiver (a rhea sender/receiver satisfies the adapter structurally).
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides as additional AMQP `application_properties` beside the contract `bq_`
+ * properties — the contract properties win a key collision (merge-not-clobber), blanks dropped.
+ * `traceparent`/`tracestate` are W3C keys with no hyphens, so they are already JMS-legal (§7 uses
+ * underscores because JMS property names must be Java identifiers). On consume the inbound
+ * `application_properties` are surfaced as a `Record<string,string>` so the core's `otel` extract
+ * sees the `traceparent` and links the consumer span as a child. A header-less publish is
+ * byte-identical. GR-1: the wire envelope body is never touched.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { sanitizeHeaders } from "./headers.js";
 
 // --- Minimal AMQP 1.0 shapes (a structural subset of rhea) ---------------------
 
@@ -73,17 +84,19 @@ export const SCHEDULED_DELIVERY_KEY = "x-opt-delivery-time";
  * annotation = URN, plus the string-valued `bq_` application properties. A positive `delayMs`
  * sets the `x-opt-delivery-time` annotation for native scheduled delivery.
  */
-export function artemisMessage(envelope: Envelope, delayMs?: number): AmqpMessage {
+export function artemisMessage(envelope: Envelope, delayMs?: number, extra?: HeaderCarrier | null): AmqpMessage {
   const annotations: Record<string, unknown> = {};
   if (envelope.job) annotations[JMS_TYPE_KEY] = envelope.job;
 
-  // The bq_ property names use underscores, not hyphens: a JMS property name must be a valid
-  // Java identifier, and every Artemis SDK uses the same JMS-legal form for cross-protocol parity.
-  const applicationProperties: Record<string, unknown> = {
-    "bq_schema_version": String(envelope.meta.schema_version),
-    "bq_attempts": String(envelope.attempts ?? 0),
-    "bq_app_id": "babelqueue",
-  };
+  // Out-of-band riders (e.g. traceparent) go in first; the contract bq_ properties below win any
+  // key collision (merge-not-clobber). The bq_ names use underscores, not hyphens: a JMS property
+  // name must be a valid Java identifier, and every Artemis SDK uses the same JMS-legal form for
+  // cross-protocol parity. traceparent/tracestate have no hyphens, so they are already JMS-legal.
+  const applicationProperties: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(sanitizeHeaders(extra))) applicationProperties[key] = value;
+  applicationProperties["bq_schema_version"] = String(envelope.meta.schema_version);
+  applicationProperties["bq_attempts"] = String(envelope.attempts ?? 0);
+  applicationProperties["bq_app_id"] = "babelqueue";
   if (envelope.meta.lang) applicationProperties["bq_source_lang"] = envelope.meta.lang;
 
   const message: AmqpMessage = {
@@ -126,6 +139,25 @@ function deliveryCount(message: AmqpMessage): number {
   return typeof value === "number" && value > 0 ? value : 0;
 }
 
+/**
+ * Read a message's `application_properties` back into a flat {@link HeaderCarrier}, stringifying
+ * values defensively. Returns an empty object when there are none. Both the contract `bq_`
+ * properties and any out-of-band rider (e.g. `traceparent`) surface — the core's `otel` extract
+ * reads only the keys it knows.
+ */
+export function headersOf(message: AmqpMessage): HeaderCarrier {
+  const props = message.application_properties;
+  const out: HeaderCarrier = {};
+  if (!props) return out;
+  for (const key of Object.keys(props)) {
+    const value = props[key];
+    if (value == null) continue;
+    const s = String(value);
+    if (s !== "") out[key] = s;
+  }
+  return out;
+}
+
 // --- Publisher -----------------------------------------------------------------
 
 /** Options for {@link ArtemisPublisher.publish}. */
@@ -133,6 +165,13 @@ export interface PublishOptions {
   traceId?: string;
   /** Schedule via Artemis's native AMQP scheduled delivery (`x-opt-delivery-time`). */
   delayMs?: number;
+  /**
+   * Out-of-band transport headers carried as AMQP `application_properties` beside the contract `bq_`
+   * properties (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s `publish`.
+   * The contract properties win a key collision; an empty/omitted carrier leaves the message
+   * unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one Artemis address with the §7 projection. */
@@ -150,15 +189,20 @@ export class ArtemisPublisher {
   /** Build + send the canonical envelope; returns the message id (`meta.id`). */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
-    await this.sender.send(artemisMessage(envelope, options.delayMs));
+    await this.sender.send(artemisMessage(envelope, options.delayMs, options.headers));
     return envelope.meta.id;
   }
 }
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw AMQP message. */
-export type BabelHandler = (envelope: Envelope, message: AmqpMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw AMQP message, and the out-of-band
+ * {@link HeaderCarrier} read from the message's `application_properties` (empty when there are
+ * none). Pass `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a
+ * child of the producer span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: AmqpMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -223,7 +267,7 @@ export class ArtemisConsumer {
     }
 
     try {
-      await handler(envelope, message);
+      await handler(envelope, message, headersOf(message));
       delivery?.accept();
     } catch (error) {
       this.report(error, envelope, context);

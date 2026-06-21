@@ -16,10 +16,19 @@
  * This implements §6 of the broker-bindings contract. `kafkajs` is an optional peer — you
  * provide the producer/consumer (a KafkaJS `Producer`/`Consumer` satisfies the adapter
  * structurally).
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides as additional Kafka **record headers** beside the contract `bq-*` headers —
+ * the contract headers win a key collision (merge-not-clobber), and blanks are dropped. On consume
+ * the inbound record headers are surfaced as a `Record<string,string>` so the core's `otel` extract
+ * sees the `traceparent` and links the consumer span as a child. A header-less publish is
+ * byte-identical. GR-1: the wire envelope (the record value) is never touched.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { mergeInto } from "./headers.js";
 
 // --- Minimal Kafka shapes (a structural subset of kafkajs) ---------------------
 
@@ -90,6 +99,23 @@ function headerInt(headers: IncomingHeaders | undefined, key: string, fallback: 
   return Number.isNaN(n) ? fallback : n;
 }
 
+/**
+ * Map an inbound record's headers onto a flat {@link HeaderCarrier}, stringifying KafkaJS's Buffer
+ * values. Returns an empty object when there are none. Both the contract `bq-*` headers and any
+ * out-of-band rider (e.g. `traceparent`) surface — the core's `otel` extract reads only the keys it
+ * knows.
+ */
+export function headersOf(message: KafkaIncomingMessage): HeaderCarrier {
+  const headers = message.headers;
+  const out: HeaderCarrier = {};
+  if (!headers) return out;
+  for (const key of Object.keys(headers)) {
+    const value = headerString(headers, key);
+    if (value !== undefined && value !== "") out[key] = value;
+  }
+  return out;
+}
+
 // --- Retry / delay topology (contract §6.4–§6.5) -------------------------------
 
 /** A single delay tier: the `<topic>.retry.<n>` topic and the delay (ms) it holds for. */
@@ -153,6 +179,12 @@ export interface PublishOptions {
   traceId?: string;
   /** Schedule via a retry tier (requires a {@link RetryTopics}); raises on a plain publisher. */
   delayMs?: number;
+  /**
+   * Out-of-band transport headers carried as Kafka record headers beside the contract `bq-*`
+   * headers (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s `publish`.
+   * The contract headers win a key collision; an empty/omitted carrier leaves the record unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one Kafka work topic with the §6 projection. */
@@ -181,15 +213,23 @@ export class KafkaPublisher {
         throw new BabelQueueError("Kafka has no native delayed delivery; a delay requires retry topics (none configured).");
       }
       const tier = this.retryTopics.tierForDelay(options.delayMs);
-      await this.sendRecord(tier.topic, envelope, options.delayMs, this.workTopic);
+      await this.sendRecord(tier.topic, envelope, options.headers, options.delayMs, this.workTopic);
     } else {
-      await this.sendRecord(this.workTopic, envelope);
+      await this.sendRecord(this.workTopic, envelope, options.headers);
     }
     return envelope.meta.id;
   }
 
-  private async sendRecord(topic: string, envelope: Envelope, delayMs?: number, originalTopic?: string): Promise<void> {
-    const headers = kafkaHeaders(envelope);
+  private async sendRecord(
+    topic: string,
+    envelope: Envelope,
+    extra?: HeaderCarrier | null,
+    delayMs?: number,
+    originalTopic?: string,
+  ): Promise<void> {
+    // The contract bq-* headers are seeded first, then the out-of-band riders are merged beside
+    // them without clobbering (the contract wins a collision).
+    const headers = mergeInto(kafkaHeaders(envelope), extra);
     if (delayMs != null) headers["bq-delay"] = String(delayMs);
     if (originalTopic != null) headers["bq-original-topic"] = originalTopic;
     await this.producer.send({
@@ -201,8 +241,13 @@ export class KafkaPublisher {
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw Kafka message. */
-export type BabelHandler = (envelope: Envelope, message: KafkaIncomingMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw Kafka message, and the out-of-band
+ * {@link HeaderCarrier} read from the record headers (empty when there are none). Pass `headers` to
+ * `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of the producer span
+ * (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: KafkaIncomingMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -278,7 +323,7 @@ export class KafkaConsumer {
     }
 
     try {
-      await handler(envelope, message);
+      await handler(envelope, message, headersOf(message));
       await this.commit(payload);
     } catch (error) {
       this.report(error, envelope, payload);

@@ -7,6 +7,18 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
+  `HeaderCarrier` from `@babelqueue/core@^1.4.0` as String **`MessageAttributes`** beside the
+  contract `bq-*` attributes (where `bq-trace-id` already rides) — the contract attributes win a key
+  collision and the merged set is bounded by SQS's 10-attribute limit (contract attributes seeded
+  first). `publish({ headers })` injects them; the consumer reads the inbound `MessageAttributes`
+  back and surfaces them to the handler's third argument, so the core's `otel` extract links the
+  consumer span as a true child of the producer span. New `mergeAttributes` / `headersOf` exports. A
+  header-less publish stays byte-identical. Bumped `@babelqueue/core` to `^1.4.0`.
+
 ## [1.0.0] - 2026-06-12
 
 ### Added

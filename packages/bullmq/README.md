@@ -48,6 +48,24 @@ unmapped URN throws unless you pass `onUnknownUrn`.
 > services. For raw cross-language queues, other SDKs read/write plain broker
 > queues directly.
 
+## OpenTelemetry tracing (ADR-0028)
+
+Cross-hop **span** linkage rides on the out-of-band `HeaderCarrier` from
+[`@babelqueue/core@^1.4.0`](https://www.npmjs.com/package/@babelqueue/core). Pass the carrier produced by
+`@babelqueue/core/otel`'s `publish` to this adapter's `publish({ headers })`; it is carried on
+BullMQ's native `telemetry.metadata` job-options slot (so the envelope — `job.data` — is never touched). On consume, the `processor` surfaces a delivered job's headers to the handler's third argument (and `headersOf(job)` reads them back),
+so the core's `otel` `wrapHandler` starts the consumer span as a true **child** of the producer span.
+
+```ts
+import { trace } from "@opentelemetry/api";
+import { publish as tracedPublish } from "@babelqueue/core/otel";
+import type { HeaderCarrier } from "@babelqueue/core";
+
+const headers: HeaderCarrier = {};
+await tracedPublish(trace.getTracer("orders"), urn, data,
+  () => adapterPublish(urn, data, { headers }), { headers });
+```
+
 ## License
 
 [MIT](../../LICENSE) © Muhammet Şafak · [babelqueue.com](https://babelqueue.com)

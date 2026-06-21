@@ -1,8 +1,15 @@
 {
   "name": "@babelqueue/bullmq",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "BullMQ adapter for BabelQueue — canonical-envelope jobs and a URN-routed processor.",
-  "keywords": ["babelqueue", "bullmq", "queue", "polyglot", "redis", "messaging"],
+  "keywords": [
+    "babelqueue",
+    "bullmq",
+    "queue",
+    "polyglot",
+    "redis",
+    "messaging"
+  ],
   "homepage": "https://babelqueue.com",
   "bugs": {
     "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
@@ -30,7 +37,9 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=18"
@@ -41,7 +50,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.0.0"
+    "@babelqueue/core": "^1.4.0"
   },
   "peerDependencies": {
     "bullmq": "^5.0.0"

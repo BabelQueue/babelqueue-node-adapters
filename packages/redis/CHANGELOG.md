@@ -7,6 +7,19 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
+  `HeaderCarrier` from `@babelqueue/core@^1.4.0` so a consumer span links as a true child of the
+  producer span. Redis lists have no native per-message metadata channel (the `LREM` ack handle
+  *is* the stored value), so a non-empty `publish({ headers })` RPUSHes a transport-owned JSON
+  **frame** (`{"__bq_frame":1,"headers":…,"body":<raw envelope>}`) that wraps the envelope without
+  touching it (GR-1). The consumer `unframe`s it and surfaces the carried headers to the handler's
+  third argument; a bare (pre-0028 / cross-version) value consumes with empty headers and
+  byte-for-byte the same ack handle. New exports: `frameValue`, `unframe`, `headersOf`, `FRAME_KEY`.
+  A header-less publish stays byte-identical. Bumped `@babelqueue/core` to `^1.4.0`.
+
 ## [1.0.0] - 2026-06-14
 
 ### Added

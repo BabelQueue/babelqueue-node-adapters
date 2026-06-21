@@ -1,8 +1,16 @@
 {
   "name": "@babelqueue/azure-service-bus",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Azure Service Bus adapter for BabelQueue — canonical-envelope publisher and a URN-routed consumer.",
-  "keywords": ["babelqueue", "azure", "servicebus", "asb", "queue", "polyglot", "messaging"],
+  "keywords": [
+    "babelqueue",
+    "azure",
+    "servicebus",
+    "asb",
+    "queue",
+    "polyglot",
+    "messaging"
+  ],
   "homepage": "https://babelqueue.com",
   "bugs": {
     "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
@@ -30,7 +38,9 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=18"
@@ -41,7 +51,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.0.0"
+    "@babelqueue/core": "^1.4.0"
   },
   "peerDependencies": {
     "@azure/service-bus": "^7.0.0"

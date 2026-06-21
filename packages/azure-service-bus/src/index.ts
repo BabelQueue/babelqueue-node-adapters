@@ -24,10 +24,19 @@
  * additive. Retry is broker-native — a failed handler `abandon`s the message, so it is
  * redelivered and `deliveryCount` is incremented; the authoritative attempt count is the
  * native `deliveryCount`, surfaced to handlers as `attempts = deliveryCount − 1`.
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides as additional native `applicationProperties` beside the contract `bq-*`
+ * properties — the contract properties win a key collision (merge-not-clobber), blanks dropped. On
+ * consume the inbound `applicationProperties` are surfaced as a `Record<string,string>` so the
+ * core's `otel` extract sees the `traceparent` and links the consumer span as a child. A
+ * header-less publish is byte-identical. GR-1: the wire envelope body is never touched.
  */
 
 import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { sanitizeHeaders } from "./headers.js";
 
 // --- Minimal Service Bus shapes (a structural subset of @azure/service-bus) -----
 
@@ -78,9 +87,16 @@ export interface AsbReceiver {
  * Project the envelope's contract fields onto a native Service Bus message — `subject`
  * = URN, `correlationId` = trace_id, `messageId` = meta.id, plus the `bq-` application
  * properties. The body stays authoritative.
+ *
+ * When `extra` is given, those out-of-band headers (e.g. a W3C `traceparent`, ADR-0028) are merged
+ * into `applicationProperties` **first**, then the contract `bq-*` properties are written so they
+ * always win a key collision (merge-not-clobber); blank keys/values are dropped. GR-1: the wire
+ * envelope body is never touched.
  */
-export function toServiceBusMessage(envelope: Envelope): AsbMessage {
+export function toServiceBusMessage(envelope: Envelope, extra?: HeaderCarrier | null): AsbMessage {
   const applicationProperties: { [key: string]: number | boolean | string } = {};
+  // Out-of-band riders go in first so the contract bq-* properties below win any key collision.
+  for (const [key, value] of Object.entries(sanitizeHeaders(extra))) applicationProperties[key] = value;
   if (envelope.meta.schema_version != null) {
     applicationProperties["bq-schema-version"] = envelope.meta.schema_version;
   }
@@ -102,6 +118,25 @@ export function toServiceBusMessage(envelope: Envelope): AsbMessage {
   return message;
 }
 
+/**
+ * Read a received message's `applicationProperties` back into a flat {@link HeaderCarrier},
+ * stringifying values defensively. Returns an empty object when there are none. Both the contract
+ * `bq-*` properties and any out-of-band rider (e.g. `traceparent`) surface — the core's `otel`
+ * extract reads only the keys it knows.
+ */
+export function headersOf(message: AsbReceivedMessage): HeaderCarrier {
+  const props = message.applicationProperties;
+  const out: HeaderCarrier = {};
+  if (!props) return out;
+  for (const key of Object.keys(props)) {
+    const value = props[key];
+    if (value == null) continue;
+    const s = String(value);
+    if (s !== "") out[key] = s;
+  }
+  return out;
+}
+
 // --- Publisher -----------------------------------------------------------------
 
 /** Options for {@link AsbPublisher.publish}. */
@@ -110,6 +145,13 @@ export interface PublishOptions {
   traceId?: string;
   /** Schedule native delayed delivery this many milliseconds from now (`scheduledEnqueueTimeUtc`). */
   delayMs?: number;
+  /**
+   * Out-of-band transport headers carried as native `applicationProperties` beside the contract
+   * `bq-*` properties (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s
+   * `publish`. The contract properties win a key collision; an empty/omitted carrier leaves the
+   * message unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one Service Bus entity with the §4 native projection. */
@@ -130,7 +172,7 @@ export class AsbPublisher {
       queue: this.sender.entityPath,
       traceId: options.traceId,
     });
-    const message = toServiceBusMessage(envelope);
+    const message = toServiceBusMessage(envelope, options.headers);
 
     if (options.delayMs != null && options.delayMs > 0) {
       message.applicationProperties = { ...message.applicationProperties, "bq-delay": options.delayMs };
@@ -144,8 +186,13 @@ export class AsbPublisher {
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw Service Bus message. */
-export type BabelHandler = (envelope: Envelope, message: AsbReceivedMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw Service Bus message, and the out-of-band
+ * {@link HeaderCarrier} read from the message's `applicationProperties` (empty when there are none).
+ * Pass `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of
+ * the producer span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: AsbReceivedMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -231,7 +278,7 @@ export class AsbConsumer {
     }
 
     try {
-      await handler(envelope, message);
+      await handler(envelope, message, headersOf(message));
       await this.receiver.completeMessage(message);
     } catch (error) {
       // Abandon releases the lock — the broker redelivers and increments deliveryCount.

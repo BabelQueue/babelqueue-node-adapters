@@ -56,6 +56,16 @@ new Worker("orders", processor({
 }), { connection: { host: "localhost", port: 6379 } });
 ```
 
+## OpenTelemetry tracing (ADR-0028)
+
+`BabelQueuePublisher.publish(urn, data, { headers })` accepts the out-of-band `HeaderCarrier`
+produced by [`@babelqueue/core/otel`](https://www.npmjs.com/package/@babelqueue/core)'s `publish`
+(e.g. a W3C `traceparent`) and threads it through to the underlying `@babelqueue/bullmq` job's native
+`telemetry.metadata` slot — the canonical envelope is never touched. Consume with the re-exported
+`processor`, whose handler receives the carried headers as its third argument, so the core's `otel`
+`wrapHandler` links the consumer span as a true **child** of the producer span. Requires
+`@babelqueue/core@^1.4.0`.
+
 ## License
 
 [MIT](../../LICENSE) © Muhammet Şafak · [babelqueue.com](https://babelqueue.com)

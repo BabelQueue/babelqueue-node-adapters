@@ -6,6 +6,17 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+### Added
+- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
+  `HeaderCarrier` from `@babelqueue/core@^1.4.0` in BullMQ's native context-propagation slot,
+  `JobsOptions.telemetry.metadata` (serialized to JSON; stored compactly as `tm` in Redis), so the
+  canonical envelope (`job.data`) stays byte-identical (GR-1). `publish(queue, urn, data, { headers })`
+  writes it (without clobbering an explicit `jobsOptions.telemetry.metadata`); the `processor`
+  surfaces the carried headers to the handler's third argument and `headersOf(job)` reads them back,
+  so the core's `otel` extract links the consumer span as a true child of the producer span. New
+  `headersOf` / `encodeMetadata` / `decodeMetadata` exports. A header-less publish leaves the job
+  options unchanged. Bumped `@babelqueue/core` to `^1.4.0`.
+
 ## [1.0.1] - 2026-06-07
 
 ### Changed

@@ -1,8 +1,16 @@
 {
   "name": "@babelqueue/rabbitmq",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "RabbitMQ adapter for BabelQueue — a canonical-envelope publisher and a URN-routed consumer with the §2 AMQP 0-9-1 property projection (type/correlation_id/message_id + x- headers) over amqplib.",
-  "keywords": ["babelqueue", "rabbitmq", "amqp", "amqplib", "queue", "polyglot", "messaging"],
+  "keywords": [
+    "babelqueue",
+    "rabbitmq",
+    "amqp",
+    "amqplib",
+    "queue",
+    "polyglot",
+    "messaging"
+  ],
   "homepage": "https://babelqueue.com",
   "bugs": {
     "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
@@ -30,7 +38,9 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=18"
@@ -41,7 +51,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.0.0"
+    "@babelqueue/core": "^1.4.0"
   },
   "peerDependencies": {
     "amqplib": "^0.10.0"

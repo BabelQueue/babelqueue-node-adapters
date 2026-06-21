@@ -6,6 +6,14 @@ All notable changes to `@babelqueue/nestjs` are documented here. The format foll
 
 ## [Unreleased]
 
+### Added
+- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** `BabelQueuePublisher.publish`
+  accepts an optional out-of-band `headers` carrier (e.g. a W3C `traceparent`) and threads it
+  through to the underlying `@babelqueue/bullmq` job's native `telemetry.metadata` slot — the
+  canonical envelope is never touched (GR-1). Consume with the re-exported `processor`, whose handler
+  receives the carried headers as its third argument, so the core's `otel` extract links the
+  consumer span as a true child of the producer span. Bumped `@babelqueue/core` to `^1.4.0`.
+
 ## [1.0.1] - 2026-06-07
 
 ### Fixed

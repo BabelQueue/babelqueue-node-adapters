@@ -14,10 +14,20 @@
  *
  * `amqplib` is an optional peer — you provide the channel (an amqplib `Channel` satisfies the
  * adapter structurally).
+ *
+ * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
+ * span linkage) rides in the native AMQP message header table (`properties.headers`) **beside** the
+ * contract `x-*` headers — the contract headers are written last so they always win a key collision
+ * (merge-not-clobber), and blank keys/values are dropped. On consume the inbound `properties.headers`
+ * are surfaced as a `Record<string,string>` so the core's `otel` extract sees the `traceparent` and
+ * links the consumer span as a child of the producer span. A header-less publish stays byte-identical.
+ * This mirrors the Go `/amqp` and PHP `AmqpTransport` wiring. GR-1: the wire envelope is untouched.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+
+import { sanitizeHeaders } from "./headers.js";
 
 // --- Minimal AMQP 0-9-1 shapes (a structural subset of amqplib) ----------------
 
@@ -49,9 +59,17 @@ export interface AmqpChannel {
 
 // --- Projection (contract §2.2–§2.3) -------------------------------------------
 
-/** Project the envelope onto native AMQP 0-9-1 properties + headers (§2.2–§2.3). */
-export function amqpProperties(envelope: Envelope): AmqpProperties {
-  const headers: Record<string, unknown> = { "x-attempts": envelope.attempts ?? 0 };
+/**
+ * Project the envelope onto native AMQP 0-9-1 properties + headers (§2.2–§2.3). When `extra` is
+ * given, those out-of-band headers (e.g. a `traceparent`, ADR-0028) are merged into the header
+ * table **first**, then the contract `x-*` headers are written last so they always win a key
+ * collision (merge-not-clobber); blank keys/values are dropped.
+ */
+export function amqpProperties(envelope: Envelope, extra?: HeaderCarrier | null): AmqpProperties {
+  const headers: Record<string, unknown> = {};
+  // Out-of-band riders go in first so the contract x-* headers below overwrite any collision.
+  for (const [key, value] of Object.entries(sanitizeHeaders(extra))) headers[key] = value;
+  headers["x-attempts"] = envelope.attempts ?? 0;
   if (envelope.meta.schema_version != null) headers["x-schema-version"] = envelope.meta.schema_version;
   if (envelope.meta.lang) headers["x-source-lang"] = envelope.meta.lang;
 
@@ -74,11 +92,37 @@ function messageBody(message: AmqpMessage): string {
   return Buffer.from(content).toString("utf8");
 }
 
+/**
+ * Map an inbound AMQP header table onto a flat {@link HeaderCarrier}, stringifying values
+ * defensively (AMQP field-tables are typed: strings, ints, byte buffers…). Returns an empty object
+ * when there are no headers, so a header-less delivery surfaces no headers. Both the contract `x-*`
+ * headers and any out-of-band rider (e.g. `traceparent`) surface — the core's `otel` extract reads
+ * only the keys it knows.
+ */
+export function headersOf(message: AmqpMessage): HeaderCarrier {
+  const table = message.properties?.headers;
+  const out: HeaderCarrier = {};
+  if (!table) return out;
+  for (const key of Object.keys(table)) {
+    const value = table[key];
+    if (value == null) continue;
+    const s = Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
+    if (s !== "") out[key] = s;
+  }
+  return out;
+}
+
 // --- Publisher -----------------------------------------------------------------
 
 /** Options for {@link RabbitMQPublisher.publish}. */
 export interface PublishOptions {
   traceId?: string;
+  /**
+   * Out-of-band transport headers carried in the AMQP header table beside the contract `x-*`
+   * headers (ADR-0028) — e.g. a W3C `traceparent` written by `@babelqueue/core/otel`'s `publish`.
+   * The contract headers win a key collision; an empty/omitted carrier leaves the publish unchanged.
+   */
+  headers?: HeaderCarrier;
 }
 
 /** Sends canonical-envelope messages to one RabbitMQ queue with the §2 projection. */
@@ -96,15 +140,24 @@ export class RabbitMQPublisher {
   /** Build + publish the canonical envelope; returns the message id (`meta.id`). */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
-    this.channel.sendToQueue(this.queue, Buffer.from(EnvelopeCodec.encode(envelope), "utf8"), amqpProperties(envelope));
+    this.channel.sendToQueue(
+      this.queue,
+      Buffer.from(EnvelopeCodec.encode(envelope), "utf8"),
+      amqpProperties(envelope, options.headers),
+    );
     return envelope.meta.id;
   }
 }
 
 // --- Consumer ------------------------------------------------------------------
 
-/** A URN handler. Receives the validated envelope and the raw AMQP message. */
-export type BabelHandler = (envelope: Envelope, message: AmqpMessage) => unknown | Promise<unknown>;
+/**
+ * A URN handler. Receives the validated envelope, the raw AMQP message, and the out-of-band
+ * {@link HeaderCarrier} read from the delivery's header table (empty when there are none). Pass
+ * `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of the
+ * producer span (ADR-0028).
+ */
+export type BabelHandler = (envelope: Envelope, message: AmqpMessage, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
 /** A map of URN → handler. */
 export type BabelHandlers = Record<string, BabelHandler>;
@@ -180,7 +233,7 @@ export class RabbitMQConsumer {
     }
 
     try {
-      await handler(envelope, message);
+      await handler(envelope, message, headersOf(message));
       this.channel.ack(message);
     } catch (error) {
       this.report(error, envelope, message);

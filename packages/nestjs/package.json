@@ -1,8 +1,15 @@
 {
   "name": "@babelqueue/nestjs",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "NestJS adapter for BabelQueue — a module + injectable publisher over BullMQ.",
-  "keywords": ["babelqueue", "nestjs", "bullmq", "queue", "polyglot", "messaging"],
+  "keywords": [
+    "babelqueue",
+    "nestjs",
+    "bullmq",
+    "queue",
+    "polyglot",
+    "messaging"
+  ],
   "homepage": "https://babelqueue.com",
   "bugs": {
     "url": "https://github.com/BabelQueue/babelqueue-node-adapters/issues"
@@ -30,7 +37,9 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=18"
   },
@@ -41,7 +50,7 @@
   },
   "dependencies": {
     "@babelqueue/bullmq": "^1.0.0",
-    "@babelqueue/core": "^1.0.0"
+    "@babelqueue/core": "^1.4.0"
   },
   "peerDependencies": {
     "@nestjs/common": "^10.0.0 || ^11.0.0",
