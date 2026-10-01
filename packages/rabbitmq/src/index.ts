@@ -172,7 +172,20 @@ export interface RabbitMQConsumerOptions {
   unknownUrn?: string;
   /** Called for a non-conformant message, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, message: AmqpMessage) => void;
+  /**
+   * First idle sleep (ms) after an empty `basic.get` in {@link RabbitMQConsumer.run} (default 50).
+   * Each further empty get doubles it up to {@link idleBackoffMaxMs}; a delivered message resets it.
+   * `0` disables the idle backoff.
+   */
+  idleBackoffMinMs?: number;
+  /** Ceiling (ms) for the exponential idle backoff (default 1000). */
+  idleBackoffMaxMs?: number;
 }
+
+const DEFAULT_IDLE_BACKOFF_MIN_MS = 50;
+const DEFAULT_IDLE_BACKOFF_MAX_MS = 1000;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Consumes a RabbitMQ queue with `basic.get` + manual ack: decode + validate, route to the handler
@@ -185,6 +198,8 @@ export class RabbitMQConsumer {
   private readonly maxTries: number;
   private readonly dlq: string | null;
   private readonly unknownUrn: string;
+  private readonly idleMinMs: number;
+  private readonly idleMaxMs: number;
 
   constructor(
     private readonly channel: AmqpChannel,
@@ -195,6 +210,14 @@ export class RabbitMQConsumer {
     this.maxTries = options.maxTries ?? 3;
     this.dlq = options.deadLetterQueue === undefined ? `${queue}.dlq` : options.deadLetterQueue;
     this.unknownUrn = options.unknownUrn ?? UnknownUrnStrategy.FAIL;
+    const idleMin = options.idleBackoffMinMs ?? DEFAULT_IDLE_BACKOFF_MIN_MS;
+    const idleMax = options.idleBackoffMaxMs ?? DEFAULT_IDLE_BACKOFF_MAX_MS;
+    if (!Number.isFinite(idleMin) || !Number.isFinite(idleMax)) {
+      // NaN/Infinity would reach setTimeout as ~1 ms — the busy-loop the backoff exists to prevent.
+      throw new BabelQueueError("idleBackoffMinMs and idleBackoffMaxMs must be finite numbers.");
+    }
+    this.idleMinMs = Math.max(0, idleMin);
+    this.idleMaxMs = Math.max(this.idleMinMs, idleMax);
   }
 
   /** Reserve + route + settle one message. Returns true if one was handled, false when empty. */
@@ -205,10 +228,21 @@ export class RabbitMQConsumer {
     return true;
   }
 
-  /** Poll while `shouldContinue` returns true. */
+  /**
+   * Poll while `shouldContinue` returns true. `basic.get` does not block, so an empty queue backs
+   * off exponentially (`idleBackoffMinMs` doubling to `idleBackoffMaxMs`) instead of busy-looping;
+   * a delivered message resets the backoff.
+   */
   async run(shouldContinue: () => boolean): Promise<void> {
+    let idle = 0;
     while (shouldContinue()) {
-      await this.poll();
+      if (await this.poll()) {
+        idle = 0;
+        continue;
+      }
+      if (this.idleMinMs === 0) continue;
+      idle = idle === 0 ? this.idleMinMs : Math.min(idle * 2, this.idleMaxMs);
+      await sleep(idle);
     }
   }
 

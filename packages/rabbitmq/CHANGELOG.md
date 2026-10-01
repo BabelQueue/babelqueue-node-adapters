@@ -9,6 +9,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-01
+
+### Fixed
+- **No more busy-loop on an empty queue.** `RabbitMQConsumer.run` now backs off exponentially after
+  an empty `basic.get` — `idleBackoffMinMs` (default 50 ms) doubling up to `idleBackoffMaxMs`
+  (default 1000 ms) — and resets the backoff as soon as a message is delivered. Both options are
+  optional; `idleBackoffMinMs: 0` restores the old tight loop. A non-finite value (`NaN`,
+  `Infinity`) is rejected at construction with a `BabelQueueError`.
+
+### Added
+- `RabbitMQConsumerOptions.idleBackoffMinMs` / `idleBackoffMaxMs`.
+
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
   `HeaderCarrier` from `@babelqueue/core@^1.4.0` in the native AMQP message **header table**

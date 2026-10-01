@@ -161,3 +161,74 @@ test("run stops when the supplier returns false", async () => {
   await new RabbitMQConsumer(channel, "orders", {}).run(() => false);
   assert.equal(channel.acked, 0);
 });
+
+// --- idle backoff (no busy-loop on an empty queue) ----------------------------
+
+/**
+ * Hand-rolled fake timers (Node 18 has no `mock.timers`): `setTimeout` resolves on the next
+ * microtask and advances a virtual clock by the requested delay, recording each delay.
+ */
+async function withFakeTimers(fn: (clock: { now: number; delays: number[] }) => Promise<void>): Promise<void> {
+  const clock = { now: 0, delays: [] as number[] };
+  const real = globalThis.setTimeout;
+  globalThis.setTimeout = ((cb: () => void, ms?: number) => {
+    clock.delays.push(ms ?? 0);
+    clock.now += ms ?? 0;
+    queueMicrotask(cb);
+    return 0 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  try {
+    await fn(clock);
+  } finally {
+    globalThis.setTimeout = real;
+  }
+}
+
+class CountingChannel extends FakeChannel {
+  gets = 0;
+  override async get(): Promise<AmqpMessage | false> {
+    this.gets += 1;
+    return super.get();
+  }
+}
+
+test("run backs off exponentially on an empty queue (bounded basic.get calls)", async () => {
+  await withFakeTimers(async (clock) => {
+    const channel = new CountingChannel();
+    await new RabbitMQConsumer(channel, "orders", {}).run(() => clock.now < 10_000);
+    assert.deepEqual(clock.delays.slice(0, 7), [50, 100, 200, 400, 800, 1000, 1000]);
+    assert.ok(clock.delays.every((d) => d <= 1000));
+    // 10 s of idle time: 5 ramp-up gets + ~9 capped ones — not thousands.
+    assert.ok(channel.gets <= 16, `expected a bounded number of gets, got ${channel.gets}`);
+  });
+});
+
+test("a delivered message resets the idle backoff; options are honoured", async () => {
+  await withFakeTimers(async (clock) => {
+    const channel = new CountingChannel([false, false, incoming(envelope(0)), false, false]);
+    let polls = 0;
+    await new RabbitMQConsumer(channel, "orders", { [URN]: () => {} }, {
+      idleBackoffMinMs: 10,
+      idleBackoffMaxMs: 25,
+    }).run(() => ++polls <= 6);
+    assert.deepEqual(clock.delays, [10, 20, 10, 20, 25]);
+    assert.equal(channel.acked, 1);
+  });
+});
+
+test("idleBackoffMinMs = 0 disables the idle sleep", async () => {
+  await withFakeTimers(async (clock) => {
+    const channel = new CountingChannel();
+    let polls = 0;
+    await new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMinMs: 0 }).run(() => ++polls <= 3);
+    assert.equal(channel.gets, 3);
+    assert.equal(clock.delays.length, 0);
+  });
+});
+
+test("non-finite idle backoff bounds are rejected at construction", () => {
+  const channel = new CountingChannel();
+  assert.throws(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMinMs: Number.NaN }), /finite/);
+  assert.throws(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMaxMs: Number.POSITIVE_INFINITY }), /finite/);
+  assert.doesNotThrow(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMinMs: -5 }));
+});

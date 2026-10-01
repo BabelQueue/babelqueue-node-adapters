@@ -54,11 +54,37 @@ For LocalStack/ElasticMQ, point the `SQS` client's `endpoint` there.
 | `meta.created_at` | `MessageAttributes.bq-created-at` (Number, ms) |
 | `attempts` | reconciled to `ApproximateReceiveCount − 1` on receive |
 | reserve / ack | visibility timeout → `DeleteMessage` |
+| release (nack) | `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout = releaseDelay)` |
 
-Retry is **SQS-native**: a throwing handler leaves the message undeleted, so SQS
-redelivers it after the visibility timeout (at-least-once). The loop never stops on a
-bad message — use `onError` / `onUnknownUrn` to observe. The envelope is unchanged
-(`schema_version` stays `1`); SQS is purely additive.
+Retry is **SQS-native** (contract §3.5): a throwing handler's message is never deleted;
+it is released with `ChangeMessageVisibility`, so SQS redelivers it after
+`releaseDelay` seconds (**default `0`** — visible again immediately; a number or a
+function of `attempts`, clamped to `0…43200`). If the release call itself fails, the
+error goes to `onError` and the message is redelivered after the visibility timeout
+(at-least-once). A `DeleteMessage` that fails *after* a successful handler is not a
+handler failure: it reaches `onError` as an `SqsDeleteError` (broker error in `cause`)
+and the message is **not** released — it returns only after its visibility timeout, so
+dedupe on `meta.id` if the side effect must not repeat. The loop never stops on a bad message — use `onError` /
+`onUnknownUrn` to observe. The envelope is unchanged (`schema_version` stays `1`); SQS
+is purely additive.
+
+> **Poison messages — configure a `RedrivePolicy`.** With the `0 s` default, a handler
+> that always fails is retried back-to-back until the queue's native `RedrivePolicy`
+> (`maxReceiveCount`) moves the message to its dead-letter queue. Without one, such a
+> message loops forever. Give every consumed queue a `RedrivePolicy` (e.g.
+> `maxReceiveCount` 3–5 → `<queue>.dlq`), and/or pass a backoff:
+>
+> ```ts
+> new SqsConsumer(sqs, url, handlers, {
+>   releaseDelay: (attempts) => Math.min(2 ** attempts * 5, 900),
+> });
+> ```
+
+An unmapped URN follows `unknownUrn`: `fail` (report, leave), `delete`, `release`
+(`ChangeMessageVisibility` after `unknownUrnReleaseDelay`, default `0`) or
+`dead_letter` (annotated envelope to the opt-in `deadLetterQueueUrl`, then delete; a
+`.fifo` DLQ gets `MessageGroupId` + `MessageDeduplicationId`). Without `unknownUrn`,
+`onUnknownUrn` is called and the message deleted, or — with no hook — reported and left.
 
 ## Test
 

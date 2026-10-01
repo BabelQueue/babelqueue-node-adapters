@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/rabbitmq",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "RabbitMQ adapter for BabelQueue — a canonical-envelope publisher and a URN-routed consumer with the §2 AMQP 0-9-1 property projection (type/correlation_id/message_id + x- headers) over amqplib.",
   "keywords": [
     "babelqueue",

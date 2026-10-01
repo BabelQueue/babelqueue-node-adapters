@@ -21,7 +21,8 @@
  * This implements §3 of the broker-bindings contract: the canonical envelope is the
  * message body, projected onto native SQS `MessageAttributes`. The envelope is
  * unchanged (`schema_version` stays 1); SQS is purely additive. Retry is SQS-native
- * (a failed handler leaves the message for visibility-timeout redelivery); the
+ * (a failed handler's message is released via `ChangeMessageVisibility` after
+ * `releaseDelay`, default 0 s — pair the queue with a `RedrivePolicy`); the
  * authoritative attempt count is `ApproximateReceiveCount`, surfaced to handlers as
  * `attempts = count − 1`.
  *
@@ -35,13 +36,16 @@
  * `/sqs` and PHP `SqsTransport` wiring. GR-1: the wire envelope body is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
+import { BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy, annotate } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
 /** SQS allows at most 10 user message attributes per message. */
 const MAX_ATTRIBUTES = 10;
+
+/** The SQS ceiling for a `VisibilityTimeout` (12 hours, in seconds). */
+export const MAX_VISIBILITY_TIMEOUT = 43_200;
 
 // --- Minimal SQS shapes (a structural subset of @aws-sdk/client-sqs) -----------
 
@@ -82,6 +86,20 @@ export interface SqsApi {
   sendMessage(input: SendMessageInput): Promise<{ MessageId?: string } | unknown>;
   receiveMessage(input: ReceiveMessageInput): Promise<{ Messages?: SqsMessage[] }>;
   deleteMessage(input: { QueueUrl: string; ReceiptHandle: string }): Promise<unknown>;
+  /**
+   * The §3.5 release primitive. Optional so existing structural clients keep compiling; it is
+   * required (checked at construction) when a consumer sets `releaseDelay` or the `release`
+   * unknown-URN strategy explicitly. Without it the default handler-failure release degrades to
+   * leaving the message for visibility-timeout redelivery. The aggregated `SQS` class from
+   * `@aws-sdk/client-sqs` provides it.
+   */
+  changeMessageVisibility?(input: ChangeMessageVisibilityInput): Promise<unknown>;
+}
+
+export interface ChangeMessageVisibilityInput {
+  QueueUrl: string;
+  ReceiptHandle: string;
+  VisibilityTimeout: number;
 }
 
 // --- Attribute projection (contract §3.2) --------------------------------------
@@ -234,9 +252,44 @@ export type BabelHandlers = Record<string, BabelHandler>;
 
 /** Options for {@link SqsConsumer}. */
 export interface SqsConsumerOptions {
-  /** Called instead of erroring when a message's URN has no handler (then the message is deleted). */
+  /**
+   * Called when a message's URN has no handler. Without `unknownUrn` the message is then deleted
+   * (the original behaviour); with `unknownUrn` set it is a notification hook and the strategy
+   * decides the message's fate.
+   */
   onUnknownUrn?: (envelope: IncomingEnvelope, message: SqsMessage) => unknown | Promise<unknown>;
-  /** Called for a non-conformant envelope, an unmapped URN (no `onUnknownUrn`), or a throwing handler. The loop never stops. */
+  /**
+   * Unknown-URN strategy per contract §3.5 — `fail` | `delete` | `release` | `dead_letter`
+   * ({@link UnknownUrnStrategy}). Omitted keeps the original behaviour (`onUnknownUrn` → delete,
+   * otherwise report and leave for visibility-timeout redelivery, i.e. `fail`). `release` uses
+   * `ChangeMessageVisibility` with {@link unknownUrnReleaseDelay}; `dead_letter` sends the annotated
+   * envelope to {@link deadLetterQueueUrl} then deletes, degrading to `delete` when no DLQ is set.
+   */
+  unknownUrn?: string;
+  /** Backoff (seconds) for the `release` unknown-URN strategy (default 0 = redeliver now). */
+  unknownUrnReleaseDelay?: number;
+  /**
+   * Backoff before a failed message is redelivered. A failed handler always releases the message
+   * via `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout)` (contract §3.5); this sets the
+   * `VisibilityTimeout` — a number of seconds, or a function of the (reconciled) `attempts`
+   * returning seconds (e.g. an exponential backoff). Clamped to `0…43200`. Default `0`: the message
+   * is visible again immediately. A permanently failing handler therefore retries without pause
+   * until the queue's `RedrivePolicy` (`maxReceiveCount`) moves it to the DLQ — configure one.
+   */
+  releaseDelay?: number | ((attempts: number) => number);
+  /**
+   * The cross-language `<queue>.dlq` URL for the `dead_letter` strategy (opt-in; default none). A
+   * `.fifo` DLQ is sent with `MessageGroupId` (the source queue name) and `MessageDeduplicationId`
+   * (`meta.id`).
+   */
+  deadLetterQueueUrl?: string | null;
+  /**
+   * Called for a non-conformant envelope, an unmapped URN (no `onUnknownUrn`), a throwing handler,
+   * a throwing `onUnknownUrn` under an `unknownUrn` strategy, a failed release / dead-letter send, or
+   * a failed delete after successful processing (an {@link SqsDeleteError} wrapping the broker
+   * error; never released). The message is then left for visibility-timeout redelivery. The loop
+   * never stops on these.
+   */
   onError?: (error: unknown, envelope: IncomingEnvelope, message: SqsMessage) => void;
   /** Long-poll wait seconds (default 20). */
   waitTimeSeconds?: number;
@@ -247,10 +300,27 @@ export interface SqsConsumerOptions {
 }
 
 /**
+ * Reported via `onError` when `DeleteMessage` fails for a message whose processing already succeeded
+ * (a handler returned normally, or the unknown-URN strategy chose `delete` / `dead_letter`). The
+ * broker error is `cause`. Distinct from a handler failure: the message is NOT released, so it is
+ * redelivered only after its visibility timeout expires (at-least-once; dedupe on `meta.id` with the
+ * idempotency helper if the side effect must not repeat).
+ */
+export class SqsDeleteError extends BabelQueueError {
+  constructor(cause: unknown) {
+    super("Failed to delete a processed SQS message; it will be redelivered after its visibility timeout.");
+    this.name = "SqsDeleteError";
+    this.cause = cause;
+  }
+}
+
+/**
  * Polls an SQS queue, decodes + validates each message, routes it to the handler
- * registered for its URN, and deletes it on success. A throwing handler leaves the
- * message undeleted — SQS redelivers it after the visibility timeout (at-least-once);
- * `attempts` is reconciled to `ApproximateReceiveCount − 1` for the handler.
+ * registered for its URN, and deletes it on success. A throwing handler's message is released via
+ * `ChangeMessageVisibility` after `releaseDelay` (default 0 s, contract §3.5); if the release itself
+ * fails the message is left for visibility-timeout redelivery (at-least-once);
+ * `attempts` is reconciled to `ApproximateReceiveCount − 1` for the handler. An unmapped URN
+ * follows the `unknownUrn` strategy (`fail` | `delete` | `release` | `dead_letter`).
  */
 export class SqsConsumer {
   constructor(
@@ -258,7 +328,18 @@ export class SqsConsumer {
     private readonly queueUrl: string,
     private readonly handlers: BabelHandlers,
     private readonly options: SqsConsumerOptions = {},
-  ) {}
+  ) {
+    const strategy = options.unknownUrn;
+    if (strategy !== undefined && !(Object.values(UnknownUrnStrategy) as string[]).includes(strategy)) {
+      throw new BabelQueueError(`Unknown unknownUrn strategy "${strategy}".`);
+    }
+    const needsRelease = options.releaseDelay != null || strategy === UnknownUrnStrategy.RELEASE;
+    if (needsRelease && typeof client.changeMessageVisibility !== "function") {
+      throw new BabelQueueError(
+        "SqsConsumer release requires a client with changeMessageVisibility (contract §3.5).",
+      );
+    }
+  }
 
   /** Receive one batch, route each message, delete the ones handled. Returns the batch size. */
   async poll(): Promise<number> {
@@ -311,6 +392,44 @@ export class SqsConsumer {
     const urn = EnvelopeCodec.urn(envelope);
     const handler = this.handlers[urn];
     if (!handler) {
+      await this.unknown(urn, envelope as Envelope, message);
+      return;
+    }
+
+    try {
+      await handler(envelope, message, headersOf(message));
+    } catch (error) {
+      this.options.onError?.(error, envelope, message);
+      await this.guard(envelope, message, async () => {
+        const delay = this.options.releaseDelay ?? 0;
+        const attempts = typeof envelope.attempts === "number" ? envelope.attempts : 0;
+        await this.release(message, typeof delay === "function" ? delay(attempts) : delay);
+      });
+      return;
+    }
+    // Outside the handler's try: a failed delete is not a handler failure. It is reported as an
+    // SqsDeleteError and the message is NOT released — releasing at the (default 0 s) backoff would
+    // redeliver an already-processed message immediately; it returns on visibility expiry instead.
+    await this.guard(envelope, message, () => this.deleteHandled(message));
+  }
+
+  /**
+   * Run a release / dead-letter step; a failure (e.g. `MessageNotInflight`, a missing IAM grant, a
+   * throwing `releaseDelay`) is reported to `onError` and the message is left undeleted, so
+   * visibility expiry still redelivers it. Never lets the error stop the consume loop.
+   */
+  private async guard(envelope: IncomingEnvelope, message: SqsMessage, step: () => Promise<void>): Promise<void> {
+    try {
+      await step();
+    } catch (error) {
+      this.options.onError?.(error, envelope, message);
+    }
+  }
+
+  /** Apply the unknown-URN strategy (contract §3.5). */
+  private async unknown(urn: string, envelope: Envelope, message: SqsMessage): Promise<void> {
+    const strategy = this.options.unknownUrn;
+    if (strategy === undefined) {
       if (this.options.onUnknownUrn) {
         await this.options.onUnknownUrn(envelope, message);
         await this.delete(message);
@@ -320,12 +439,68 @@ export class SqsConsumer {
       return;
     }
 
+    await this.guard(envelope, message, async () => {
+      await this.options.onUnknownUrn?.(envelope, message);
+    });
+    switch (strategy) {
+      case UnknownUrnStrategy.DELETE:
+        await this.guard(envelope, message, () => this.deleteHandled(message));
+        return;
+      case UnknownUrnStrategy.RELEASE:
+        await this.guard(envelope, message, () => this.release(message, this.options.unknownUrnReleaseDelay ?? 0));
+        return;
+      case UnknownUrnStrategy.DEAD_LETTER:
+        await this.guard(envelope, message, async () => {
+          await this.deadLetter(envelope, "unknown_urn");
+          await this.deleteHandled(message);
+        });
+        return;
+      default:
+        // FAIL: surface and do NOT delete — visibility expiry redelivers, native redrive quarantines.
+        this.options.onError?.(new UnknownUrnError(urn), envelope, message);
+    }
+  }
+
+  /** Make the message visible again after `seconds` via `ChangeMessageVisibility`; never deletes. */
+  private async release(message: SqsMessage, seconds: number): Promise<void> {
+    if (!message.ReceiptHandle || !this.client.changeMessageVisibility) return;
+    const timeout = Number.isFinite(seconds)
+      ? Math.min(MAX_VISIBILITY_TIMEOUT, Math.max(0, Math.floor(seconds)))
+      : 0;
+    await this.client.changeMessageVisibility({
+      QueueUrl: this.queueUrl,
+      ReceiptHandle: message.ReceiptHandle,
+      VisibilityTimeout: timeout,
+    });
+  }
+
+  /** Send the annotated envelope to the opt-in DLQ; a no-op (→ plain delete) when none is set. */
+  private async deadLetter(envelope: Envelope, reason: string): Promise<void> {
+    const dlq = this.options.deadLetterQueueUrl;
+    if (!dlq) return;
+    const source = envelope.meta?.queue ?? queueNameFromUrl(this.queueUrl);
+    const annotated = annotate(envelope, reason, source, {
+      attempts: envelope.attempts ?? 0,
+    });
+    const input: SendMessageInput = {
+      QueueUrl: dlq,
+      MessageBody: EnvelopeCodec.encode(annotated),
+      MessageAttributes: toMessageAttributes(annotated),
+    };
+    if (dlq.endsWith(".fifo")) {
+      // A FIFO DLQ (`<queue>.dlq.fifo`) rejects a send without a group; dedup on meta.id (§3.2).
+      input.MessageGroupId = source;
+      if (annotated.meta?.id) input.MessageDeduplicationId = annotated.meta.id;
+    }
+    await this.client.sendMessage(input);
+  }
+
+  /** Delete a message whose processing already succeeded; a broker failure becomes an SqsDeleteError. */
+  private async deleteHandled(message: SqsMessage): Promise<void> {
     try {
-      await handler(envelope, message, headersOf(message));
       await this.delete(message);
     } catch (error) {
-      // Leave the message undeleted — SQS redelivers after the visibility timeout.
-      this.options.onError?.(error, envelope, message);
+      throw new SqsDeleteError(error);
     }
   }
 
