@@ -16,7 +16,7 @@ jobs:
       matrix:
         node: [ "18", "20", "22", "24" ]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -38,7 +38,7 @@ jobs:
     name: Static analysis (ESLint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -51,7 +51,7 @@ jobs:
     name: Coverage gate (>=90% lines)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -68,7 +68,7 @@ jobs:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify vendored conformance matches the canonical suite
         # @babelqueue/sqs, @babelqueue/azure-service-bus, @babelqueue/pulsar, @babelqueue/kafka,
         # @babelqueue/artemis, @babelqueue/redis and @babelqueue/rabbitmq each vendor the conformance
