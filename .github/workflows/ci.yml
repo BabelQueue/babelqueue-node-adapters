@@ -74,8 +74,9 @@ jobs:
         # @babelqueue/artemis, @babelqueue/redis and @babelqueue/rabbitmq each vendor the conformance
         # suite (for their binding tests); guard every copy against drift.
         run: |
-          git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          git clone --depth 1 --branch v1.0.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
           for pkg in sqs azure-service-bus pulsar kafka artemis redis rabbitmq; do
+            diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "packages/$pkg/test/conformance/CONFORMANCE_VERSION"
             diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/$pkg/test/conformance/manifest.json"
             diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/$pkg/test/conformance/fixtures"
             diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/$pkg/test/conformance/schema"
