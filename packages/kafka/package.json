@@ -21,7 +21,7 @@
     "directory": "packages/kafka"
   },
   "license": "MIT",
-  "author": "Muhammet Şafak <info@muhammetsafak.com.tr>",
+  "author": "Muhammet Şafak <info@muhammetsafak.com>",
   "type": "module",
   "exports": {
     ".": {
