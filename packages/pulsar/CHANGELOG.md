@@ -9,15 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-10
+
 ### Added
-- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
-  `HeaderCarrier` from `@babelqueue/core@^1.4.0` as additional native Pulsar **message properties**
-  beside the contract `bq-*` properties — the contract properties win a key collision
-  (merge-not-clobber). `publish({ headers })` injects them; the consumer reads `getProperties()`
-  back and surfaces them to the handler's third argument, so the core's `otel` extract links the
-  consumer span as a true child of the producer span. New `headersOf` export; `toPulsarMessage`
-  takes an optional headers carrier. A header-less publish stays byte-identical. Bumped
-  `@babelqueue/core` to `^1.4.0`.
 - `PulsarConsumerOptions.onRoutingMismatch(propertyUrn, bodyUrn, envelope)` — optional, separate
   hook (default no-op) called when the `bq-job` property and the body URN differ. Its errors and
   rejections are swallowed (`Promise.resolve(result).catch`); it never affects acknowledgement and is not routed
@@ -36,7 +30,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
   body URN and ignored `bq-attempts`. The handler still receives the body envelope, and a body
   without `job` is still rejected. `attempts` is written to the envelope only when the body holds an
   integer value and it really changes, so a body with a missing or non-integer `attempts` is still
-  rejected by `accepts()`. No version bump; envelope unchanged (`schema_version: 1`).
+  rejected by `accepts()`. Envelope unchanged (`schema_version: 1`).
+
+## [1.1.0] - 2026-06-21
+
+### Added
+- **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
+  `HeaderCarrier` from `@babelqueue/core@^1.4.0` as additional native Pulsar **message properties**
+  beside the contract `bq-*` properties — the contract properties win a key collision
+  (merge-not-clobber). `publish({ headers })` injects them; the consumer reads `getProperties()`
+  back and surfaces them to the handler's third argument, so the core's `otel` extract links the
+  consumer span as a true child of the producer span. New `headersOf` export; `toPulsarMessage`
+  takes an optional headers carrier. A header-less publish stays byte-identical. Bumped
+  `@babelqueue/core` to `^1.4.0`.
 
 ## [1.0.0] - 2026-06-13
 
