@@ -73,6 +73,13 @@ consumer falls back to the body's `attempts`. The result is reconciled to
 maps directly with **no −1** (the body is only rewritten when it holds an integer `attempts` that really changes; a missing or non-integer `attempts` is still rejected) — so a republish-driven retry and a native redelivery both
 converge on the same number.
 
+**Version gate (§5.7 step 3).** Before the body is decoded the consumer reads
+`bq-schema-version`. Missing or blank: nothing changes ("blank" is the same set in every SDK: the empty string or only ASCII whitespace — space, `\t`, `\n`, `\v`, `\f`, `\r`; NBSP, U+0085, U+FEFF, U+3000 and the like are not blank). Any value other than the core's supported
+`SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message **undecoded** through the same
+path as a non-conformant envelope — `onError` (an error naming the version, with an empty
+envelope) and a `negativeAcknowledge`; the handler, `onUnknownUrn` and `onRoutingMismatch` are
+not called.
+
 If the `bq-job` property and the body's URN differ, routing follows the property and the
 optional `onRoutingMismatch(propertyUrn, bodyUrn, envelope)` hook is called (default: no-op).
 It is separate from `onError`, its failures (including a rejected promise) are swallowed, and

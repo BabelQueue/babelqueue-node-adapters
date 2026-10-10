@@ -33,6 +33,12 @@
  * that fits a 32-bit int), reconciled to `max(bq-attempts, getRedeliveryCount())` — no −1,
  * because Pulsar's redelivery count is 0-based. The handler still receives the body's envelope.
  *
+ * **Version gate (§5.7 step 3).** Before the body is decoded the consumer reads the
+ * `bq-schema-version` property. A missing or blank value (empty or only ASCII whitespace) changes nothing; any value other than
+ * the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message undecoded
+ * through the same path as a non-conformant envelope — `onError` (with an error naming the
+ * version, and an empty envelope since nothing was decoded) and a `negativeAcknowledge`.
+ *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional native Pulsar **message properties** beside the contract `bq-*`
  * properties — the contract properties win a key collision (merge-not-clobber), and blanks are
@@ -41,7 +47,7 @@
  * header-less publish is byte-identical. GR-1: the wire envelope (the payload) is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
+import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { mergeInto } from "./headers.js";
@@ -223,6 +229,21 @@ function parseAttempts(raw: string | undefined): number | undefined {
   return value <= MAX_ATTEMPTS ? value : undefined;
 }
 
+/** Blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — not `String.prototype.trim()`'s wider set. */
+const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * The `bq-schema-version` value when it is present, non-blank and not the supported version
+ * (compared against the core's `SCHEMA_VERSION`, exact string match: `"01"`, `" 1"`, `"1.0"` are
+ * rejected). Blank means the empty string or only ASCII whitespace (the same set in every SDK, GR-5);
+ * NBSP, U+0085, U+FEFF, U+3000 and the like are not blank. `undefined` when the message may be decoded.
+ */
+function unsupportedSchemaVersion(properties: { [key: string]: string }): string | undefined {
+  const raw: unknown = properties["bq-schema-version"];
+  if (typeof raw !== "string" || BLANK_ASCII.test(raw)) return undefined;
+  return raw === String(SCHEMA_VERSION) ? undefined : raw;
+}
+
 function isReceiveTimeout(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /timeout/i.test(message);
@@ -268,9 +289,23 @@ export class PulsarConsumer {
   }
 
   private async handle(message: PulsarReceivedMessage): Promise<void> {
-    const envelope = EnvelopeCodec.decode(decodePayload(message.getData()));
-
     const properties = safeProperties(message);
+
+    // §5.7 step 3: gate on bq-schema-version before the body is decoded.
+    const rejectedVersion = unsupportedSchemaVersion(properties);
+    if (rejectedVersion !== undefined) {
+      this.options.onError?.(
+        new BabelQueueError(
+          `Rejected a message from Apache Pulsar with unsupported bq-schema-version "${rejectedVersion}" (supported: ${SCHEMA_VERSION}).`,
+        ),
+        {},
+        message,
+      );
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+
+    const envelope = EnvelopeCodec.decode(decodePayload(message.getData()));
 
     // attempts: the authoritative bq-attempts property (the body's value when it is absent or
     // invalid), then max(.., getRedeliveryCount()): the redelivery count is 0-based, so it maps

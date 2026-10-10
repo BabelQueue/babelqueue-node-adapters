@@ -24,6 +24,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   through `onError`. It is called only for an accepted envelope, after `accepts()` and the `attempts` reconcile.
 
 ### Fixed
+- **Consumer version-gates on `bq-schema-version` (broker-bindings §5.7 step 3).** Before the body
+  is decoded the consumer reads the `bq-schema-version` property. A missing or blank value changes
+  nothing; "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (`String.prototype.trim()` is not used: it also trims NBSP, U+FEFF, U+2028, U+3000, ...) a value other than the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...)
+  rejects the message undecoded through the existing non-conformant-envelope path: `onError` (an
+  error naming the version, with an empty envelope) and a `negativeAcknowledge`. No wire change.
 - **Consumer now follows broker-bindings §5.2/§5.7.** It routes on the `bq-job` property (falling
   back to the body URN when the property is absent or blank) and takes `attempts` from the
   authoritative `bq-attempts` property (falling back to the body when it is absent or not

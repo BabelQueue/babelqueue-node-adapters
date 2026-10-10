@@ -399,3 +399,67 @@ test("onRoutingMismatch is not called for a rejected envelope", async () => {
   assert.equal(called, false);
   assert.equal(consumer.nacked.length, 1);
 });
+
+// --- bq-schema-version gate (§5.7 step 3) ----------------------------------------
+
+test("a missing or blank bq-schema-version decodes and delivers as before", async () => {
+  // blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK
+  const blanks = ["", "  ", "\u000B", "\f", " \t\n\v\f\r"];
+  for (const props of [{} as { [key: string]: string }, ...blanks.map((v) => ({ "bq-schema-version": v }))]) {
+    const consumer = new FakeConsumer([new FakeMessage(body(), 0, props)]);
+    const seen: Envelope[] = [];
+    await new PulsarConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
+    assert.equal(seen.length, 1);
+    assert.equal(consumer.acked.length, 1);
+    assert.equal(consumer.nacked.length, 0);
+  }
+});
+
+test("bq-schema-version \"1\" is delivered", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(body(), 0, { "bq-schema-version": "1" })]);
+  const seen: Envelope[] = [];
+  await new PulsarConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
+  assert.equal(seen.length, 1);
+  assert.equal(consumer.acked.length, 1);
+});
+
+test("an unsupported bq-schema-version is rejected undecoded: onError + nack, no handler", async () => {
+  // The body is not JSON: decoding it would yield the generic "non-conformant envelope" error,
+  // so an error naming the version proves the gate ran before the decode.
+  const garbage = "{not json";
+  // NBSP, U+001C, U+0085, U+FEFF and U+3000 are not ASCII whitespace, hence not blank
+  for (const value of ["2", "x", "01", " 1", "1.0", "-1", "\u00A0", "\u001C", "\u0085", "\uFEFF", "\u3000"]) {
+    const consumer = new FakeConsumer([new FakeMessage(garbage, 0, { "bq-schema-version": value, "bq-job": URN })]);
+    const errors: Array<{ error: unknown; envelope: unknown }> = [];
+    let handled = false;
+    await new PulsarConsumer(
+      consumer,
+      { [URN]: () => void (handled = true) },
+      { onError: (error, envelope) => void errors.push({ error, envelope }) },
+    ).poll();
+
+    assert.equal(handled, false, `value ${JSON.stringify(value)}`);
+    assert.equal(consumer.acked.length, 0);
+    assert.equal(consumer.nacked.length, 1);
+    assert.equal(errors.length, 1);
+    const message = (errors[0].error as Error).message;
+    assert.match(message, /unsupported bq-schema-version/);
+    assert.ok(message.includes(`"${value}"`), message);
+    assert.deepEqual(errors[0].envelope, {}); // nothing was decoded
+  }
+});
+
+test("a gated message neither reaches onUnknownUrn nor the routing-mismatch hook", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(body(), 0, { "bq-schema-version": "2", "bq-job": OTHER })]);
+  let unknown = false;
+  let mismatch = false;
+  await new PulsarConsumer(consumer, { [URN]: () => undefined }, {
+    onUnknownUrn: () => void (unknown = true),
+    onRoutingMismatch: () => void (mismatch = true),
+    onError: () => undefined,
+  }).poll();
+  assert.equal(unknown, false);
+  assert.equal(mismatch, false);
+  assert.equal(consumer.nacked.length, 1);
+  assert.equal(consumer.acked.length, 0);
+});
