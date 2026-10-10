@@ -71,6 +71,15 @@ export interface AmqpEventContext {
   delivery?: AmqpDelivery;
 }
 
+/**
+ * The context rhea passes to a sender link event (`accepted`, `rejected`, `sender_close`, ...). Only
+ * `delivery` is inspected (to match a verdict to its delivery); everything else is opaque. Deliberately
+ * no index signature: an interface-typed handler parameter (e.g. rhea's `EventContext`) must stay assignable.
+ */
+export interface AmqpLinkEventContext {
+  delivery?: unknown;
+}
+
 /** The subset of a rhea sender this adapter calls. */
 export interface AmqpSender {
   /** Queue a delivery. rhea returns the delivery synchronously; the broker's verdict arrives later as an event. */
@@ -80,14 +89,14 @@ export interface AmqpSender {
    * version-gate path waits for the broker's `accepted` disposition on the DLQ delivery before it
    * settles the source message; without them only a synchronous `send` failure is observable.
    */
-  on?(event: string, handler: (context: any) => void): unknown;
-  removeListener?(event: string, handler: (context: any) => void): unknown;
+  on?(event: string, handler: (context: AmqpLinkEventContext) => void): unknown;
+  removeListener?(event: string, handler: (context: AmqpLinkEventContext) => void): unknown;
   /**
    * Optional (a rhea link has it). rhea does not bubble an event to the session/connection while the
    * link has a listener for it, so the temporary confirmation listeners re-dispatch what is not theirs
    * (other deliveries' dispositions, link close/error) here.
    */
-  session?: { dispatch?(event: string, context?: any): unknown };
+  session?: { dispatch?(event: string, context?: AmqpLinkEventContext): unknown };
 }
 
 /** The subset of a rhea receiver this adapter wires to (its `message` event). */
@@ -245,7 +254,7 @@ interface PendingConfirmation {
   /** The delivery `send` returned; `undefined` while `send` is still running synchronously. */
   delivery: unknown;
   /** `true` when `context` is (or may be) this confirmation's verdict. */
-  matches(context: { delivery?: unknown } | undefined): boolean;
+  matches(context: AmqpLinkEventContext | undefined): boolean;
   /** Resolve (no argument) or reject the confirmation. */
   settle(error?: Error): void;
 }
@@ -262,19 +271,19 @@ const CONFIRMATION_CLOSES = ["sender_close", "sender_error"] as const;
  */
 class ConfirmationHub {
   private readonly pending = new Set<PendingConfirmation>();
-  private readonly handlers: [string, (context: any) => void][] = [];
+  private readonly handlers: [string, (context: AmqpLinkEventContext) => void][] = [];
 
   constructor(
     private readonly sender: AmqpSender,
-    private readonly on: (event: string, handler: (context: any) => void) => unknown,
-    private readonly off: (event: string, handler: (context: any) => void) => unknown,
+    private readonly on: (event: string, handler: (context: AmqpLinkEventContext) => void) => unknown,
+    private readonly off: (event: string, handler: (context: AmqpLinkEventContext) => void) => unknown,
   ) {}
 
   add(confirmation: PendingConfirmation): void {
     this.pending.add(confirmation);
     if (this.handlers.length === 0) {
       for (const name of [...CONFIRMATION_VERDICTS, ...CONFIRMATION_CLOSES]) {
-        const handler = (context: any): void => this.dispatch(name, context);
+        const handler = (context: AmqpLinkEventContext): void => this.dispatch(name, context);
         this.handlers.push([name, handler]);
         this.on(name, handler);
       }
@@ -290,7 +299,7 @@ class ConfirmationHub {
     }
   }
 
-  private dispatch(name: string, context: any): void {
+  private dispatch(name: string, context: AmqpLinkEventContext): void {
     if ((CONFIRMATION_CLOSES as readonly string[]).includes(name)) {
       for (const confirmation of [...this.pending]) {
         confirmation.settle(new BabelQueueError(`The dead-letter link closed before the broker accepted the delivery (${name}).`));
@@ -308,7 +317,7 @@ class ConfirmationHub {
     }
   }
 
-  private forward(name: string, context: unknown): void {
+  private forward(name: string, context: AmqpLinkEventContext): void {
     try {
       this.sender.session?.dispatch?.(name, context);
     } catch {
@@ -341,7 +350,6 @@ function sendConfirmed(sender: AmqpSender, message: AmqpMessage, timeoutMs: numb
       hubs.set(sender, hub);
     }
     const activeHub = hub;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let finished = false;
 
     const confirmation: PendingConfirmation = {
@@ -351,7 +359,7 @@ function sendConfirmed(sender: AmqpSender, message: AmqpMessage, timeoutMs: numb
       settle: (error) => {
         if (finished) return;
         finished = true;
-        if (timer) clearTimeout(timer);
+        clearTimeout(timer);
         activeHub.remove(confirmation);
         if (error) reject(error);
         else resolve();
@@ -359,7 +367,8 @@ function sendConfirmed(sender: AmqpSender, message: AmqpMessage, timeoutMs: numb
     };
     activeHub.add(confirmation);
 
-    timer = setTimeout(
+    // `settle` (above) reads `timer`; it cannot run before this line (nothing is sent or listened to yet).
+    const timer = setTimeout(
       () => confirmation.settle(new BabelQueueError(`Timed out after ${timeoutMs}ms waiting for the broker to accept the dead-letter delivery.`)),
       timeoutMs,
     );

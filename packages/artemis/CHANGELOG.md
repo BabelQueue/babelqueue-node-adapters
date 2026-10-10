@@ -22,6 +22,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   again (and reports its failure again via `onError`) every `deadLetterRetryDelayMs` until the DLQ
   write succeeds. For the version gate, poison and unknown-URN paths no handler is involved.
 
+### Changed
+- The `AmqpSender.on` / `removeListener` handler parameter is typed `AmqpLinkEventContext`
+  (`{ delivery?: unknown }`) instead of `any`. Handlers typed `any`, `unknown` or with rhea's
+  `EventContext` still compile; a handler whose parameter type shares no property with it
+  (e.g. `(c: { foo: string }) => void`) no longer does. No runtime change.
+
 ## [1.2.0] - 2026-10-10
 
 ### Fixed

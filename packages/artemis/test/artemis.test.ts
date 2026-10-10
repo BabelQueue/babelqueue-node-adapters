@@ -13,6 +13,7 @@ import {
   SCHEDULED_DELIVERY_KEY,
   type AmqpDelivery,
   type AmqpEventContext,
+  type AmqpLinkEventContext,
   type AmqpMessage,
   type AmqpReceiver,
   type AmqpSender,
@@ -278,20 +279,20 @@ test("gate: without a DLQ sender the rejected message is only reported and accep
 /** A rhea-like sender: `send` returns a delivery and the broker's verdict arrives later as a sender event. */
 class EventSender implements AmqpSender {
   sent: AmqpMessage[] = [];
-  forwarded: [string, any][] = [];
-  session = { dispatch: (event: string, context?: any): unknown => void this.forwarded.push([event, context]) };
-  private listeners = new Map<string, Set<(context: any) => void>>();
+  forwarded: [string, AmqpLinkEventContext | undefined][] = [];
+  session = { dispatch: (event: string, context?: AmqpLinkEventContext): unknown => void this.forwarded.push([event, context]) };
+  private listeners = new Map<string, Set<(context: AmqpLinkEventContext) => void>>();
   constructor(private readonly verdict: string | null, private readonly throwOnSend = false) {}
-  on(event: string, handler: (context: any) => void): unknown {
+  on(event: string, handler: (context: AmqpLinkEventContext) => void): unknown {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
     this.listeners.get(event)!.add(handler);
     return this;
   }
-  removeListener(event: string, handler: (context: any) => void): unknown {
+  removeListener(event: string, handler: (context: AmqpLinkEventContext) => void): unknown {
     this.listeners.get(event)?.delete(handler);
     return this;
   }
-  emit(event: string, context: any): void {
+  emit(event: string, context: AmqpLinkEventContext & { sender?: string }): void {
     for (const handler of [...(this.listeners.get(event) ?? [])]) handler(context);
   }
   listenerCount(): number {
