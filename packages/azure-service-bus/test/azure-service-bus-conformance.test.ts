@@ -18,7 +18,8 @@ const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const asb = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).asb as AsbBlock;
 
 interface GateCase {
-  value?: string | number;
+  value?: string | number | null;
+  value_type?: "float";
   absent?: boolean;
   expect: "decode" | "reject";
 }
@@ -97,7 +98,16 @@ test("asb conformance: schema_version_gate decides decode vs reject before the b
   const body = readFileSync(join(dir, gate.fixture), "utf8");
   assert.ok(gate.cases.length > 0);
 
+  const skippedFloatValues: unknown[] = [];
   for (const c of gate.cases) {
+    // value_type "float" (e.g. 1.0) is a native AMQP float. JavaScript has a single number type, so
+    // a float 1.0 is the very same value as integral 1 and reaches the gate as `1` -- the case is
+    // not representable here (the SDK cannot tell them apart) and is skipped, never mis-run as `1`.
+    if (c.value_type === "float") {
+      skippedFloatValues.push(c.value);
+      continue;
+    }
+    assert.equal(c.value_type, undefined, `unknown value_type ${String(c.value_type)}`);
     // A JSON number stands for a native AMQP integral: exercise it at both int32 (number) and
     // int64 (bigint) width when it is an integer; a non-integral number only exists as a number.
     const variants: unknown[] =
@@ -125,4 +135,6 @@ test("asb conformance: schema_version_gate decides decode vs reject before the b
       }
     }
   }
+  // Exactly the one float 1.0 case may be skipped -- a vanished or renamed marker must fail loudly.
+  assert.deepEqual(skippedFloatValues, [1]);
 });
