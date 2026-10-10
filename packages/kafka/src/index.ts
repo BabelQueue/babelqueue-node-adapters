@@ -39,7 +39,7 @@ import { mergeInto } from "./headers.js";
 // --- Minimal Kafka shapes (a structural subset of kafkajs) ---------------------
 
 /** Incoming record headers (KafkaJS decodes header values to Buffers). */
-export type IncomingHeaders = { [key: string]: Buffer | string | (Buffer | string)[] | undefined };
+export type IncomingHeaders = { [key: string]: Buffer | string | (Buffer | string)[] | null | undefined };
 
 /** A record to produce (structural subset of a KafkaJS message). */
 export interface KafkaProducerMessage {
@@ -97,14 +97,14 @@ export function kafkaHeaders(envelope: Envelope): { [key: string]: string } {
 
 /**
  * Copy inbound record headers for a raw DLQ forward: every value becomes a `Buffer` copy (a string is
- * UTF-8 encoded), array-valued headers keep all their entries, and `undefined` values are dropped.
+ * UTF-8 encoded), array-valued headers keep all their entries, and `undefined` / `null` values are dropped.
  */
 function copyHeaders(headers: IncomingHeaders | undefined): { [key: string]: Buffer | Buffer[] } {
   const out: { [key: string]: Buffer | Buffer[] } = {};
   if (!headers) return out;
   const copy = (v: Buffer | string): Buffer => (Buffer.isBuffer(v) ? Buffer.from(v) : Buffer.from(v, "utf8"));
   for (const [name, value] of Object.entries(headers)) {
-    if (value === undefined) continue;
+    if (value === undefined || value === null) continue;
     if (Array.isArray(value)) {
       out[name] = value.filter((v) => v !== undefined && v !== null).map(copy);
     } else {
@@ -116,9 +116,10 @@ function copyHeaders(headers: IncomingHeaders | undefined): { [key: string]: Buf
 
 function headerString(headers: IncomingHeaders | undefined, key: string): string | undefined {
   const value = headers?.[key];
-  if (value === undefined) return undefined;
+  // A null header value is "no header" (broker-bindings.md §6.7): never stringified to "null".
+  if (value === undefined || value === null) return undefined;
   const v = Array.isArray(value) ? value[0] : value;
-  if (v === undefined) return undefined;
+  if (v === undefined || v === null) return undefined;
   return Buffer.isBuffer(v) ? v.toString("utf8") : String(v);
 }
 

@@ -24,7 +24,7 @@ const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const kafka = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).kafka as KafkaBlock;
 
 interface GateCase {
-  value?: string;
+  value?: string | null;
   absent?: boolean;
   expect: "decode" | "reject";
 }
@@ -88,7 +88,8 @@ test("kafka conformance: schema_version_gate decides decode vs reject before the
   for (const c of gate.cases) {
     const label = c.absent ? "absent" : JSON.stringify(c.value);
     const headers: IncomingHeaders = {};
-    if (!c.absent) headers[gate.property] = Buffer.from(c.value as string, "utf8");
+    // JSON null = the header key is present with a null value (must be treated as absent, never "null").
+    if (!c.absent) headers[gate.property] = c.value === null ? null : Buffer.from(c.value as string, "utf8");
     const payload: EachMessagePayload = { topic: "orders", partition: 0, message: { value: body, headers, offset: "0" } };
 
     const sent: { topic: string; messages: KafkaProducerMessage[] }[] = [];

@@ -23,7 +23,7 @@ const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const artemis = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).artemis as ArtemisBlock;
 
 interface GateCase {
-  value?: string;
+  value?: string | null;
   absent?: boolean;
   expect: "decode" | "reject";
 }

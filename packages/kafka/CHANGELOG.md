@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- A `bq-schema-version` header present with a null value is now treated as absent (§6.7), like
+  every other SDK: the record decodes normally. Previously the null was stringified to `"null"`
+  and the record was rejected by the version gate. A null header value also no longer crashes
+  the raw DLQ forward (`Buffer.from(null)` threw a `TypeError`); it is dropped from the forwarded
+  headers.
+- The exported `IncomingHeaders` type now admits `null` values (`Buffer | string | (Buffer | string)[]
+  | null | undefined`), matching what kafkajs can deliver at runtime. This widens an input type only;
+  producer-side types are unchanged.
+
 ## [1.1.1] - 2026-10-10
 
 ### Fixed

@@ -341,9 +341,35 @@ test("raw DLQ: a record without a key or headers forwards no key and an empty he
   assert.deepEqual(sent.headers, {});
 });
 
+test("raw DLQ: a null-valued header is dropped, the forward succeeds and the offset is committed", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload: EachMessagePayload = {
+    topic: "orders",
+    partition: 1,
+    message: {
+      value: Buffer.from("not-json", "utf8"),
+      offset: "9",
+      // A null array element is not in the declared header type; the cast keeps the runtime case covered.
+      headers: {
+        foo: null,
+        "x-keep": Buffer.from("v", "utf8"),
+        "x-arr": [null, Buffer.from("a", "utf8")] as unknown as Buffer[],
+      },
+    },
+  };
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  assert.equal(producer.sent.length, 1);
+  const sent = producer.sent[0]!.messages[0]!;
+  assert.equal("foo" in sent.headers!, false);
+  assert.deepEqual(sent.headers!["x-keep"], Buffer.from("v", "utf8"));
+  assert.deepEqual(sent.headers!["x-arr"], [Buffer.from("a", "utf8")]);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 1, offset: "10" }]);
+});
+
 // --- schema-version gate (contract §6.7) ---------------------------------------
 
-function gatePayload(version: string | Buffer | undefined, body = payloadFor(envelope(0))): EachMessagePayload {
+function gatePayload(version: string | Buffer | null | undefined, body = payloadFor(envelope(0))): EachMessagePayload {
   const headers: IncomingHeaders = { ...body.message.headers };
   delete headers["bq-schema-version"];
   if (version !== undefined) headers["bq-schema-version"] = version;
@@ -358,6 +384,18 @@ test("gate: a missing or blank bq-schema-version header follows the normal decod
     assert.equal(calls, 1, JSON.stringify(version));
     assert.equal(consumer.committed.length, 1);
   }
+});
+
+test("gate: a null bq-schema-version header value is treated as absent and decodes", async () => {
+  const consumer = new FakeConsumer();
+  let calls = 0;
+  const errors: unknown[] = [];
+  await new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }, { onError: (e) => void errors.push(e) }).handle(
+    gatePayload(null),
+  );
+  assert.equal(calls, 1);
+  assert.equal(errors.length, 0);
+  assert.equal(consumer.committed.length, 1);
 });
 
 test("gate: \"1\" (Buffer or string) is decoded and the handler runs", async () => {
