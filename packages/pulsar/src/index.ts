@@ -26,9 +26,12 @@
  * `bq-trace-id` = trace_id, `bq-message-id` = meta.id, plus `bq-schema-version` /
  * `bq-source-lang` / `bq-attempts`. The envelope is unchanged (`schema_version` stays 1);
  * Pulsar is purely additive. A failed handler `negativeAcknowledge`s the message, so it is
- * redelivered (at-least-once) and `getRedeliveryCount()` is incremented; the authoritative
- * attempt count is the body's `bq-attempts`, reconciled to `max(bq-attempts,
- * getRedeliveryCount())` — no −1, because Pulsar's redelivery count is 0-based.
+ * redelivered (at-least-once) and `getRedeliveryCount()` is incremented. Per §5.2 / §5.7 the
+ * consumer routes on the `bq-job` property (the body's URN is used only when the property is
+ * absent or blank) and takes `attempts` from the authoritative `bq-attempts` property (the
+ * body's value is used only when the property is absent or not a plain ASCII-decimal integer
+ * that fits a 32-bit int), reconciled to `max(bq-attempts, getRedeliveryCount())` — no −1,
+ * because Pulsar's redelivery count is 0-based. The handler still receives the body's envelope.
  *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional native Pulsar **message properties** beside the contract `bq-*`
@@ -202,6 +205,22 @@ export interface PulsarConsumerOptions {
   onError?: (error: unknown, envelope: IncomingEnvelope, message: PulsarReceivedMessage) => void;
   /** Per-receive timeout in ms (default 1000). A timeout yields an empty poll, not an error. */
   receiveTimeoutMs?: number;
+  /**
+   * Optional diagnostic hook, called when the `bq-job` property and the body's URN differ (the
+   * property wins and the message is routed on it). `envelope` is the body's envelope. Separate
+   * from {@link PulsarConsumerOptions.onError}: it is not an error, and anything it throws (or
+   * rejects with) is swallowed — it never changes how the message is handled or acknowledged.
+   */
+  onRoutingMismatch?: (propertyUrn: string, bodyUrn: string, envelope: IncomingEnvelope) => unknown;
+}
+
+/** `bq-attempts` is valid only as ASCII digits that fit a signed 32-bit int (matches Java/.NET, GR-5). */
+const MAX_ATTEMPTS = 2 ** 31 - 1;
+
+function parseAttempts(raw: string | undefined): number | undefined {
+  if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) return undefined;
+  const value = Number(raw);
+  return value <= MAX_ATTEMPTS ? value : undefined;
 }
 
 function isReceiveTimeout(error: unknown): boolean {
@@ -217,8 +236,9 @@ function decodePayload(data: Buffer | string): string {
  * Receives from a Pulsar subscription, decodes + validates each message, routes it to the
  * handler for its URN, and acknowledges it on success. A throwing handler
  * `negativeAcknowledge`s the message — the broker redelivers it and increments
- * `getRedeliveryCount()` (at-least-once); `attempts` is reconciled to
- * `max(bq-attempts, getRedeliveryCount())` for the handler.
+ * `getRedeliveryCount()` (at-least-once). Routing uses the `bq-job` property (body URN as the
+ * fallback); `attempts` is the `bq-attempts` property (body value as the fallback) reconciled to
+ * `max(.., getRedeliveryCount())` for the handler.
  */
 export class PulsarConsumer {
   constructor(
@@ -250,14 +270,30 @@ export class PulsarConsumer {
   private async handle(message: PulsarReceivedMessage): Promise<void> {
     const envelope = EnvelopeCodec.decode(decodePayload(message.getData()));
 
-    // attempts = max(current, getRedeliveryCount()): the redelivery count is 0-based, so it
-    // maps directly with no −1; the max never lowers a higher body count republished from
-    // another SDK (the Go/Python transports retry by re-sending with attempts+1).
+    const properties = safeProperties(message);
+
+    // attempts: the authoritative bq-attempts property (the body's value when it is absent or
+    // invalid), then max(.., getRedeliveryCount()): the redelivery count is 0-based, so it maps
+    // directly with no −1; the max never lowers a higher count republished from another SDK
+    // (the Go/Python transports retry by re-sending with attempts+1).
     const redeliveryCount = typeof message.getRedeliveryCount === "function" ? message.getRedeliveryCount() : 0;
-    const current = typeof envelope.attempts === "number" ? envelope.attempts : 0;
-    if (redeliveryCount > current) {
-      envelope.attempts = redeliveryCount;
+    // A body without an integer attempts stays as sent, so accepts() below still rejects it
+    // (the property can't repair a non-conformant body); the value is written only on a change.
+    const bodyAttempts = envelope.attempts;
+    let attempts = typeof bodyAttempts === "number" && Number.isInteger(bodyAttempts) ? bodyAttempts : 0;
+    const fromProperty = parseAttempts(properties["bq-attempts"]);
+    if (fromProperty !== undefined) attempts = fromProperty;
+    if (redeliveryCount > attempts) attempts = redeliveryCount;
+    if (typeof bodyAttempts === "number" && Number.isInteger(bodyAttempts) && bodyAttempts !== attempts) {
+      envelope.attempts = attempts;
     }
+
+    // routing: the bq-job property wins; the body's URN is the fallback. A body with no URN is
+    // still rejected below, whatever bq-job says.
+    const bodyUrn = EnvelopeCodec.urn(envelope);
+    const rawJob: unknown = properties["bq-job"];
+    const propertyUrn = typeof rawJob === "string" ? rawJob.trim() : "";
+    const urn = propertyUrn !== "" ? propertyUrn : bodyUrn;
 
     if (!EnvelopeCodec.accepts(envelope)) {
       this.options.onError?.(
@@ -269,7 +305,12 @@ export class PulsarConsumer {
       return;
     }
 
-    const urn = EnvelopeCodec.urn(envelope);
+    // Diagnostics only, and only for an accepted envelope (07a Java/.NET order): after accepts()
+    // and the attempts reconcile, so the hook sees the same envelope the handler gets.
+    if (propertyUrn !== "" && bodyUrn !== "" && propertyUrn !== bodyUrn) {
+      this.notifyRoutingMismatch(propertyUrn, bodyUrn, envelope);
+    }
+
     const handler = this.handlers[urn];
     if (!handler) {
       if (this.options.onUnknownUrn) {
@@ -290,5 +331,25 @@ export class PulsarConsumer {
       this.options.onError?.(error, envelope, message);
       await this.consumer.negativeAcknowledge(message);
     }
+  }
+
+  private notifyRoutingMismatch(propertyUrn: string, bodyUrn: string, envelope: IncomingEnvelope): void {
+    const hook = this.options.onRoutingMismatch;
+    if (hook === undefined) return;
+    try {
+      const result = hook(propertyUrn, bodyUrn, envelope);
+      Promise.resolve(result).catch(() => undefined);
+    } catch {
+      // A diagnostic hook must never disturb consumption.
+    }
+  }
+}
+
+function safeProperties(message: PulsarReceivedMessage): { [key: string]: string } {
+  try {
+    const properties = typeof message.getProperties === "function" ? message.getProperties() : undefined;
+    return properties ?? {};
+  } catch {
+    return {};
   }
 }

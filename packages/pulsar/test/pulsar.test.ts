@@ -44,12 +44,13 @@ class FakeMessage implements PulsarReceivedMessage {
   constructor(
     private readonly raw: string,
     private readonly redeliveryCount = 0,
+    private readonly properties: { [key: string]: string } = {},
   ) {}
   getData(): Buffer {
     return Buffer.from(this.raw, "utf8");
   }
   getProperties(): { [key: string]: string } {
-    return {};
+    return this.properties;
   }
   getRedeliveryCount(): number {
     return this.redeliveryCount;
@@ -193,6 +194,137 @@ test("a non-conformant envelope negative-acknowledges and reports onError", asyn
   assert.equal(consumer.nacked.length, 1);
 });
 
+// --- §5.2 / §5.7 routing and attempts reconciliation ---------------------------
+
+const OTHER = "urn:babel:orders:refunded";
+
+function bodyWithUrn(job: string, attempts = 0): string {
+  const env = envelope(attempts);
+  env.job = job;
+  return EnvelopeCodec.encode(env);
+}
+
+test("bq-job property routes the message even when the body names a different URN", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": URN })]);
+  const seen: string[] = [];
+  const handlers: BabelHandlers = {
+    [URN]: (env) => void seen.push(`property:${EnvelopeCodec.urn(env)}`),
+    [OTHER]: () => void seen.push("body"),
+  };
+  await new PulsarConsumer(consumer, handlers).poll();
+  // routed to the property's handler; the handler still gets the body's envelope
+  assert.deepEqual(seen, [`property:${OTHER}`]);
+  assert.equal(consumer.acked.length, 1);
+});
+
+test("onRoutingMismatch is called with both URNs and the body envelope; onError is not", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": `  ${URN}  ` })]);
+  const calls: Array<[string, string, string]> = [];
+  const errors: unknown[] = [];
+  await new PulsarConsumer(
+    consumer,
+    { [URN]: () => undefined },
+    {
+      onRoutingMismatch: (propertyUrn, bodyUrn, env) => void calls.push([propertyUrn, bodyUrn, EnvelopeCodec.urn(env)]),
+      onError: (e) => void errors.push(e),
+    },
+  ).poll();
+  assert.deepEqual(calls, [[URN, OTHER, OTHER]]);
+  assert.equal(errors.length, 0);
+  assert.equal(consumer.acked.length, 1);
+});
+
+test("onRoutingMismatch is not called when there is no mismatch", async () => {
+  const noJob = JSON.stringify({ trace_id: "t", data: {}, meta: { id: "m", queue: "q", lang: "node", schema_version: 1, created_at: 1 }, attempts: 0 });
+  const cases: Array<[string, { [key: string]: string }]> = [
+    [body(), { "bq-job": URN }],
+    [body(), { "bq-job": `  ${URN}  ` }],
+    [body(), {}],
+    [body(), { "bq-job": "   " }],
+    [noJob, { "bq-job": URN }],
+  ];
+  for (const [raw, props] of cases) {
+    let called = false;
+    const consumer = new FakeConsumer([new FakeMessage(raw, 0, props)]);
+    await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
+    assert.equal(called, false, JSON.stringify(props));
+  }
+});
+
+test("a throwing or rejecting onRoutingMismatch hook still routes and acknowledges", async () => {
+  for (const hook of [
+    () => {
+      throw new Error("hook failure");
+    },
+    () => Promise.reject(new Error("hook failure")),
+  ]) {
+    const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": URN })]);
+    let handled = 0;
+    let reported = 0;
+    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onRoutingMismatch: hook, onError: () => void reported++ }).poll();
+    assert.equal(handled, 1);
+    assert.equal(reported, 0);
+    assert.equal(consumer.acked.length, 1);
+    assert.equal(consumer.nacked.length, 0);
+  }
+});
+
+test("blank or missing bq-job falls back to the body URN", async () => {
+  for (const props of [{}, { "bq-job": "" }, { "bq-job": "   " }] as Array<{ [key: string]: string }>) {
+    const consumer = new FakeConsumer([new FakeMessage(body(), 0, props)]);
+    let handled = 0;
+    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }).poll();
+    assert.equal(handled, 1, JSON.stringify(props));
+    assert.equal(consumer.acked.length, 1);
+  }
+});
+
+test("a body without a job is rejected even when bq-job is set", async () => {
+  const noJob = JSON.stringify({ trace_id: "t", data: {}, meta: { id: "m", queue: "q", lang: "node", schema_version: 1, created_at: 1 }, attempts: 0 });
+  const consumer = new FakeConsumer([new FakeMessage(noJob, 0, { "bq-job": URN })]);
+  let handled = 0;
+  let reported: unknown = null;
+  await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
+  assert.equal(handled, 0);
+  assert.ok(reported instanceof Error);
+  assert.equal(consumer.nacked.length, 1);
+  assert.equal(consumer.acked.length, 0);
+});
+
+async function attemptsSeen(raw: string, props: { [key: string]: string }, redelivery = 0): Promise<number> {
+  const consumer = new FakeConsumer([new FakeMessage(raw, redelivery, props)]);
+  let seen = -1;
+  await new PulsarConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
+  return seen;
+}
+
+test("bq-attempts is authoritative over the body", async () => {
+  const cases: Array<[string, number, string, number, number]> = [
+    ["property replaces body", 5, "3", 0, 3],
+    ["property raises body", 1, "4", 0, 4],
+    ["redelivery raises property", 0, "2", 6, 6],
+    ["property above redelivery", 0, "7", 2, 7],
+    ["leading zeros are digits", 0, "007", 0, 7],
+    ["zero property lowers body", 5, "0", 0, 0],
+    ["int32 max is valid", 0, "2147483647", 0, 2147483647],
+  ];
+  for (const [name, bodyAttempts, prop, redelivery, want] of cases) {
+    assert.equal(await attemptsSeen(body(bodyAttempts), { "bq-attempts": prop }, redelivery), want, name);
+  }
+});
+
+test("an invalid bq-attempts falls back to the body value", async () => {
+  const bad = ["", " ", "abc", "-1", "+3", "-0", "3.5", "1e2", " 3", "3 ", "3\n", " 3x", "\u0663", "2147483648", "99999999999999999999"];
+  for (const value of bad) {
+    assert.equal(await attemptsSeen(body(5), { "bq-attempts": value }), 5, JSON.stringify(value));
+  }
+  assert.equal(await attemptsSeen(body(5), { "bq-attempts": "nope" }, 9), 9, "redelivery still applies");
+});
+
+test("a missing bq-attempts falls back to the body value", async () => {
+  assert.equal(await attemptsSeen(body(5), {}), 5);
+});
+
 test("poll returns 0 on a receive timeout", async () => {
   const consumer = new FakeConsumer([]);
   const count = await new PulsarConsumer(consumer, {}).poll();
@@ -216,4 +348,54 @@ test("run stops once the signal is aborted", async () => {
   controller.abort();
   await new PulsarConsumer(consumer, {}).run(controller.signal); // returns immediately
   assert.equal(consumer.acked.length, 0);
+});
+
+// --- Fix round 1: attempts repair and hook order -------------------------------
+
+test("a missing or non-integer body attempts stays rejected, whatever bq-attempts / redelivery say", async () => {
+  const base = JSON.parse(body()) as { [key: string]: unknown };
+  const variants: Array<[string, (env: { [key: string]: unknown }) => void]> = [
+    ["missing", (env) => void delete env.attempts],
+    ["string", (env) => void (env.attempts = "3")],
+    ["null", (env) => void (env.attempts = null)],
+    ["float", (env) => void (env.attempts = 1.5)],
+  ];
+  for (const [name, mutate] of variants) {
+    const env = JSON.parse(JSON.stringify(base)) as { [key: string]: unknown };
+    mutate(env);
+    const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(env), 2, { "bq-attempts": "4" })]);
+    let handled = 0;
+    let reported: unknown = null;
+    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
+    assert.equal(handled, 0, name);
+    assert.ok(reported instanceof Error, name);
+    assert.equal(consumer.nacked.length, 1, name);
+    assert.equal(consumer.acked.length, 0, name);
+  }
+});
+
+test("attempts is written only when the integer body value really changes", async () => {
+  const seenRaw: string[] = [];
+  const capture = (env: Envelope): void => void seenRaw.push(JSON.stringify(env));
+  const same = body(3);
+  await new PulsarConsumer(new FakeConsumer([new FakeMessage(same, 3, { "bq-attempts": "3" })]), { [URN]: capture }).poll();
+  assert.equal(seenRaw[0], JSON.stringify(JSON.parse(same)));
+  assert.equal(await attemptsSeen(body(3), { "bq-attempts": "4" }), 4);
+});
+
+test("onRoutingMismatch sees the reconciled attempts", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": URN, "bq-attempts": "4" })]);
+  const seen: unknown[] = [];
+  await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: (_p, _b, env) => void seen.push(env.attempts) }).poll();
+  assert.deepEqual(seen, [4]);
+});
+
+test("onRoutingMismatch is not called for a rejected envelope", async () => {
+  const bad = JSON.parse(bodyWithUrn(OTHER)) as { meta: { schema_version: number } };
+  bad.meta.schema_version = 2;
+  const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(bad), 0, { "bq-job": URN })]);
+  let called = false;
+  await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
+  assert.equal(called, false);
+  assert.equal(consumer.nacked.length, 1);
 });

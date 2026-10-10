@@ -48,7 +48,8 @@ await consumer.run();
 ```
 
 Delayed delivery: `publish(urn, data, { delayMs: 300000 })` → native `deliverAfter`. The
-consumer routes purely on the `bq-job` property.
+consumer routes on the `bq-job` property (§5.2); when it is absent or blank it falls back to the
+body's URN. The body is always decoded and the handler always receives the body's envelope.
 
 ## Contract mapping (§5)
 
@@ -61,14 +62,23 @@ consumer routes purely on the `bq-job` property.
 | `meta.schema_version` | property `bq-schema-version` |
 | `meta.lang` | property `bq-source-lang` |
 | `meta.created_at` | publish time (mirror; body authoritative) |
-| `attempts` | property `bq-attempts` (authoritative), cross-checked against `getRedeliveryCount()` |
+| `attempts` | property `bq-attempts` (authoritative; body is the fallback), floored by `getRedeliveryCount()` |
 | reserve / ack / retry | `acknowledge` / `negativeAcknowledge` |
 
 Pulsar properties are string→string, so `bq-attempts` carries the contract `attempts` and is
-**authoritative**. The consumer reconciles to `max(bq-attempts, getRedeliveryCount())`:
-`getRedeliveryCount()` is 0-based (0 on first delivery) so it maps directly with **no −1**,
-and the `max` never lowers a higher body count — so a republish-driven retry and a native
-redelivery both converge on the same number. A throwing handler `negativeAcknowledge`s, so
+**authoritative**. It is valid only when it is plain decimal digits (`^[0-9]+$`, at most
+2147483647) — a sign, whitespace, an empty string or an out-of-range value is invalid and the
+consumer falls back to the body's `attempts`. The result is reconciled to
+`max(.., getRedeliveryCount())`: `getRedeliveryCount()` is 0-based (0 on first delivery) so it
+maps directly with **no −1** (the body is only rewritten when it holds an integer `attempts` that really changes; a missing or non-integer `attempts` is still rejected) — so a republish-driven retry and a native redelivery both
+converge on the same number.
+
+If the `bq-job` property and the body's URN differ, routing follows the property and the
+optional `onRoutingMismatch(propertyUrn, bodyUrn, envelope)` hook is called (default: no-op).
+It is separate from `onError`, its failures (including a rejected promise) are swallowed, and
+it never changes the ack flow. The hook runs only for an accepted envelope — after `accepts()` and
+the `attempts` reconcile — so it sees the same envelope the handler gets. A body without a `job` is still rejected by the codec even when
+`bq-job` is set. A throwing handler `negativeAcknowledge`s, so
 the broker redelivers (at-least-once). The poll loop never stops on a bad message — observe
 via `onError` / `onUnknownUrn`. The envelope is unchanged (`schema_version` stays `1`);
 Pulsar is purely additive.

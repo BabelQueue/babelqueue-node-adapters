@@ -18,6 +18,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
   consumer span as a true child of the producer span. New `headersOf` export; `toPulsarMessage`
   takes an optional headers carrier. A header-less publish stays byte-identical. Bumped
   `@babelqueue/core` to `^1.4.0`.
+- `PulsarConsumerOptions.onRoutingMismatch(propertyUrn, bodyUrn, envelope)` — optional, separate
+  hook (default no-op) called when the `bq-job` property and the body URN differ. Its errors and
+  rejections are swallowed (`Promise.resolve(result).catch`); it never affects acknowledgement and is not routed
+  through `onError`. It is called only for an accepted envelope, after `accepts()` and the `attempts` reconcile.
+
+### Fixed
+- **Consumer now follows broker-bindings §5.2/§5.7.** It routes on the `bq-job` property (falling
+  back to the body URN when the property is absent or blank) and takes `attempts` from the
+  authoritative `bq-attempts` property (falling back to the body when it is absent or not
+  `^[0-9]+$` within int32), then applies `max(.., redeliveryCount)`. Previously it routed on the
+  body URN and ignored `bq-attempts`. The handler still receives the body envelope, and a body
+  without `job` is still rejected. `attempts` is written to the envelope only when the body holds an
+  integer value and it really changes, so a body with a missing or non-integer `attempts` is still
+  rejected by `accepts()`. No version bump; envelope unchanged (`schema_version: 1`).
 
 ## [1.0.0] - 2026-06-13
 
