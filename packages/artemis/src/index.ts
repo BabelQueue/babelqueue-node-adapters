@@ -393,15 +393,19 @@ export interface ArtemisConsumerOptions {
   /** A sender to `<queue>.dlq`; enables cross-language dead-lettering. Without it a terminal failure drops. */
   deadLetterSender?: AmqpSender;
   /**
-   * How long (ms) the version-gate path waits for the broker to accept the DLQ delivery before it
-   * releases the source message instead of accepting it (default 30000).
+   * How long (ms) every dead-letter path (version gate, poison, unknown-URN `dead_letter`, terminal
+   * handler failure) waits for the broker to accept the DLQ delivery before it releases the source
+   * message instead of accepting it (default 30000).
    */
   deadLetterTimeoutMs?: number;
   /**
-   * Pause (ms) before the version-gate path releases a message whose DLQ write failed (default 1000).
+   * Pause (ms) before a dead-letter path releases a message whose DLQ write failed (default 1000).
    * The release is a plain `released` outcome (no `delivery_failed`, so the broker's delivery counter and
    * `max-delivery-attempts` are untouched); the pause keeps a persistently failing DLQ from becoming a
    * hot redelivery loop. The delivery stays unsettled (holding one credit) while it waits.
+   * Note: on the terminal handler-failure path the message has already been through the handler, and
+   * a plain release does not bump the delivery counter, so the redelivery runs the handler again (and
+   * reports its failure again) until the DLQ write succeeds.
    */
   deadLetterRetryDelayMs?: number;
   /** Attempts before terminal dead-lettering (default 3). */
@@ -469,8 +473,7 @@ export class ArtemisConsumer {
     if (!EnvelopeCodec.accepts(decoded)) {
       // A non-conformant / poison message may lack the fields to annotate; forward it raw.
       this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Artemis."), decoded, context);
-      await this.deadLetterRaw(messageBody(message));
-      delivery?.accept();
+      await this.settleAfterDeadLetter(context, decoded, () => this.deadLetterRaw(messageBody(message)));
       return;
     }
 
@@ -505,8 +508,7 @@ export class ArtemisConsumer {
         delivery?.accept();
         return;
       case UnknownUrnStrategy.DEAD_LETTER:
-        await this.deadLetter(envelope, "unknown_urn");
-        delivery?.accept();
+        await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(envelope, "unknown_urn"));
         return;
       case UnknownUrnStrategy.RELEASE:
         delivery?.release({ delivery_failed: true });
@@ -526,11 +528,30 @@ export class ArtemisConsumer {
       // Release with delivery-failed leaves it for redelivery — the broker bumps delivery-count.
       delivery?.release({ delivery_failed: true });
     } else if (this.options.deadLetterSender) {
-      await this.deadLetter(envelope, "failed", error);
-      delivery?.accept();
+      await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(envelope, "failed", error));
     } else {
       delivery?.accept(); // terminal, no DLQ → drop
     }
+  }
+
+  /**
+   * Dead-letter write → `accept`, or, when the write fails, report + plain `release` after the retry
+   * delay (never `accept`, so a failed DLQ write cannot lose the source message). Without a DLQ sender
+   * the write is a no-op and the message is accepted (terminal drop), as before.
+   */
+  private async settleAfterDeadLetter(
+    context: AmqpEventContext,
+    envelope: IncomingEnvelope | null,
+    write: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await write();
+    } catch (dlqError) {
+      this.safeReport(dlqError, envelope, context);
+      await this.releaseAfterBackoff(context.delivery);
+      return;
+    }
+    context.delivery?.accept();
   }
 
   private async deadLetter(envelope: Envelope, reason: string, error?: unknown): Promise<void> {
@@ -542,16 +563,15 @@ export class ArtemisConsumer {
       error: error instanceof Error ? error.message : null,
       exception: error instanceof Error ? error.name : null,
     });
-    await sender.send(artemisMessage(annotated));
+    await sendConfirmed(sender, artemisMessage(annotated), this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
   }
 
-  private async deadLetterRaw(raw: string): Promise<void> {
-    const sender = this.options.deadLetterSender;
-    if (!sender) return;
-    await sender.send({ body: raw });
+  /** Poison path: forward the raw body, confirmed like the gate path. */
+  private deadLetterRaw(raw: string): Promise<void> {
+    return this.deadLetterRawConfirmed(raw);
   }
 
-  /** Gate-only: forward the raw body and wait for the broker's `accepted` (a no-op without a DLQ sender). */
+  /** Forward the raw body and wait for the broker's `accepted` (a no-op without a DLQ sender). */
   private async deadLetterRawConfirmed(raw: string): Promise<void> {
     const sender = this.options.deadLetterSender;
     if (!sender) return;

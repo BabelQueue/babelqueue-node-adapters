@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **The non-gate dead-letter paths no longer lose a message when the DLQ write fails.** The terminal
+  handler failure (`MaxTries`), the unknown-URN `dead_letter` strategy and the poison (non-conformant)
+  message now follow the version-gate pattern: the source message is `accept`ed only after the broker
+  has accepted the DLQ delivery (rhea `accepted` event, bounded by `deadLetterTimeoutMs`). A rejected /
+  released / modified disposition, a link close/error, a throwing `send` or a timeout is reported to
+  `onError` and the message gets a plain `release()` after `deadLetterRetryDelayMs`, instead of being
+  accepted (or left unsettled by a thrown error). Without a `deadLetterSender` behaviour is unchanged.
+  **Side effect to know:** on the terminal handler-failure path the message has already been through the
+  handler; the plain `release()` does not bump the delivery counter, so the redelivery runs the handler
+  again (and reports its failure again via `onError`) every `deadLetterRetryDelayMs` until the DLQ
+  write succeeds. For the version gate, poison and unknown-URN paths no handler is involved.
+
 ## [1.2.0] - 2026-10-10
 
 ### Fixed

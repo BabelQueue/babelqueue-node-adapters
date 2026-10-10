@@ -441,6 +441,123 @@ test("unknown URN with dead_letter dead-letters and accepts", async () => {
   assert.equal((EnvelopeCodec.decode(messageBody(dlq.sent[0]!)) as Envelope).dead_letter!.reason, "unknown_urn");
 });
 
+// --- consumer: non-gate DLQ paths never lose the message on a failed DLQ write ---
+
+type DlqPath = { name: string; run: (dlq: AmqpSender, onError: (e: unknown) => void, delayMs?: number) => Promise<FakeDelivery>; reason?: string };
+
+const dlqPaths: DlqPath[] = [
+  {
+    name: "terminal handler failure (max tries)",
+    run: async (dlq, onError, delayMs = 0) => {
+      const { context: ctx, delivery } = context(incoming(envelope(2)));
+      await new ArtemisConsumer({ [URN]: () => { throw new Error("boom"); } }, { maxTries: 3, deadLetterSender: dlq, deadLetterRetryDelayMs: delayMs, onError }).handle(ctx);
+      return delivery;
+    },
+  },
+  {
+    name: "unknown URN with dead_letter",
+    run: async (dlq, onError, delayMs = 0) => {
+      const { context: ctx, delivery } = context(incoming(envelope(0)));
+      await new ArtemisConsumer({}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterSender: dlq, deadLetterRetryDelayMs: delayMs, onError }).handle(ctx);
+      return delivery;
+    },
+  },
+  {
+    name: "poison (non-conformant) message",
+    run: async (dlq, onError, delayMs = 0) => {
+      const { context: ctx, delivery } = context({ body: "not-json" });
+      await new ArtemisConsumer({}, { deadLetterSender: dlq, deadLetterRetryDelayMs: delayMs, onError }).handle(ctx);
+      return delivery;
+    },
+  },
+];
+
+test("non-gate DLQ paths: the source message is accepted only after the broker accepts the DLQ delivery", async () => {
+  for (const path of dlqPaths) {
+    const dlq = new EventSender("accepted");
+    const delivery = await path.run(dlq, () => undefined);
+    assert.equal(dlq.sent.length, 1, path.name);
+    assert.equal(delivery.accepted, 1, path.name);
+    assert.equal(delivery.released.length, 0, path.name);
+    assert.equal(dlq.listenerCount(), 0, path.name);
+  }
+});
+
+test("non-gate DLQ paths: a refused DLQ delivery releases (plain) instead of accepting, and is reported", async () => {
+  for (const path of dlqPaths) {
+    for (const verdict of ["rejected", "released", "modified", "sender_close", "sender_error"]) {
+      const errors: unknown[] = [];
+      const dlq = new EventSender(verdict);
+      const delivery = await path.run(dlq, (e) => void errors.push(e));
+      const label = `${path.name} / ${verdict}`;
+      assert.equal(delivery.accepted, 0, label);
+      assert.deepEqual(delivery.released, [{}], label); // plain release: no delivery_failed
+      assert.ok(errors.length >= 1, label);
+      assert.equal(dlq.listenerCount(), 0, label);
+    }
+  }
+});
+
+test("non-gate DLQ paths: a throwing DLQ send releases instead of accepting", async () => {
+  for (const path of dlqPaths) {
+    for (const dlq of [new EventSender(null, true), Object.assign(new FakeSender(), { send: (): never => { throw new Error("send failed"); } })]) {
+      const errors: unknown[] = [];
+      const delivery = await path.run(dlq, (e) => void errors.push(e));
+      assert.equal(delivery.accepted, 0, path.name);
+      assert.deepEqual(delivery.released, [{}], path.name);
+      assert.equal(errors.length >= 1, true, path.name);
+    }
+  }
+});
+
+test("non-gate DLQ paths: no broker verdict before deadLetterTimeoutMs releases the source message", async () => {
+  const cases: [string, () => Promise<FakeDelivery>][] = [
+    ["terminal", async () => {
+      const { context: ctx, delivery } = context(incoming(envelope(2)));
+      await new ArtemisConsumer({ [URN]: () => { throw new Error("boom"); } }, { maxTries: 3, deadLetterSender: new EventSender(null), deadLetterTimeoutMs: 20, deadLetterRetryDelayMs: 0 }).handle(ctx);
+      return delivery;
+    }],
+    ["unknown_urn", async () => {
+      const { context: ctx, delivery } = context(incoming(envelope(0)));
+      await new ArtemisConsumer({}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterSender: new EventSender(null), deadLetterTimeoutMs: 20, deadLetterRetryDelayMs: 0 }).handle(ctx);
+      return delivery;
+    }],
+    ["poison", async () => {
+      const { context: ctx, delivery } = context({ body: "not-json" });
+      await new ArtemisConsumer({}, { deadLetterSender: new EventSender(null), deadLetterTimeoutMs: 20, deadLetterRetryDelayMs: 0 }).handle(ctx);
+      return delivery;
+    }],
+  ];
+  for (const [name, run] of cases) {
+    const delivery = await run();
+    assert.equal(delivery.accepted, 0, name);
+    assert.deepEqual(delivery.released, [{}], name);
+  }
+});
+
+test("non-gate DLQ paths: a failed DLQ write waits deadLetterRetryDelayMs before the plain release", async () => {
+  for (const path of dlqPaths) {
+    let result: FakeDelivery | undefined;
+    const pending = path.run(new EventSender("rejected"), () => undefined, 60).then((d) => (result = d));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(result, undefined, `${path.name}: still waiting`);
+    const delivery = await pending;
+    assert.equal(delivery.accepted, 0, path.name);
+    assert.deepEqual(delivery.released, [{}], path.name);
+  }
+});
+
+test("non-gate DLQ paths: a throwing onError cannot skip the release", async () => {
+  const boom = (): void => {
+    throw new Error("onError exploded");
+  };
+  // The DLQ-failure report is isolated (safeReport): a throwing callback must not leave the delivery unsettled.
+  const { context: ctx, delivery } = context(incoming(envelope(0)));
+  await new ArtemisConsumer({}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterSender: new EventSender("rejected"), deadLetterRetryDelayMs: 0, onError: boom }).handle(ctx);
+  assert.equal(delivery.accepted, 0);
+  assert.deepEqual(delivery.released, [{}]);
+});
+
 // --- listen wiring ------------------------------------------------------------
 
 test("listen wires the receiver's message event to handle", async () => {
