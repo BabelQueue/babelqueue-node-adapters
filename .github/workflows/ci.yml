@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -82,6 +83,76 @@ jobs:
             diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/$pkg/test/conformance/schema"
           done
           echo "Vendored conformance is in sync with the canonical suite."
+
+  integration:
+    name: Integration (live Kafka + Artemis)
+    # Opt-in, not a required check: runs on push to main and on demand, never on pull requests,
+    # and is deliberately NOT in ci-green's needs.
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
+      artemis:
+        image: apache/activemq-artemis:2.37.0
+        ports:
+          - 5672:5672
+          - 61616:61616
+        env:
+          ARTEMIS_USER: artemis
+          ARTEMIS_PASSWORD: artemis
+        options: >-
+          --health-cmd "/var/lib/artemis-instance/bin/artemis check node --up --user artemis --password artemis"
+          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      # kafkajs and rhea are optional peers of the adapters, so they are not workspace dependencies;
+      # install them for this job only (pinned) without touching package.json / the lockfile.
+      - name: Install optional peers
+        run: npm install --no-save kafkajs@2.2.4 rhea@3.0.5
+
+      - name: Kafka integration tests
+        working-directory: packages/kafka
+        env:
+          BQ_INTEGRATION: "1"
+          BQ_KAFKA_BROKERS: localhost:9092
+        run: node --import tsx --test test/kafka-integration.test.ts
+
+      - name: Artemis integration tests
+        working-directory: packages/artemis
+        env:
+          BQ_INTEGRATION: "1"
+          BQ_ARTEMIS_HOST: localhost
+          BQ_ARTEMIS_PORT: "5672"
+          BQ_ARTEMIS_USER: artemis
+          BQ_ARTEMIS_PASSWORD: artemis
+        run: node --import tsx --test test/artemis-integration.test.ts
 
   ci-green:
     name: CI green
