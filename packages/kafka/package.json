@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/kafka",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Apache Kafka adapter for BabelQueue — canonical-envelope publisher and a URN-routed, process-then-commit consumer (SDK-owned retry topics + DLQ).",
   "keywords": [
     "babelqueue",

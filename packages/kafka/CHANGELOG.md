@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-10
+
 ### Fixed
 - **The consumer now gates on `bq-schema-version` before decoding the record value (contract §6.7).**
   A record whose `bq-schema-version` header is present, non-blank and not exactly the core's
@@ -16,6 +18,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
   reported to `onError` (with a `null` envelope), the raw value forwarded to `<topic>.dlq` when one is
   configured, and the offset committed. A missing or blank value (empty or only ASCII whitespace)
   keeps the existing decode path. The envelope and the producer are unchanged.
+
+## [1.1.0] - 2026-06-21
 
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band

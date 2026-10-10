@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-10
+
 ### Fixed
 - **The consumer now gates on `bq-schema-version` before decoding the body (contract §3.7).** A
   message whose `bq-schema-version` message attribute is present, non-blank and not exactly the

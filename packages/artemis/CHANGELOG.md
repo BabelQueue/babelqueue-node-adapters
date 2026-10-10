@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-10
+
 ### Fixed
 - **The consumer now gates on `bq_schema_version` before decoding the body (contract §7.7).** A
   message whose `bq_schema_version` application property (underscores, ADR-0017) is present,
@@ -25,6 +27,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
   (a throwing callback cannot skip the settlement) and events that are not the confirmation's own are
   re-dispatched to the sender's session. `AmqpSender` gained optional `on`/`removeListener` (a rhea
   sender satisfies them); a sender without them keeps the previous await-`send` behaviour.
+
+### Added
+- **`ArtemisConsumerOptions.deadLetterTimeoutMs?` and `deadLetterRetryDelayMs?` (new optional options).**
+  They bound the wait for the DLQ delivery confirmation (default 30000 ms) and the pause before a
+  failed version-gated message is released for redelivery (default 1000 ms). `AmqpSender` also gained
+  optional `on`/`removeListener`. Backward compatible (all optional), but they extend exported
+  types, so release it as a MINOR.
+
+## [1.1.0] - 2026-06-21
 
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
