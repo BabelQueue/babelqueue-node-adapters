@@ -27,8 +27,8 @@
  * **Version gate (§6.7).** Before decoding the record value the consumer reads the `bq-schema-version`
  * header. A missing or blank value (empty or only ASCII whitespace) follows the normal decode path;
  * any other value is compared, untrimmed, to the supported `"1"`, and a record that does not match is
- * rejected undecoded down the poison path — reported to `onError`, the raw value forwarded to the
- * DLQ (when configured) and the offset committed.
+ * rejected undecoded down the poison path — reported to `onError`, the raw record (value, key and
+ * headers) forwarded to the DLQ (when configured) and the offset committed.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
@@ -45,6 +45,11 @@ export type IncomingHeaders = { [key: string]: Buffer | string | (Buffer | strin
 export interface KafkaProducerMessage {
   key?: Buffer | string | null;
   value: Buffer | string;
+  /**
+   * Header values are strings for records the adapter builds. Raw DLQ forwarding (gate rejection,
+   * decode error, non-conformant envelope) instead passes the inbound values through as
+   * `Buffer | Buffer[]` (KafkaJS `IHeaders`); a custom producer wrapper must tolerate both.
+   */
   headers?: { [key: string]: string };
   timestamp?: string;
 }
@@ -88,6 +93,25 @@ export function kafkaHeaders(envelope: Envelope): { [key: string]: string } {
   if (envelope.meta.lang) headers["bq-source-lang"] = envelope.meta.lang;
   headers["bq-attempts"] = String(envelope.attempts ?? 0);
   return headers;
+}
+
+/**
+ * Copy inbound record headers for a raw DLQ forward: every value becomes a `Buffer` copy (a string is
+ * UTF-8 encoded), array-valued headers keep all their entries, and `undefined` values are dropped.
+ */
+function copyHeaders(headers: IncomingHeaders | undefined): { [key: string]: Buffer | Buffer[] } {
+  const out: { [key: string]: Buffer | Buffer[] } = {};
+  if (!headers) return out;
+  const copy = (v: Buffer | string): Buffer => (Buffer.isBuffer(v) ? Buffer.from(v) : Buffer.from(v, "utf8"));
+  for (const [name, value] of Object.entries(headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      out[name] = value.filter((v) => v !== undefined && v !== null).map(copy);
+    } else {
+      out[name] = copy(value);
+    }
+  }
+  return out;
 }
 
 function headerString(headers: IncomingHeaders | undefined, key: string): string | undefined {
@@ -438,10 +462,16 @@ export class KafkaConsumer {
     if (!dlq) return;
     this.requireProducer();
     const { message } = payload;
-    await this.options.producer!.send({
-      topic: dlq,
-      messages: [{ value: message.value ?? Buffer.alloc(0), timestamp: String(Date.now()) }],
-    });
+    // Forward the original record verbatim (value, key, headers) so the DLQ copy keeps its provenance
+    // (Java reference; the .NET consumer forwards value + headers). Only the timestamp is re-stamped.
+    const forwarded: KafkaProducerMessage = {
+      value: message.value ?? Buffer.alloc(0),
+      // KafkaJS accepts Buffer / array header values; the published structural type stays string-only.
+      headers: copyHeaders(message.headers) as unknown as KafkaProducerMessage["headers"],
+      timestamp: String(Date.now()),
+    };
+    if (message.key !== undefined && message.key !== null) forwarded.key = Buffer.from(message.key);
+    await this.options.producer!.send({ topic: dlq, messages: [forwarded] });
   }
 
   private async produce(topic: string, envelope: Envelope, headers: { [key: string]: string }): Promise<void> {

@@ -18,6 +18,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   reported to `onError` (with a `null` envelope), the raw value forwarded to `<topic>.dlq` when one is
   configured, and the offset committed. A missing or blank value (empty or only ASCII whitespace)
   keeps the existing decode path. The envelope and the producer are unchanged.
+- **Raw DLQ forwarding now keeps the original record metadata.** Every path that forwards a record
+  undecoded to `<topic>.dlq` (version-gate rejection, decode error, non-conformant envelope) used to
+  send only the value and a fresh timestamp. It now also forwards the original record `key` and all
+  headers, aligned with the Java reference. Header values are copied as `Buffer`s, array-valued
+  headers stay arrays, and the timestamp is still re-stamped. The commit-after-forward behaviour
+  is unchanged.
 
 ## [1.1.0] - 2026-06-21
 

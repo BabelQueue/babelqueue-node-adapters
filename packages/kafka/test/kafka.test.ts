@@ -260,6 +260,87 @@ test("run wires a manual-commit eachMessage loop", async () => {
   assert.equal(seen, 0);
 });
 
+function richPayload(value: Buffer | null): EachMessagePayload {
+  return {
+    topic: "orders",
+    partition: 2,
+    message: {
+      value,
+      key: Buffer.from("order-7", "utf8"),
+      headers: {
+        "x-tenant": Buffer.from("acme", "utf8"),
+        "x-str": "plain",
+        "x-multi": [Buffer.from("a", "utf8"), "b"],
+        "x-undef": undefined,
+        "bq-original-topic": Buffer.from("orders", "utf8"),
+      },
+      offset: "20",
+    },
+  };
+}
+
+function assertForwardedWithMetadata(producer: FakeProducer, payload: EachMessagePayload): void {
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  const sent = producer.sent[0]!.messages[0]!;
+  assert.deepEqual(sent.value, payload.message.value ?? Buffer.alloc(0));
+  assert.deepEqual(sent.key, Buffer.from("order-7", "utf8"));
+  assert.deepEqual(sent.headers, {
+    "x-tenant": Buffer.from("acme", "utf8"),
+    "x-str": Buffer.from("plain", "utf8"),
+    "x-multi": [Buffer.from("a", "utf8"), Buffer.from("b", "utf8")],
+    "bq-original-topic": Buffer.from("orders", "utf8"),
+  });
+  // Buffers are copies, not the inbound instances.
+  assert.notEqual(sent.headers!["x-tenant"], payload.message.headers!["x-tenant"]);
+  assert.notEqual(sent.key, payload.message.key);
+}
+
+test("raw DLQ (decode error): the original key and headers are forwarded, headers as Buffer copies", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = richPayload(Buffer.from("not-json", "utf8"));
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  assertForwardedWithMetadata(producer, payload);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 2, offset: "21" }]);
+});
+
+test("raw DLQ (non-conformant envelope): the original key and headers are forwarded", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = richPayload(Buffer.from('{"foo":"bar"}', "utf8"));
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  assertForwardedWithMetadata(producer, payload);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 2, offset: "21" }]);
+});
+
+test("raw DLQ (version gate): the original key and headers are forwarded", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = richPayload(payloadFor(envelope(0)).message.value);
+  payload.message.headers!["bq-schema-version"] = Buffer.from("2", "utf8");
+  await new KafkaConsumer(consumer, { [URN]: () => undefined }, { producer, retryTopics: topology() }).handle(payload);
+  const sent = producer.sent[0]!.messages[0]!;
+  assert.deepEqual(sent.key, Buffer.from("order-7", "utf8"));
+  assert.deepEqual(sent.headers!["x-multi"], [Buffer.from("a", "utf8"), Buffer.from("b", "utf8")]);
+  assert.deepEqual(sent.headers!["bq-schema-version"], Buffer.from("2", "utf8"));
+  assert.deepEqual(sent.value, payload.message.value);
+});
+
+test("raw DLQ: a record without a key or headers forwards no key and an empty header set", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload: EachMessagePayload = {
+    topic: "orders",
+    partition: 0,
+    message: { value: Buffer.from("not-json", "utf8"), offset: "1", key: null },
+  };
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  const sent = producer.sent[0]!.messages[0]!;
+  assert.equal("key" in sent, false);
+  assert.deepEqual(sent.headers, {});
+});
+
 // --- schema-version gate (contract §6.7) ---------------------------------------
 
 function gatePayload(version: string | Buffer | undefined, body = payloadFor(envelope(0))): EachMessagePayload {
@@ -305,7 +386,12 @@ test("gate: an unsupported version is dead-lettered raw as poison and committed 
     assert.equal(producer.sent.length, 1);
     assert.equal(producer.sent[0]!.topic, "orders.dlq");
     assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
-    assert.equal(producer.sent[0]!.messages[0]!.headers, undefined);
+    // Literal expectation (not derived from the implementation): every inbound header is a Buffer
+    // except the version under test, which is forwarded as its Buffer-encoded value.
+    assert.deepEqual(producer.sent[0]!.messages[0]!.headers, {
+      ...payload.message.headers,
+      "bq-schema-version": Buffer.from(version),
+    });
     assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "11" }]);
     assert.equal(errors.length, 1);
     assert.equal((errors[0] as unknown[])[1], null);

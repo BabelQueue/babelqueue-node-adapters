@@ -189,6 +189,27 @@ test("a non-conformant message is forwarded raw to the DLQ and accepted", async 
   assert.ok(reported);
 });
 
+// Raw DLQ parity: the .NET (AMQP 1.0) and Java (JMS) Artemis consumers forward ONLY the body of an
+// undecodable / gated message (`new Message(body)` / `createTextMessage(body)`). Node matches that.
+test("raw DLQ (non-conformant and gated): the forwarded message carries only the body", async () => {
+  const rich = (): AmqpMessage => ({
+    body: "not-json",
+    correlation_id: "corr-1",
+    content_type: "application/json",
+    message_annotations: { [JMS_TYPE_KEY]: URN },
+    application_properties: { custom: "x", bq_schema_version: "2" },
+  });
+  for (const gate of [false, true]) {
+    const dlq = new FakeSender();
+    const message = rich();
+    if (!gate) delete message.application_properties;
+    const { context: ctx } = context(message);
+    await new ArtemisConsumer({}, { deadLetterSender: dlq }).handle(ctx);
+    assert.equal(dlq.sent.length, 1, `gate=${gate}`);
+    assert.deepEqual(dlq.sent[0], { body: "not-json" }, `gate=${gate}`);
+  }
+});
+
 // --- consumer: schema-version gate (contract §7.7) ---------------------------
 
 function gated(version: unknown, opts: { absent?: boolean } = {}): AmqpMessage {
