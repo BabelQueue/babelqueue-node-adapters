@@ -323,3 +323,31 @@ test("gate: without a DLQ the rejected record is only reported and committed", a
   assert.equal(errors, 1);
   assert.equal(consumer.committed.length, 1);
 });
+
+test("gate: a failing DLQ produce does not commit and never reaches the handler", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  producer.send = async () => {
+    throw new Error("dlq produce failed");
+  };
+  let calls = 0;
+  await assert.rejects(
+    new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }, {
+      producer,
+      retryTopics: topology(),
+    }).handle(gatePayload("2")),
+    /dlq produce failed/,
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(consumer.committed, []);
+});
+
+test("gate: a DLQ configured without a producer does not commit and never reaches the handler", async () => {
+  const consumer = new FakeConsumer();
+  let calls = 0;
+  await assert.rejects(
+    new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }, { retryTopics: topology() }).handle(gatePayload("2")),
+  );
+  assert.equal(calls, 0);
+  assert.deepEqual(consumer.committed, []);
+});
