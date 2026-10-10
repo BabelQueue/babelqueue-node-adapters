@@ -31,7 +31,11 @@
  * application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
  * whitespace) follows the normal decode path; any other value is compared, untrimmed, to the supported
  * `"1"`, and a message that does not match is rejected undecoded — reported to `onError`, the raw body
- * forwarded to the DLQ sender (when configured) and the message accepted.
+ * forwarded to the DLQ sender (when configured) and the message accepted **only after the broker has
+ * accepted the DLQ delivery**. If the DLQ send fails, is refused (rejected/released/modified), the link
+ * closes or `deadLetterTimeoutMs` elapses, the failure is reported and, after `deadLetterRetryDelayMs`,
+ * the source message gets a plain `released` outcome (no `delivery_failed`: the broker's delivery
+ * counter and `max-delivery-attempts` stay untouched) — never accepted, never handed to a handler.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
@@ -69,7 +73,21 @@ export interface AmqpEventContext {
 
 /** The subset of a rhea sender this adapter calls. */
 export interface AmqpSender {
+  /** Queue a delivery. rhea returns the delivery synchronously; the broker's verdict arrives later as an event. */
   send(message: AmqpMessage): unknown;
+  /**
+   * Optional (a rhea sender has it). When both `on` and `removeListener` exist, the consumer's
+   * version-gate path waits for the broker's `accepted` disposition on the DLQ delivery before it
+   * settles the source message; without them only a synchronous `send` failure is observable.
+   */
+  on?(event: string, handler: (context: any) => void): unknown;
+  removeListener?(event: string, handler: (context: any) => void): unknown;
+  /**
+   * Optional (a rhea link has it). rhea does not bubble an event to the session/connection while the
+   * link has a listener for it, so the temporary confirmation listeners re-dispatch what is not theirs
+   * (other deliveries' dispositions, link close/error) here.
+   */
+  session?: { dispatch?(event: string, context?: any): unknown };
 }
 
 /** The subset of a rhea receiver this adapter wires to (its `message` event). */
@@ -215,6 +233,148 @@ export class ArtemisPublisher {
   }
 }
 
+// --- DLQ delivery confirmation ---------------------------------------------------
+
+/** Default wait (ms) for the broker to settle a gate-path DLQ delivery. */
+const DEFAULT_DLQ_CONFIRM_TIMEOUT_MS = 30_000;
+/** Default pause (ms) before a gate message whose DLQ write failed is released back to the broker. */
+const DEFAULT_DLQ_RETRY_DELAY_MS = 1_000;
+
+/** One in-flight DLQ confirmation registered on a {@link ConfirmationHub}. */
+interface PendingConfirmation {
+  /** The delivery `send` returned; `undefined` while `send` is still running synchronously. */
+  delivery: unknown;
+  /** `true` when `context` is (or may be) this confirmation's verdict. */
+  matches(context: { delivery?: unknown } | undefined): boolean;
+  /** Resolve (no argument) or reject the confirmation. */
+  settle(error?: Error): void;
+}
+
+const CONFIRMATION_VERDICTS = ["accepted", "rejected", "released", "modified"] as const;
+const CONFIRMATION_CLOSES = ["sender_close", "sender_error"] as const;
+
+/**
+ * One shared set of temporary sender listeners per {@link AmqpSender}, however many DLQ confirmations
+ * are in flight. rhea bubbles a link event to the session only while the link has no listener for it,
+ * so while confirmations are pending the hub owns the listeners and re-dispatches every event it does
+ * not consume to `sender.session` exactly once (per-confirmation listeners would forward each event
+ * once per pending confirmation). The listeners are removed as soon as no confirmation is pending.
+ */
+class ConfirmationHub {
+  private readonly pending = new Set<PendingConfirmation>();
+  private readonly handlers: [string, (context: any) => void][] = [];
+
+  constructor(
+    private readonly sender: AmqpSender,
+    private readonly on: (event: string, handler: (context: any) => void) => unknown,
+    private readonly off: (event: string, handler: (context: any) => void) => unknown,
+  ) {}
+
+  add(confirmation: PendingConfirmation): void {
+    this.pending.add(confirmation);
+    if (this.handlers.length === 0) {
+      for (const name of [...CONFIRMATION_VERDICTS, ...CONFIRMATION_CLOSES]) {
+        const handler = (context: any): void => this.dispatch(name, context);
+        this.handlers.push([name, handler]);
+        this.on(name, handler);
+      }
+    }
+  }
+
+  remove(confirmation: PendingConfirmation): void {
+    this.pending.delete(confirmation);
+    if (this.pending.size === 0) {
+      for (const [name, handler] of this.handlers) this.off(name, handler);
+      this.handlers.length = 0;
+      hubs.delete(this.sender);
+    }
+  }
+
+  private dispatch(name: string, context: any): void {
+    if ((CONFIRMATION_CLOSES as readonly string[]).includes(name)) {
+      for (const confirmation of [...this.pending]) {
+        confirmation.settle(new BabelQueueError(`The dead-letter link closed before the broker accepted the delivery (${name}).`));
+      }
+      this.forward(name, context);
+      return;
+    }
+    const owners = [...this.pending].filter((confirmation) => confirmation.matches(context));
+    if (owners.length === 0) {
+      this.forward(name, context);
+      return;
+    }
+    for (const owner of owners) {
+      owner.settle(name === "accepted" ? undefined : new BabelQueueError(`The broker did not accept the dead-letter delivery (${name}).`));
+    }
+  }
+
+  private forward(name: string, context: unknown): void {
+    try {
+      this.sender.session?.dispatch?.(name, context);
+    } catch {
+      // forwarding is best effort; never let it change a confirmation outcome
+    }
+  }
+}
+
+const hubs = new WeakMap<AmqpSender, ConfirmationHub>();
+
+/**
+ * Send `message` and resolve only once the broker has `accepted` the delivery. A rhea `send` returns
+ * synchronously and reports the verdict (`accepted` / `rejected` / `released` / `modified`) as a
+ * sender event, so awaiting `send` alone cannot see a broker refusal. Rejects on any non-accepted
+ * disposition, a link close/error, or when `timeoutMs` elapses (an unsettled delivery that is lost on
+ * reconnect raises no event). A sender without event support degrades to awaiting `send` itself.
+ * Events that are not this delivery's verdict (other deliveries, link close/error) are re-dispatched on
+ * the sender's session, once per event, so the application still sees them (rhea suppresses bubbling
+ * while the link has a listener) — see {@link ConfirmationHub}.
+ */
+function sendConfirmed(sender: AmqpSender, message: AmqpMessage, timeoutMs: number): Promise<void> {
+  const on = sender.on?.bind(sender);
+  const off = sender.removeListener?.bind(sender);
+  if (!on || !off) return Promise.resolve(sender.send(message)).then(() => undefined);
+
+  return new Promise<void>((resolve, reject) => {
+    let hub = hubs.get(sender);
+    if (!hub) {
+      hub = new ConfirmationHub(sender, on, off);
+      hubs.set(sender, hub);
+    }
+    const activeHub = hub;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finished = false;
+
+    const confirmation: PendingConfirmation = {
+      delivery: undefined,
+      matches: (context) =>
+        confirmation.delivery === undefined || context?.delivery === undefined || context.delivery === confirmation.delivery,
+      settle: (error) => {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        activeHub.remove(confirmation);
+        if (error) reject(error);
+        else resolve();
+      },
+    };
+    activeHub.add(confirmation);
+
+    timer = setTimeout(
+      () => confirmation.settle(new BabelQueueError(`Timed out after ${timeoutMs}ms waiting for the broker to accept the dead-letter delivery.`)),
+      timeoutMs,
+    );
+    try {
+      confirmation.delivery = sender.send(message);
+    } catch (error) {
+      confirmation.settle(error instanceof Error ? error : new BabelQueueError(String(error)));
+      return;
+    }
+    // A pre-settled delivery (or a sender that returns none) raises no disposition event.
+    const delivery = confirmation.delivery;
+    if (delivery === null || typeof delivery !== "object" || (delivery as { settled?: unknown }).settled === true) confirmation.settle();
+  });
+}
+
 // --- Consumer ------------------------------------------------------------------
 
 /**
@@ -232,6 +392,18 @@ export type BabelHandlers = Record<string, BabelHandler>;
 export interface ArtemisConsumerOptions {
   /** A sender to `<queue>.dlq`; enables cross-language dead-lettering. Without it a terminal failure drops. */
   deadLetterSender?: AmqpSender;
+  /**
+   * How long (ms) the version-gate path waits for the broker to accept the DLQ delivery before it
+   * releases the source message instead of accepting it (default 30000).
+   */
+  deadLetterTimeoutMs?: number;
+  /**
+   * Pause (ms) before the version-gate path releases a message whose DLQ write failed (default 1000).
+   * The release is a plain `released` outcome (no `delivery_failed`, so the broker's delivery counter and
+   * `max-delivery-attempts` are untouched); the pause keeps a persistently failing DLQ from becoming a
+   * hot redelivery loop. The delivery stays unsettled (holding one credit) while it waits.
+   */
+  deadLetterRetryDelayMs?: number;
   /** Attempts before terminal dead-lettering (default 3). */
   maxTries?: number;
   /** Strategy for a URN with no handler (default `fail`). */
@@ -273,13 +445,22 @@ export class ArtemisConsumer {
     // Version gate (§7.7): decided on the application property alone, before the body is decoded.
     const unsupported = unsupportedSchemaVersion(message);
     if (unsupported !== undefined) {
-      this.report(
-        new BabelQueueError(`Rejected a message from Artemis with unsupported bq_schema_version "${unsupported}" (supported: ${SCHEMA_VERSION}).`),
-        null,
-        context,
+      const gateError = new BabelQueueError(
+        `Rejected a message from Artemis with unsupported bq_schema_version "${unsupported}" (supported: ${SCHEMA_VERSION}).`,
       );
-      await this.deadLetterRaw(messageBody(message));
+      // Accept only after the broker has accepted the DLQ copy; otherwise release (plain, after a pause) so
+      // the message is never lost and never reaches a handler. Reports come after the settlement, or are
+      // isolated, so a throwing onError can never leave the message unsettled.
+      try {
+        await this.deadLetterRawConfirmed(messageBody(message));
+      } catch (dlqError) {
+        this.safeReport(gateError, null, context);
+        this.safeReport(dlqError, null, context);
+        await this.releaseAfterBackoff(delivery);
+        return;
+      }
       delivery?.accept();
+      this.safeReport(gateError, null, context);
       return;
     }
 
@@ -368,6 +549,29 @@ export class ArtemisConsumer {
     const sender = this.options.deadLetterSender;
     if (!sender) return;
     await sender.send({ body: raw });
+  }
+
+  /** Gate-only: forward the raw body and wait for the broker's `accepted` (a no-op without a DLQ sender). */
+  private async deadLetterRawConfirmed(raw: string): Promise<void> {
+    const sender = this.options.deadLetterSender;
+    if (!sender) return;
+    await sendConfirmed(sender, { body: raw }, this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
+  }
+
+  /** Plain `released` outcome (the broker's delivery counter is not touched), after the retry delay. */
+  private async releaseAfterBackoff(delivery: AmqpDelivery | undefined): Promise<void> {
+    const delayMs = this.options.deadLetterRetryDelayMs ?? DEFAULT_DLQ_RETRY_DELAY_MS;
+    if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs).unref?.());
+    delivery?.release();
+  }
+
+  /** `onError` isolated: a throwing callback must not skip the settlement that follows or precedes it. */
+  private safeReport(error: unknown, envelope: IncomingEnvelope | null, context: AmqpEventContext): void {
+    try {
+      this.report(error, envelope, context);
+    } catch {
+      // swallowed by design
+    }
   }
 
   private report(error: unknown, envelope: IncomingEnvelope | null, context: AmqpEventContext): void {

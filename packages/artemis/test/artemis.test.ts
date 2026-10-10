@@ -254,6 +254,139 @@ test("gate: without a DLQ sender the rejected message is only reported and accep
   assert.equal(delivery.accepted, 1);
 });
 
+/** A rhea-like sender: `send` returns a delivery and the broker's verdict arrives later as a sender event. */
+class EventSender implements AmqpSender {
+  sent: AmqpMessage[] = [];
+  forwarded: [string, any][] = [];
+  session = { dispatch: (event: string, context?: any): unknown => void this.forwarded.push([event, context]) };
+  private listeners = new Map<string, Set<(context: any) => void>>();
+  constructor(private readonly verdict: string | null, private readonly throwOnSend = false) {}
+  on(event: string, handler: (context: any) => void): unknown {
+    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
+    this.listeners.get(event)!.add(handler);
+    return this;
+  }
+  removeListener(event: string, handler: (context: any) => void): unknown {
+    this.listeners.get(event)?.delete(handler);
+    return this;
+  }
+  emit(event: string, context: any): void {
+    for (const handler of [...(this.listeners.get(event) ?? [])]) handler(context);
+  }
+  listenerCount(): number {
+    let n = 0;
+    for (const set of this.listeners.values()) n += set.size;
+    return n;
+  }
+  send(message: AmqpMessage): unknown {
+    if (this.throwOnSend) throw new Error("send failed");
+    this.sent.push(message);
+    const delivery = { settled: false };
+    if (this.verdict !== null) {
+      setImmediate(() => this.emit(this.verdict!, { delivery }));
+    }
+    return delivery;
+  }
+}
+
+test("gate: the source message is accepted only after the broker accepts the DLQ delivery", async () => {
+  const dlq = new EventSender("accepted");
+  const { context: ctx, delivery } = context(gated("2"));
+  let calls = 0;
+  await new ArtemisConsumer({ [URN]: () => void (calls += 1) }, { deadLetterSender: dlq }).handle(ctx);
+  assert.equal(calls, 0);
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(delivery.accepted, 1);
+  assert.equal(delivery.released.length, 0);
+  assert.equal(dlq.listenerCount(), 0);
+});
+
+test("gate: a refused DLQ delivery releases the source message, is reported, and never reaches a handler", async () => {
+  for (const verdict of ["rejected", "released", "modified", "sender_close", "sender_error"]) {
+    const dlq = new EventSender(verdict);
+    const { context: ctx, delivery } = context(gated("2"));
+    let calls = 0;
+    const errors: unknown[] = [];
+    await new ArtemisConsumer({ [URN]: () => void (calls += 1) }, { deadLetterSender: dlq, deadLetterRetryDelayMs: 0, onError: (e) => void errors.push(e) }).handle(ctx);
+    assert.equal(calls, 0, verdict);
+    assert.equal(delivery.accepted, 0, verdict);
+    assert.deepEqual(delivery.released, [{}], verdict); // plain release: no delivery_failed
+    assert.equal(errors.length, 2, verdict); // the gate report + the DLQ failure
+    assert.equal(dlq.listenerCount(), 0, verdict);
+  }
+});
+
+test("gate: a throwing DLQ send releases the source message instead of accepting it", async () => {
+  const { context: ctx, delivery } = context(gated("2"));
+  let calls = 0;
+  await new ArtemisConsumer({ [URN]: () => void (calls += 1) }, { deadLetterSender: new EventSender(null, true), deadLetterRetryDelayMs: 0 }).handle(ctx);
+  assert.equal(calls, 0);
+  assert.equal(delivery.accepted, 0);
+  assert.deepEqual(delivery.released, [{}]);
+});
+
+test("gate: a plain sender whose send throws releases the source message instead of accepting it", async () => {
+  const dlq = new FakeSender();
+  dlq.send = () => {
+    throw new Error("send failed");
+  };
+  const { context: ctx, delivery } = context(gated("2"));
+  await new ArtemisConsumer({}, { deadLetterSender: dlq, deadLetterRetryDelayMs: 0 }).handle(ctx);
+  assert.equal(delivery.accepted, 0);
+  assert.deepEqual(delivery.released, [{}]);
+});
+
+test("gate: no broker verdict before deadLetterTimeoutMs releases the source message", async () => {
+  const dlq = new EventSender(null);
+  const { context: ctx, delivery } = context(gated("2"));
+  let calls = 0;
+  await new ArtemisConsumer({ [URN]: () => void (calls += 1) }, { deadLetterSender: dlq, deadLetterTimeoutMs: 20, deadLetterRetryDelayMs: 0 }).handle(ctx);
+  assert.equal(calls, 0);
+  assert.equal(delivery.accepted, 0);
+  assert.deepEqual(delivery.released, [{}]);
+  assert.equal(dlq.listenerCount(), 0);
+});
+
+test("gate: a failed DLQ write never uses delivery_failed and waits deadLetterRetryDelayMs before releasing", async () => {
+  const { context: ctx, delivery } = context(gated("2"));
+  const pending = new ArtemisConsumer({}, { deadLetterSender: new EventSender("rejected"), deadLetterRetryDelayMs: 60 }).handle(ctx);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(delivery.released.length, 0, "no hot-loop release before the backoff elapsed");
+  assert.equal(delivery.accepted, 0);
+  await pending;
+  assert.deepEqual(delivery.released, [{}]);
+  assert.ok(delivery.released.every((p) => (p as { delivery_failed?: boolean }).delivery_failed === undefined));
+});
+
+test("gate: a throwing onError cannot skip the settlement (accept on success, release on DLQ failure)", async () => {
+  const boom = (): void => {
+    throw new Error("onError exploded");
+  };
+  const ok = context(gated("2"));
+  await new ArtemisConsumer({}, { deadLetterSender: new EventSender("accepted"), onError: boom }).handle(ok.context);
+  assert.equal(ok.delivery.accepted, 1);
+
+  const bad = context(gated("2"));
+  await new ArtemisConsumer({}, { deadLetterSender: new EventSender("rejected"), deadLetterRetryDelayMs: 0, onError: boom }).handle(bad.context);
+  assert.equal(bad.delivery.accepted, 0);
+  assert.deepEqual(bad.delivery.released, [{}]);
+});
+
+test("gate: events that are not this delivery's verdict are re-dispatched to the session, and link close too", async () => {
+  const dlq = new EventSender(null);
+  const { context: ctx, delivery } = context(gated("2"));
+  const pending = new ArtemisConsumer({}, { deadLetterSender: dlq, deadLetterRetryDelayMs: 0 }).handle(ctx);
+  const other = { settled: false };
+  dlq.emit("accepted", { delivery: other });
+  assert.deepEqual(dlq.forwarded, [["accepted", { delivery: other }]]);
+  assert.equal(delivery.accepted, 0, "another delivery's accepted must not confirm ours");
+  dlq.emit("sender_close", { sender: "x" });
+  await pending;
+  assert.deepEqual(dlq.forwarded[1], ["sender_close", { sender: "x" }]);
+  assert.deepEqual(delivery.released, [{}]);
+  assert.equal(dlq.listenerCount(), 0);
+});
+
 // --- consumer: unknown URN ----------------------------------------------------
 
 test("unknown URN with fail throws and does not settle", async () => {
@@ -301,4 +434,52 @@ test("listen wires the receiver's message event to handle", async () => {
 
 test("handle tolerates a context with no delivery", async () => {
   await new ArtemisConsumer({ [URN]: () => {} }).handle({ message: incoming(envelope(0)) }); // no throw
+});
+
+test("gate: two concurrent gate rejections on one DLQ sender forward each foreign/close event exactly once", async () => {
+  const dlq = new EventSender(null);
+  const a = context(gated("2"));
+  const b = context(gated("2"));
+  const consumer = new ArtemisConsumer({}, { deadLetterSender: dlq, deadLetterRetryDelayMs: 0 });
+  const first = consumer.handle(a.context);
+  const second = consumer.handle(b.context);
+  assert.equal(dlq.sent.length, 2);
+  assert.equal(dlq.listenerCount(), 6, "one shared listener per event, not one set per pending confirmation");
+
+  const foreign = { settled: false };
+  dlq.emit("accepted", { delivery: foreign });
+  assert.equal(dlq.forwarded.length, 1, "a foreign verdict is forwarded once with two confirmations pending");
+  assert.equal(a.delivery.accepted + b.delivery.accepted, 0);
+
+  dlq.emit("sender_close", { sender: "x" });
+  await Promise.all([first, second]);
+  assert.equal(dlq.forwarded.length, 2, "sender_close is forwarded once");
+  assert.deepEqual(dlq.forwarded[1], ["sender_close", { sender: "x" }]);
+  assert.deepEqual(a.delivery.released, [{}]);
+  assert.deepEqual(b.delivery.released, [{}]);
+  assert.equal(dlq.listenerCount(), 0);
+});
+
+test("gate: concurrent rejections settle independently by delivery", async () => {
+  const dlq = new EventSender(null);
+  const sentDeliveries: { settled: boolean }[] = [];
+  const origSend = dlq.send.bind(dlq);
+  dlq.send = ((m: AmqpMessage) => {
+    const d = origSend(m) as { settled: boolean };
+    sentDeliveries.push(d);
+    return d;
+  }) as typeof dlq.send;
+  const a = context(gated("2"));
+  const b = context(gated("2"));
+  const consumer = new ArtemisConsumer({}, { deadLetterSender: dlq, deadLetterRetryDelayMs: 0 });
+  const first = consumer.handle(a.context);
+  const second = consumer.handle(b.context);
+  dlq.emit("accepted", { delivery: sentDeliveries[0] });
+  dlq.emit("rejected", { delivery: sentDeliveries[1] });
+  await Promise.all([first, second]);
+  assert.equal(a.delivery.accepted, 1);
+  assert.equal(b.delivery.accepted, 0);
+  assert.deepEqual(b.delivery.released, [{}]);
+  assert.equal(dlq.forwarded.length, 0);
+  assert.equal(dlq.listenerCount(), 0);
 });

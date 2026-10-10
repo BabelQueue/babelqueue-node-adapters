@@ -16,6 +16,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
   undecoded: reported to `onError` (with a `null` envelope), the raw body forwarded to the
   `deadLetterSender` when one is configured, then `accept`ed. A missing or blank value (empty or only
   ASCII whitespace) keeps the existing decode path. The envelope and the producer are unchanged.
+- **The gate no longer loses a message when the DLQ write fails.** The source message is `accept`ed
+  only after the broker has accepted the DLQ delivery (rhea `accepted` event; new optional
+  `deadLetterTimeoutMs`, default 30000). A rejected/released/modified disposition, a link close/error,
+  a throwing `send` or a timeout is reported to `onError` and the message gets a **plain**
+  `release()` (no `delivery_failed`, so Artemis's delivery counter / `max-delivery-attempts` are not
+  consumed) after `deadLetterRetryDelayMs` (default 1000) to avoid a hot loop. `onError` is isolated
+  (a throwing callback cannot skip the settlement) and events that are not the confirmation's own are
+  re-dispatched to the sender's session. `AmqpSender` gained optional `on`/`removeListener` (a rhea
+  sender satisfies them); a sender without them keeps the previous await-`send` behaviour.
 
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band

@@ -82,7 +82,17 @@ strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
 whitespace) follows the normal decode path; any other value is compared as-is (never trimmed) to
 `"1"`. A message that does not match is rejected undecoded: reported to `onError`, its raw body
-forwarded to the `deadLetterSender` (when configured), then `accept`ed.
+forwarded to the `deadLetterSender` (when configured), then `accept`ed — but only **after the broker
+has accepted the DLQ delivery** (rhea `accepted` event on the DLQ sender). If the DLQ delivery is
+rejected/released/modified, the link closes, `send` throws, or `deadLetterTimeoutMs` (default 30000)
+elapses, the failure is reported to `onError` and the source message gets a plain `release()` instead —
+after `deadLetterRetryDelayMs` (default 1000) so a persistently failing DLQ is not a hot redelivery
+loop. It is never accepted and never reaches a handler. The release deliberately omits
+`delivery_failed`: that would bump Artemis's delivery counter and, once `max-delivery-attempts` is hit,
+route the message to the broker's DLA (or delete it when no DLA is configured). While waiting, the
+delivery stays unsettled and holds one receiver credit. The DLQ confirmation listens on the DLQ
+sender only for the duration of each gate send and re-dispatches events that are not its own to the
+sender's session.
 
 > `autoaccept: false` is required — the consumer owns the disposition. `handle(context)` is also
 > exposed directly for testing or a custom event wiring.
