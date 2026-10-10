@@ -9,6 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **The consumer now gates on `bq-schema-version` before decoding the body (contract §3.7).** A
+  message whose `bq-schema-version` message attribute is present, non-blank and not exactly the
+  core's supported `"1"` (`"2"`, `"x"`, `"01"`, `" 1"`, ...) is rejected undecoded: it is reported to
+  `onError` (with an empty envelope) and left undeleted, so SQS redelivers it and the queue's
+  `RedrivePolicy` moves it to the DLQ. A missing or blank value (empty or only ASCII whitespace)
+  keeps the existing decode path. The envelope and the producer are unchanged.
+
 ## [1.2.0] - 2026-10-03
 
 ### Changed

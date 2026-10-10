@@ -189,6 +189,71 @@ test("a non-conformant message is forwarded raw to the DLQ and accepted", async 
   assert.ok(reported);
 });
 
+// --- consumer: schema-version gate (contract §7.7) ---------------------------
+
+function gated(version: unknown, opts: { absent?: boolean } = {}): AmqpMessage {
+  const message = incoming(envelope(0));
+  if (!opts.absent) message.application_properties = { bq_schema_version: version };
+  return message;
+}
+
+test("gate: an absent or blank bq_schema_version follows the normal decode path", async () => {
+  const cases: AmqpMessage[] = [
+    gated(undefined, { absent: true }),
+    gated(""),
+    gated(" \t"),
+    gated("\n\u000b\f\r"),
+    gated(null),
+  ];
+  for (const message of cases) {
+    const { context: ctx, delivery } = context(message);
+    let calls = 0;
+    await new ArtemisConsumer({ [URN]: () => void (calls += 1) }).handle(ctx);
+    assert.equal(calls, 1);
+    assert.equal(delivery.accepted, 1);
+  }
+});
+
+test("gate: \"1\" is decoded and the handler runs", async () => {
+  const { context: ctx, delivery } = context(gated("1"));
+  let calls = 0;
+  await new ArtemisConsumer({ [URN]: () => void (calls += 1) }).handle(ctx);
+  assert.equal(calls, 1);
+  assert.equal(delivery.accepted, 1);
+});
+
+test("gate: an unsupported version is forwarded raw to the DLQ and accepted without decoding", async () => {
+  for (const version of ["2", "x", "01", " 1", "\u00a0", "\ufeff"]) {
+    const dlq = new FakeSender();
+    const message = gated(version);
+    const { context: ctx, delivery } = context(message);
+    let calls = 0;
+    const errors: unknown[] = [];
+    await new ArtemisConsumer(
+      { [URN]: () => void (calls += 1) },
+      { deadLetterSender: dlq, onError: (e, env) => void errors.push([e, env]) },
+    ).handle(ctx);
+
+    assert.equal(calls, 0, JSON.stringify(version));
+    assert.equal(dlq.sent.length, 1);
+    assert.equal(messageBody(dlq.sent[0]!), messageBody(message));
+    assert.equal(delivery.accepted, 1);
+    assert.equal(delivery.released.length, 0);
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0] as unknown[])[1], null);
+  }
+});
+
+test("gate: without a DLQ sender the rejected message is only reported and accepted", async () => {
+  const { context: ctx, delivery } = context(gated("2"));
+  let calls = 0;
+  let errors = 0;
+  await new ArtemisConsumer({ [URN]: () => void (calls += 1) }, { onError: () => void (errors += 1) }).handle(ctx);
+  assert.equal(calls, 0);
+  assert.equal(errors, 1);
+  assert.equal(delivery.accepted, 1);
+});
+
 // --- consumer: unknown URN ----------------------------------------------------
 
 test("unknown URN with fail throws and does not settle", async () => {

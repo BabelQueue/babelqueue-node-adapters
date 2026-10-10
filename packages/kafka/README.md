@@ -61,6 +61,12 @@ tier (requires `KafkaPublisher.withRetryTopics`); on a plain publisher a delay t
 throwing handler republishes to the next `<topic>.retry.<n>` tier with `bq-attempts + 1`, then
 commits; once `maxTries` is reached it goes to `<topic>.dlq` with a `dead_letter` block.
 
+**Version gate (§6.7).** Before the record value is decoded the consumer reads the
+`bq-schema-version` header. A missing or blank value (empty or only ASCII whitespace) follows the
+normal decode path; any other value is compared as-is (never trimmed) to `"1"`. A record that does
+not match is rejected undecoded as poison: reported to `onError`, forwarded raw to `<topic>.dlq`
+(when configured) and its offset committed.
+
 ## Contract mapping (§6)
 
 | Envelope | Apache Kafka |

@@ -25,6 +25,13 @@
  * redelivered and `deliveryCount` is incremented; the authoritative attempt count is the
  * native `deliveryCount`, surfaced to handlers as `attempts = deliveryCount − 1`.
  *
+ * **Version gate (§4.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+ * application property. A missing or blank value (empty or only ASCII whitespace) changes nothing;
+ * the string `"1"` and the integral number `1` (what the producer writes) decode; any other value
+ * or type (`"2"`, `"x"`, `"01"`, `2`, `1.5`, ...) rejects the message undecoded — `onError` (with an
+ * empty envelope) and an explicit `deadLetterMessage` (reason `unsupported schema version`), never
+ * `abandon`, so the message is not redelivered to the same consumer.
+ *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional native `applicationProperties` beside the contract `bq-*`
  * properties — the contract properties win a key collision (merge-not-clobber), blanks dropped. On
@@ -33,7 +40,7 @@
  * header-less publish is byte-identical. GR-1: the wire envelope body is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, UnknownUrnError } from "@babelqueue/core";
+import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
@@ -79,6 +86,43 @@ export interface AsbReceiver {
   receiveMessages(maxMessageCount: number, options?: { maxWaitTimeInMs?: number }): Promise<AsbReceivedMessage[]>;
   completeMessage(message: AsbReceivedMessage): Promise<void>;
   abandonMessage(message: AsbReceivedMessage): Promise<void>;
+  /**
+   * Move a message to the entity's dead-letter sub-queue. A `ServiceBusReceiver` from
+   * `@azure/service-bus` provides it. Optional so existing structural implementations keep
+   * compiling; a receiver without it cannot dead-letter, so an unsupported-schema-version
+   * message degrades to `abandonMessage` (the broker's `MaxDeliveryCount` then dead-letters it).
+   */
+  deadLetterMessage?(
+    message: AsbReceivedMessage,
+    options?: { deadLetterReason?: string; deadLetterErrorDescription?: string },
+  ): Promise<void>;
+}
+
+/** Blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — not `String.prototype.trim()`'s wider set. */
+const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/** Reason recorded on a message dead-lettered by the version gate. */
+const UNSUPPORTED_SCHEMA_VERSION_REASON = "unsupported schema version";
+
+/**
+ * The `bq-schema-version` application property rendered for reporting when it is present, non-blank
+ * and not the supported version (compared against the core's `SCHEMA_VERSION`). The string must be
+ * exactly `"1"` (`"01"`, `" 1"`, `"1.0"` are rejected, never trimmed); blank means the empty string
+ * or only ASCII whitespace (the same set in every SDK, GR-5), while NBSP, U+0085, U+FEFF, U+3000
+ * and the like are not blank. AMQP-typed numbers are accepted when they are the integer 1 (a JS
+ * `number`, or the `bigint` an int64 may surface as); every other number or type is rejected.
+ * `undefined` when the message may be decoded.
+ */
+function unsupportedSchemaVersion(message: AsbReceivedMessage): string | undefined {
+  const raw = message.applicationProperties?.["bq-schema-version"];
+  if (raw == null) return undefined;
+  if (typeof raw === "string") {
+    if (BLANK_ASCII.test(raw)) return undefined;
+    return raw === String(SCHEMA_VERSION) ? undefined : raw;
+  }
+  if (typeof raw === "number") return raw === SCHEMA_VERSION ? undefined : String(raw);
+  if (typeof raw === "bigint") return raw === BigInt(SCHEMA_VERSION) ? undefined : String(raw);
+  return `${typeof raw}:${String(raw)}`;
 }
 
 // --- Native projection (contract §4.2–§4.3) ------------------------------------
@@ -242,6 +286,30 @@ export class AsbConsumer {
   }
 
   private async handle(message: AsbReceivedMessage): Promise<void> {
+    // §4.7: gate on bq-schema-version before the body is decoded. The message is dead-lettered
+    // explicitly (never abandoned) so it does not loop back to the same consumer.
+    const rejectedVersion = unsupportedSchemaVersion(message);
+    if (rejectedVersion !== undefined) {
+      const description = `Rejected a message from Azure Service Bus with unsupported bq-schema-version "${rejectedVersion}" (supported: ${SCHEMA_VERSION}).`;
+      const deadLetter = this.receiver.deadLetterMessage?.bind(this.receiver);
+      this.options.onError?.(
+        new BabelQueueError(
+          deadLetter ? description : `${description} The receiver has no deadLetterMessage; degraded to abandon.`,
+        ),
+        {},
+        message,
+      );
+      if (deadLetter) {
+        await deadLetter(message, {
+          deadLetterReason: UNSUPPORTED_SCHEMA_VERSION_REASON,
+          deadLetterErrorDescription: description,
+        });
+      } else {
+        await this.receiver.abandonMessage(message);
+      }
+      return;
+    }
+
     const raw = typeof message.body === "string" ? message.body : String(message.body ?? "");
     const envelope = EnvelopeCodec.decode(raw);
 

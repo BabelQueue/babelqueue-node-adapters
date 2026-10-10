@@ -9,7 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **The consumer now gates on `bq-schema-version` before decoding the body (contract §4.7).** A
+  message whose `bq-schema-version` application property is present, non-blank and neither the
+  string `"1"` nor the integral number `1` (`"2"`, `"x"`, `"01"`, `2`, `1.5`, ...) is rejected
+  undecoded: it is reported to `onError` (with an empty envelope) and **dead-lettered explicitly**
+  with reason `unsupported schema version` — never abandoned. A missing or blank value (empty or only
+  ASCII whitespace) keeps the existing decode path. A receiver without `deadLetterMessage` degrades
+  to `abandonMessage` (the `onError` message says so). The envelope and the producer are unchanged.
+
 ### Added
+- **`AsbReceiver.deadLetterMessage?` (new optional public-type member).** A `ServiceBusReceiver`
+  provides it; the version gate uses it to dead-letter explicitly. Backward compatible (optional), but
+  it extends the exported interface, so release it as a MINOR.
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
   `HeaderCarrier` from `@babelqueue/core@^1.4.0` as additional native **`applicationProperties`**
   beside the contract `bq-*` properties — the contract properties win a key collision

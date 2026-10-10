@@ -63,6 +63,15 @@ A throwing handler `abandonMessage`s, so the broker redelivers and increments
 `onError` / `onUnknownUrn`. The envelope is unchanged (`schema_version` stays `1`); Azure
 Service Bus is purely additive.
 
+**Version gate (§4.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+application property. A missing or blank value (empty or only ASCII whitespace) changes nothing;
+the string `"1"` and the integral number `1` decode; any other value or type (`"2"`, `"x"`, `"01"`,
+`2`, `1.5` — strings are never trimmed) rejects the message **undecoded**: it reaches `onError`
+(with an empty envelope) and is **dead-lettered explicitly** (`deadLetterMessage`, reason
+`unsupported schema version`) — never abandoned, so it does not loop back to the same consumer. The
+receiver must provide `deadLetterMessage` (a `ServiceBusReceiver` does); one without it degrades to
+`abandonMessage`.
+
 The sender/receiver are injected, so the unit tests use fakes — no Azure, no broker. Dual
 ESM + CJS.
 

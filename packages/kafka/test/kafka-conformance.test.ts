@@ -13,6 +13,9 @@ import {
   type EachMessagePayload,
   type IncomingHeaders,
   type KafkaConsumerClient,
+  type KafkaProducerClient,
+  type KafkaProducerMessage,
+  RetryTopics,
 } from "../src/index.js";
 
 // The vendored canonical suite (synced from conformance/). The `kafka` block locks the §6
@@ -20,7 +23,14 @@ import {
 const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const kafka = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).kafka as KafkaBlock;
 
+interface GateCase {
+  value?: string;
+  absent?: boolean;
+  expect: "decode" | "reject";
+}
+
 interface KafkaBlock {
+  schema_version_gate: { property: string; fixture: string; cases: GateCase[] };
   property_projection: { envelope_file: string; headers: Record<string, string> };
   attempts_reconciliation: {
     cases: { name: string; body_attempts: number; header_attempts: number | null; expected_attempts: number }[];
@@ -65,5 +75,47 @@ test("kafka conformance: attempts reconciliation matches the golden", async () =
     await new KafkaConsumer(new CommitCapturingConsumer(), handlers).handle(payload);
 
     assert.equal(seen, c.expected_attempts, c.name);
+  }
+});
+
+test("kafka conformance: schema_version_gate decides decode vs reject before the body is decoded", async () => {
+  const gate = kafka.schema_version_gate;
+  assert.equal(gate.property, "bq-schema-version");
+  const body = Buffer.from(readFileSync(join(dir, gate.fixture), "utf8"), "utf8");
+  const urn = EnvelopeCodec.urn(EnvelopeCodec.decode(body.toString("utf8")));
+  assert.ok(gate.cases.length > 0);
+
+  for (const c of gate.cases) {
+    const label = c.absent ? "absent" : JSON.stringify(c.value);
+    const headers: IncomingHeaders = {};
+    if (!c.absent) headers[gate.property] = Buffer.from(c.value as string, "utf8");
+    const payload: EachMessagePayload = { topic: "orders", partition: 0, message: { value: body, headers, offset: "0" } };
+
+    const sent: { topic: string; messages: KafkaProducerMessage[] }[] = [];
+    const producer: KafkaProducerClient = {
+      async send(record) {
+        sent.push(record);
+        return {};
+      },
+    };
+    const consumer = new CommitCapturingConsumer();
+    let calls = 0;
+    let errors = 0;
+    await new KafkaConsumer(
+      consumer,
+      { [urn]: () => void (calls += 1) },
+      { producer, retryTopics: new RetryTopics("orders", [5000]), onError: () => void (errors += 1) },
+    ).handle(payload);
+
+    assert.equal(consumer.committed.length, 1, label);
+    if (c.expect === "decode") {
+      assert.equal(calls, 1, label);
+      assert.equal(sent.length, 0, label);
+    } else {
+      assert.equal(calls, 0, label);
+      assert.equal(errors, 1, label);
+      assert.equal(sent.length, 1, label);
+      assert.equal(sent[0]!.topic, "orders.dlq", label);
+    }
   }
 });

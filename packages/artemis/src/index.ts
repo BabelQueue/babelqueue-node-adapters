@@ -26,9 +26,15 @@
  * `application_properties` are surfaced as a `Record<string,string>` so the core's `otel` extract
  * sees the `traceparent` and links the consumer span as a child. A header-less publish is
  * byte-identical. GR-1: the wire envelope body is never touched.
+ *
+ * **Version gate (§7.7).** Before decoding the body the consumer reads the `bq_schema_version`
+ * application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
+ * whitespace) follows the normal decode path; any other value is compared, untrimmed, to the supported
+ * `"1"`, and a message that does not match is rejected undecoded — reported to `onError`, the raw body
+ * forwarded to the DLQ sender (when configured) and the message accepted.
  */
 
-import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
+import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
@@ -132,6 +138,21 @@ export function messageBody(message: AmqpMessage): string {
 function jmsType(message: AmqpMessage): string | undefined {
   const value = message.message_annotations?.[JMS_TYPE_KEY];
   return value == null ? undefined : String(value);
+}
+
+/** Blank = empty or only ASCII whitespace (GR-5: the same set in every SDK, never `String.trim()`). */
+const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * The inbound `bq_schema_version` application property when it is present, non-blank and not exactly
+ * the supported version (compared untrimmed), else `undefined` (the message may be decoded).
+ */
+function unsupportedSchemaVersion(message: AmqpMessage): string | undefined {
+  const raw = message.application_properties?.["bq_schema_version"];
+  if (raw == null) return undefined;
+  const value = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+  if (BLANK_ASCII.test(value)) return undefined;
+  return value === String(SCHEMA_VERSION) ? undefined : value;
 }
 
 function deliveryCount(message: AmqpMessage): number {
@@ -248,6 +269,20 @@ export class ArtemisConsumer {
   async handle(context: AmqpEventContext): Promise<void> {
     const message = context.message ?? {};
     const delivery = context.delivery;
+
+    // Version gate (§7.7): decided on the application property alone, before the body is decoded.
+    const unsupported = unsupportedSchemaVersion(message);
+    if (unsupported !== undefined) {
+      this.report(
+        new BabelQueueError(`Rejected a message from Artemis with unsupported bq_schema_version "${unsupported}" (supported: ${SCHEMA_VERSION}).`),
+        null,
+        context,
+      );
+      await this.deadLetterRaw(messageBody(message));
+      delivery?.accept();
+      return;
+    }
+
     const decoded = EnvelopeCodec.decode(messageBody(message));
 
     if (!EnvelopeCodec.accepts(decoded)) {

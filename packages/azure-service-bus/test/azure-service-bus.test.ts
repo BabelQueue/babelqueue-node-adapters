@@ -39,6 +39,7 @@ class FakeSender implements AsbSender {
 class FakeReceiver implements AsbReceiver {
   completed: AsbReceivedMessage[] = [];
   abandoned: AsbReceivedMessage[] = [];
+  deadLettered: { message: AsbReceivedMessage; reason?: string; description?: string }[] = [];
 
   constructor(private readonly messages: AsbReceivedMessage[] = []) {}
 
@@ -52,6 +53,17 @@ class FakeReceiver implements AsbReceiver {
 
   async abandonMessage(message: AsbReceivedMessage): Promise<void> {
     this.abandoned.push(message);
+  }
+
+  async deadLetterMessage(
+    message: AsbReceivedMessage,
+    options?: { deadLetterReason?: string; deadLetterErrorDescription?: string },
+  ): Promise<void> {
+    this.deadLettered.push({
+      message,
+      reason: options?.deadLetterReason,
+      description: options?.deadLetterErrorDescription,
+    });
   }
 }
 
@@ -141,4 +153,80 @@ test("consume: non-conformant envelope abandons and reports onError", async () =
   await new AsbConsumer(receiver, {}, { onError: (error) => { reported = error; } }).poll();
   assert.ok(reported);
   assert.equal(receiver.abandoned.length, 1);
+});
+
+// --- §4.7 schema-version gate (decided before the body is decoded) -------------------------------
+
+function gated(value?: unknown): AsbReceivedMessage {
+  const body = EnvelopeCodec.encode(envelope());
+  return value === undefined
+    ? { body, deliveryCount: 1 }
+    : { body, deliveryCount: 1, applicationProperties: { "bq-schema-version": value } };
+}
+
+test("gate: a missing or blank bq-schema-version decodes and runs the handler", async () => {
+  for (const value of [undefined, "", " \t", "\n\u000b\f\r"]) {
+    const receiver = new FakeReceiver([gated(value)]);
+    let calls = 0;
+    await new AsbConsumer(receiver, { [URN]: () => { calls += 1; } }).poll();
+    assert.equal(calls, 1, JSON.stringify(value));
+    assert.equal(receiver.completed.length, 1, JSON.stringify(value));
+    assert.equal(receiver.deadLettered.length, 0, JSON.stringify(value));
+  }
+});
+
+test("gate: bq-schema-version 1 (number) and \"1\" (string) run the handler", async () => {
+  for (const value of [1, 1n, "1"]) {
+    const receiver = new FakeReceiver([gated(value)]);
+    let calls = 0;
+    await new AsbConsumer(receiver, { [URN]: () => { calls += 1; } }).poll();
+    assert.equal(calls, 1, String(value));
+    assert.equal(receiver.completed.length, 1, String(value));
+  }
+});
+
+test("gate: an unsupported bq-schema-version is dead-lettered explicitly, undecoded, never abandoned", async () => {
+  for (const value of ["2", "x", 2, 2n, 0, 1.5, true]) {
+    const receiver = new FakeReceiver([gated(value)]);
+    let calls = 0;
+    let captured: unknown = null;
+    let seenEnvelope: unknown = null;
+    await new AsbConsumer(
+      receiver,
+      { [URN]: () => { calls += 1; } },
+      { onError: (e, env) => { captured = e; seenEnvelope = env; } },
+    ).poll();
+    const label = String(value);
+    assert.equal(calls, 0, label);
+    assert.ok(captured instanceof Error, label);
+    assert.match((captured as Error).message, /unsupported bq-schema-version/, label);
+    assert.deepEqual(seenEnvelope, {}, label);
+    assert.equal(receiver.deadLettered.length, 1, label);
+    assert.equal(receiver.deadLettered[0]?.reason, "unsupported schema version", label);
+    assert.equal(receiver.abandoned.length, 0, label);
+    assert.equal(receiver.completed.length, 0, label);
+  }
+});
+
+test("gate: the version is decided before decode - an undecodable body with version 2 is dead-lettered by the gate", async () => {
+  const receiver = new FakeReceiver([{ body: "{not json", deliveryCount: 1, applicationProperties: { "bq-schema-version": "2" } }]);
+  await new AsbConsumer(receiver, {}).poll();
+  assert.equal(receiver.deadLettered.length, 1);
+  assert.equal(receiver.abandoned.length, 0);
+});
+
+test("gate: a receiver without deadLetterMessage degrades to abandon (still undecoded)", async () => {
+  const abandoned: AsbReceivedMessage[] = [];
+  const receiver: AsbReceiver = {
+    async receiveMessages() { return [gated("2")]; },
+    async completeMessage() {},
+    async abandonMessage(m) { abandoned.push(m); },
+  };
+  let calls = 0;
+  const errors: unknown[] = [];
+  await new AsbConsumer(receiver, { [URN]: () => { calls += 1; } }, { onError: (e) => { errors.push(e); } }).poll();
+  assert.equal(calls, 0);
+  assert.equal(abandoned.length, 1);
+  assert.equal(errors.length, 1);
+  assert.match((errors[0] as Error).message, /degraded to abandon/);
 });

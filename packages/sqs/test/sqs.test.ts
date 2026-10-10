@@ -518,3 +518,75 @@ test("a throwing onUnknownUrn under a strategy is reported and the strategy stil
   assert.deepEqual(errors.map((e) => (e as Error).message), ["metrics down"]);
   assert.deepEqual(sqs.deleted, ["seed-1"]);
 });
+
+// --- §3.7 schema-version gate (decided before the body is decoded) -------------------------------
+
+function gateApi(message: SqsMessage) {
+  const deleted: string[] = [];
+  const visibility: ChangeMessageVisibilityInput[] = [];
+  const api: SqsApi = {
+    async sendMessage() { return {}; },
+    async receiveMessage() { return { Messages: [message] }; },
+    async deleteMessage(input) { deleted.push(input.ReceiptHandle); return {}; },
+    async changeMessageVisibility(input) { visibility.push(input); return {}; },
+  };
+  return { api, deleted, visibility };
+}
+
+function gateMessage(body: string, version?: string): SqsMessage {
+  return {
+    Body: body,
+    ReceiptHandle: "rh-gate",
+    MessageAttributes: version === undefined ? undefined : { "bq-schema-version": { DataType: "String", StringValue: version } },
+    Attributes: { ApproximateReceiveCount: "1" },
+  };
+}
+
+test("gate: a missing or blank bq-schema-version decodes and runs the handler", async () => {
+  const body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", { x: 1 }));
+  for (const version of [undefined, "", " \t", "\n\u000b\f\r"]) {
+    const { api, deleted } = gateApi(gateMessage(body, version));
+    let calls = 0;
+    await new SqsConsumer(api, URL, { "urn:babel:orders:created": () => { calls += 1; } }).poll();
+    assert.equal(calls, 1, JSON.stringify(version));
+    assert.equal(deleted.length, 1, JSON.stringify(version));
+  }
+});
+
+test("gate: bq-schema-version \"1\" runs the handler", async () => {
+  const body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", { x: 1 }));
+  const { api, deleted } = gateApi(gateMessage(body, "1"));
+  let calls = 0;
+  await new SqsConsumer(api, URL, { "urn:babel:orders:created": () => { calls += 1; } }).poll();
+  assert.equal(calls, 1);
+  assert.equal(deleted.length, 1);
+});
+
+test("gate: an unsupported bq-schema-version is rejected undecoded, reported and NOT deleted", async () => {
+  const body = EnvelopeCodec.encode(EnvelopeCodec.make("urn:babel:orders:created", { x: 1 }));
+  for (const version of ["2", "x"]) {
+    const { api, deleted, visibility } = gateApi(gateMessage(body, version));
+    let calls = 0;
+    let captured: unknown = null;
+    let seenEnvelope: unknown = null;
+    await new SqsConsumer(
+      api,
+      URL,
+      { "urn:babel:orders:created": () => { calls += 1; } },
+      { onError: (e, env) => { captured = e; seenEnvelope = env; } },
+    ).poll();
+    assert.equal(calls, 0, version);
+    assert.ok(captured instanceof Error, version);
+    assert.match((captured as Error).message, new RegExp(`unsupported bq-schema-version "${version}"`));
+    assert.deepEqual(seenEnvelope, {}, version);
+    assert.equal(deleted.length, 0, version);
+    assert.equal(visibility.length, 0, version);
+  }
+});
+
+test("gate: the version is decided before decode - an undecodable body with version 2 reports the gate error, not a decode error", async () => {
+  const { api } = gateApi(gateMessage("{not json", "2"));
+  let captured: unknown = null;
+  await new SqsConsumer(api, URL, {}, { onError: (e) => { captured = e; } }).poll();
+  assert.match((captured as Error).message, /unsupported bq-schema-version "2"/);
+});

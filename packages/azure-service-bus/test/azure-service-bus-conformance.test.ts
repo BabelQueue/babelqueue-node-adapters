@@ -17,7 +17,13 @@ import {
 const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const asb = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).asb as AsbBlock;
 
+interface GateCase {
+  value?: string | number;
+  absent?: boolean;
+  expect: "decode" | "reject";
+}
 interface AsbBlock {
+  schema_version_gate: { property: string; fixture: string; cases: GateCase[] };
   property_projection: {
     envelope_file: string;
     message: { subject: string; correlation_id: string; message_id: string; content_type: string };
@@ -46,6 +52,8 @@ test("asb conformance: native projection matches the golden", () => {
 /** A receiver that hands back one message, then nothing. */
 class OneShotReceiver implements AsbReceiver {
   completed: AsbReceivedMessage[] = [];
+  abandoned = 0;
+  deadLettered = 0;
 
   constructor(private readonly message: AsbReceivedMessage) {}
 
@@ -57,7 +65,13 @@ class OneShotReceiver implements AsbReceiver {
     this.completed.push(message);
   }
 
-  async abandonMessage(): Promise<void> {}
+  async abandonMessage(): Promise<void> {
+    this.abandoned += 1;
+  }
+
+  async deadLetterMessage(): Promise<void> {
+    this.deadLettered += 1;
+  }
 }
 
 test("asb conformance: attempts reconciliation matches the golden", async () => {
@@ -74,5 +88,41 @@ test("asb conformance: attempts reconciliation matches the golden", async () => 
     }).poll();
 
     assert.equal(seen, c.expected_attempts, c.name);
+  }
+});
+
+test("asb conformance: schema_version_gate decides decode vs reject before the body is decoded", async () => {
+  const gate = asb.schema_version_gate;
+  assert.equal(gate.property, "bq-schema-version");
+  const body = readFileSync(join(dir, gate.fixture), "utf8");
+  assert.ok(gate.cases.length > 0);
+
+  for (const c of gate.cases) {
+    // A JSON number stands for a native AMQP integral: exercise it at both int32 (number) and
+    // int64 (bigint) width when it is an integer; a non-integral number only exists as a number.
+    const variants: unknown[] =
+      typeof c.value === "number" && Number.isInteger(c.value) ? [c.value, BigInt(c.value)] : [c.value];
+    for (const value of variants) {
+      const label = c.absent ? "absent" : `${typeof value}:${String(value)}`;
+      const message: AsbReceivedMessage = {
+        body,
+        deliveryCount: 1,
+        applicationProperties: c.absent ? undefined : { [gate.property]: value },
+      };
+      const receiver = new OneShotReceiver(message);
+      let calls = 0;
+      await new AsbConsumer(receiver, { "urn:babel:orders:created": () => { calls += 1; } }).poll();
+
+      if (c.expect === "decode") {
+        assert.equal(calls, 1, label);
+        assert.equal(receiver.completed.length, 1, label);
+        assert.equal(receiver.deadLettered, 0, label);
+      } else {
+        assert.equal(calls, 0, label);
+        assert.equal(receiver.deadLettered, 1, label);
+        assert.equal(receiver.abandoned, 0, label);
+        assert.equal(receiver.completed.length, 0, label);
+      }
+    }
   }
 });

@@ -18,7 +18,14 @@ import {
 const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const pulsar = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).pulsar as PulsarBlock;
 
+interface GateCase {
+  value?: string;
+  absent?: boolean;
+  expect: "decode" | "reject";
+}
+
 interface PulsarBlock {
+  schema_version_gate: { property: string; fixture: string; cases: GateCase[] };
   property_projection: { envelope_file: string; properties: Record<string, string> };
   attempts_reconciliation: {
     cases: { name: string; body_attempts: number; redelivery_count: number; expected_attempts: number }[];
@@ -72,5 +79,43 @@ test("pulsar conformance: attempts reconciliation matches the golden", async () 
     }).poll();
 
     assert.equal(seen, c.expected_attempts, c.name);
+  }
+});
+
+test("pulsar conformance: schema_version_gate decides decode vs reject before the body is decoded", async () => {
+  const gate = pulsar.schema_version_gate;
+  assert.equal(gate.property, "bq-schema-version");
+  const body = readFileSync(join(dir, gate.fixture), "utf8");
+  const urn = EnvelopeCodec.urn(EnvelopeCodec.decode(body));
+  assert.ok(gate.cases.length > 0);
+
+  for (const c of gate.cases) {
+    const label = c.absent ? "absent" : JSON.stringify(c.value);
+    const properties: Record<string, string> = c.absent ? {} : { [gate.property]: c.value as string };
+    const message: PulsarReceivedMessage = {
+      getData: () => body,
+      getProperties: () => properties,
+      getRedeliveryCount: () => 0,
+    };
+
+    const client = new OneShotConsumer(message);
+    let calls = 0;
+    let errors = 0;
+    await new PulsarConsumer(
+      client,
+      { [urn]: () => void (calls += 1) },
+      { onError: () => void (errors += 1) },
+    ).poll();
+
+    if (c.expect === "decode") {
+      assert.equal(calls, 1, label);
+      assert.equal(client.acked.length, 1, label);
+      assert.equal(client.nacked.length, 0, label);
+    } else {
+      assert.equal(calls, 0, label);
+      assert.equal(errors, 1, label);
+      assert.equal(client.acked.length, 0, label);
+      assert.equal(client.nacked.length, 1, label);
+    }
   }
 });

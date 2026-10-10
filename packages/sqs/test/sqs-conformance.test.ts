@@ -18,7 +18,13 @@ interface GoldenAttr {
   DataType: string;
   StringValue: string;
 }
+interface GateCase {
+  value?: string;
+  absent?: boolean;
+  expect: "decode" | "reject";
+}
 interface SqsBlock {
+  schema_version_gate: { property: string; fixture: string; cases: GateCase[] };
   attribute_projection: { envelope_file: string; message_attributes: Record<string, GoldenAttr> };
   attempts_reconciliation: {
     cases: { name: string; body_attempts: number; approximate_receive_count: string | null; expected_attempts: number }[];
@@ -65,5 +71,46 @@ test("sqs conformance: attempts reconciliation matches the golden", async () => 
     }).poll();
 
     assert.equal(seen, c.expected_attempts, c.name);
+  }
+});
+
+test("sqs conformance: schema_version_gate decides decode vs reject before the body is decoded", async () => {
+  const gate = sqs.schema_version_gate;
+  assert.equal(gate.property, "bq-schema-version");
+  const body = readFileSync(join(dir, gate.fixture), "utf8");
+  assert.ok(gate.cases.length > 0);
+
+  for (const c of gate.cases) {
+    const label = c.absent ? "absent" : JSON.stringify(c.value);
+    const message: SqsMessage = {
+      Body: body,
+      ReceiptHandle: "rh",
+      MessageAttributes: c.absent ? undefined : { [gate.property]: { DataType: "String", StringValue: c.value } },
+      Attributes: { ApproximateReceiveCount: "1" },
+    };
+    const deleted: string[] = [];
+    const api: SqsApi = {
+      async sendMessage() { return {}; },
+      async receiveMessage() { return { Messages: [message] }; },
+      async deleteMessage(input) { deleted.push(input.ReceiptHandle); return {}; },
+    };
+
+    let calls = 0;
+    let errors = 0;
+    await new SqsConsumer(
+      api,
+      "https://sqs.x/123/orders",
+      { "urn:babel:orders:created": () => { calls += 1; } },
+      { onError: () => { errors += 1; } },
+    ).poll();
+
+    if (c.expect === "decode") {
+      assert.equal(calls, 1, label);
+      assert.equal(deleted.length, 1, label);
+    } else {
+      assert.equal(calls, 0, label);
+      assert.equal(errors, 1, label);
+      assert.equal(deleted.length, 0, label);
+    }
   }
 });

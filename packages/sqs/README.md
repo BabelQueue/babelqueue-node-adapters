@@ -68,6 +68,12 @@ dedupe on `meta.id` if the side effect must not repeat. The loop never stops on 
 `onUnknownUrn` to observe. The envelope is unchanged (`schema_version` stays `1`); SQS
 is purely additive.
 
+**Version gate (§3.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+message attribute. A missing or blank value (empty or only ASCII whitespace) changes nothing; any
+other value that is not exactly `"1"` (`"2"`, `"x"`, `"01"`, `" 1"` — never trimmed) rejects the
+message **undecoded**: it reaches `onError` (with an empty envelope) and is left undeleted, so it is
+redelivered and the `RedrivePolicy` below moves it to the DLQ.
+
 > **Poison messages — configure a `RedrivePolicy`.** With the `0 s` default, a handler
 > that always fails is retried back-to-back until the queue's native `RedrivePolicy`
 > (`maxReceiveCount`) moves the message to its dead-letter queue. Without one, such a

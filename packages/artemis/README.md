@@ -78,6 +78,12 @@ redelivers and bumps `delivery-count`); once `maxTries` is reached the envelope 
 (falling back to the body URN), so it never decodes a message it cannot handle. Unknown-URN
 strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 
+**Version gate (§7.7).** Before the body is decoded the consumer reads the `bq_schema_version`
+application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
+whitespace) follows the normal decode path; any other value is compared as-is (never trimmed) to
+`"1"`. A message that does not match is rejected undecoded: reported to `onError`, its raw body
+forwarded to the `deadLetterSender` (when configured), then `accept`ed.
+
 > `autoaccept: false` is required — the consumer owns the disposition. `handle(context)` is also
 > exposed directly for testing or a custom event wiring.
 

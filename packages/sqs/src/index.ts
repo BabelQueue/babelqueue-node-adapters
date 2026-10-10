@@ -26,6 +26,13 @@
  * authoritative attempt count is `ApproximateReceiveCount`, surfaced to handlers as
  * `attempts = count − 1`.
  *
+ * **Version gate (§3.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+ * message attribute. A missing or blank value (empty or only ASCII whitespace) changes nothing; any
+ * value other than the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the
+ * message undecoded through the same path as a non-conformant envelope — `onError` (with an error
+ * naming the version, and an empty envelope since nothing was decoded) and the message is left
+ * undeleted, so it is redelivered and the queue's `RedrivePolicy` moves it to the DLQ.
+ *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional String `MessageAttributes` **beside** the contract `bq-*`
  * attributes where `bq-trace-id` already lives — the contract attributes win a key collision, and
@@ -36,7 +43,14 @@
  * `/sqs` and PHP `SqsTransport` wiring. GR-1: the wire envelope body is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy, annotate } from "@babelqueue/core";
+import {
+  BabelQueueError,
+  EnvelopeCodec,
+  SCHEMA_VERSION,
+  UnknownUrnError,
+  UnknownUrnStrategy,
+  annotate,
+} from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
@@ -168,6 +182,22 @@ export function headersOf(message: SqsMessage): HeaderCarrier {
     if (value != null && value !== "") out[key] = value;
   }
   return out;
+}
+
+/** Blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — not `String.prototype.trim()`'s wider set. */
+const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * The `bq-schema-version` message attribute when it is present, non-blank and not the supported
+ * version (compared against the core's `SCHEMA_VERSION`, exact string match: `"01"`, `" 1"`, `"1.0"`
+ * are rejected). Blank means the empty string or only ASCII whitespace (the same set in every SDK,
+ * GR-5); NBSP, U+0085, U+FEFF, U+3000 and the like are not blank. `undefined` when the message may
+ * be decoded.
+ */
+function unsupportedSchemaVersion(message: SqsMessage): string | undefined {
+  const raw: unknown = message.MessageAttributes?.["bq-schema-version"]?.StringValue;
+  if (typeof raw !== "string" || BLANK_ASCII.test(raw)) return undefined;
+  return raw === String(SCHEMA_VERSION) ? undefined : raw;
 }
 
 function queueNameFromUrl(queueUrl: string): string {
@@ -369,6 +399,20 @@ export class SqsConsumer {
   }
 
   private async handle(message: SqsMessage): Promise<void> {
+    // §3.7: gate on the bq-schema-version attribute before the body is decoded. The message is
+    // not deleted, so SQS redelivers it and the queue's RedrivePolicy moves it to the DLQ.
+    const rejectedVersion = unsupportedSchemaVersion(message);
+    if (rejectedVersion !== undefined) {
+      this.options.onError?.(
+        new BabelQueueError(
+          `Rejected a message from SQS with unsupported bq-schema-version "${rejectedVersion}" (supported: ${SCHEMA_VERSION}).`,
+        ),
+        {},
+        message,
+      );
+      return;
+    }
+
     const envelope = EnvelopeCodec.decode(message.Body ?? "");
 
     const receiveCount = message.Attributes?.["ApproximateReceiveCount"];

@@ -12,6 +12,7 @@ import {
   artemisMessage,
   JMS_TYPE_KEY,
   type AmqpMessage,
+  type AmqpSender,
   type BabelHandlers,
 } from "../src/index.js";
 
@@ -21,7 +22,14 @@ import {
 const dir = fileURLToPath(new URL("./conformance", import.meta.url));
 const artemis = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")).artemis as ArtemisBlock;
 
+interface GateCase {
+  value?: string;
+  absent?: boolean;
+  expect: "decode" | "reject";
+}
+
 interface ArtemisBlock {
+  schema_version_gate: { property: string; fixture: string; cases: GateCase[] };
   property_projection: {
     envelope_file: string;
     jms_type: string;
@@ -61,5 +69,45 @@ test("artemis conformance: attempts reconciliation matches the golden", async ()
     });
 
     assert.equal(seen, c.expected_attempts, c.name);
+  }
+});
+
+test("artemis conformance: schema_version_gate decides decode vs reject before the body is decoded", async () => {
+  const gate = artemis.schema_version_gate;
+  assert.equal(gate.property, "bq_schema_version");
+  const body = readFileSync(join(dir, gate.fixture), "utf8");
+  const urn = EnvelopeCodec.urn(EnvelopeCodec.decode(body));
+  assert.ok(gate.cases.length > 0);
+
+  for (const c of gate.cases) {
+    const label = c.absent ? "absent" : JSON.stringify(c.value);
+    const message: AmqpMessage = { body, message_annotations: { [JMS_TYPE_KEY]: urn } };
+    if (!c.absent) message.application_properties = { [gate.property]: c.value };
+
+    const dead: AmqpMessage[] = [];
+    const dlq: AmqpSender = { send: (m) => void dead.push(m) };
+    let accepted = 0;
+    let released = 0;
+    let calls = 0;
+    let errors = 0;
+    await new ArtemisConsumer(
+      { [urn]: () => void (calls += 1) },
+      { deadLetterSender: dlq, onError: () => void (errors += 1) },
+    ).handle({
+      message,
+      delivery: { accept: () => void (accepted += 1), release: () => void (released += 1) },
+    });
+
+    assert.equal(accepted, 1, label);
+    assert.equal(released, 0, label);
+    if (c.expect === "decode") {
+      assert.equal(calls, 1, label);
+      assert.equal(dead.length, 0, label);
+    } else {
+      assert.equal(calls, 0, label);
+      assert.equal(errors, 1, label);
+      assert.equal(dead.length, 1, label);
+      assert.equal(dead[0]!.body, body, label);
+    }
   }
 });

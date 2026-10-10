@@ -259,3 +259,67 @@ test("run wires a manual-commit eachMessage loop", async () => {
   await consumer.eachMessage!(payloadFor(envelope(0)));
   assert.equal(seen, 0);
 });
+
+// --- schema-version gate (contract §6.7) ---------------------------------------
+
+function gatePayload(version: string | Buffer | undefined, body = payloadFor(envelope(0))): EachMessagePayload {
+  const headers: IncomingHeaders = { ...body.message.headers };
+  delete headers["bq-schema-version"];
+  if (version !== undefined) headers["bq-schema-version"] = version;
+  return { ...body, message: { ...body.message, headers } };
+}
+
+test("gate: a missing or blank bq-schema-version header follows the normal decode path", async () => {
+  for (const version of [undefined, "", " \t", "\n\u000b\f\r", Buffer.from("  ", "utf8")]) {
+    const consumer = new FakeConsumer();
+    let calls = 0;
+    await new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }).handle(gatePayload(version));
+    assert.equal(calls, 1, JSON.stringify(version));
+    assert.equal(consumer.committed.length, 1);
+  }
+});
+
+test("gate: \"1\" (Buffer or string) is decoded and the handler runs", async () => {
+  for (const version of ["1", Buffer.from("1", "utf8")]) {
+    const consumer = new FakeConsumer();
+    let calls = 0;
+    await new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }).handle(gatePayload(version));
+    assert.equal(calls, 1);
+  }
+});
+
+test("gate: an unsupported version is dead-lettered raw as poison and committed without decoding", async () => {
+  for (const version of ["2", "x", "01", " 1", "\u00a0", Buffer.from("2", "utf8")]) {
+    const consumer = new FakeConsumer();
+    const producer = new FakeProducer();
+    let calls = 0;
+    const errors: unknown[] = [];
+    const payload = gatePayload(version);
+    await new KafkaConsumer(
+      consumer,
+      { [URN]: () => void (calls += 1) },
+      { producer, retryTopics: topology(), onError: (e, env) => void errors.push([e, env]) },
+    ).handle(payload);
+
+    assert.equal(calls, 0, JSON.stringify(version));
+    assert.equal(producer.sent.length, 1);
+    assert.equal(producer.sent[0]!.topic, "orders.dlq");
+    assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+    assert.equal(producer.sent[0]!.messages[0]!.headers, undefined);
+    assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "11" }]);
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0] as unknown[])[1], null);
+  }
+});
+
+test("gate: without a DLQ the rejected record is only reported and committed", async () => {
+  const consumer = new FakeConsumer();
+  let calls = 0;
+  let errors = 0;
+  await new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }, { onError: () => void (errors += 1) }).handle(
+    gatePayload("2"),
+  );
+  assert.equal(calls, 0);
+  assert.equal(errors, 1);
+  assert.equal(consumer.committed.length, 1);
+});

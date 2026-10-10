@@ -9,6 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+- **The consumer now gates on `bq_schema_version` before decoding the body (contract §7.7).** A
+  message whose `bq_schema_version` application property (underscores, ADR-0017) is present,
+  non-blank and not exactly the core's supported `"1"` (`"2"`, `"x"`, `"01"`, `" 1"`, ...) is rejected
+  undecoded: reported to `onError` (with a `null` envelope), the raw body forwarded to the
+  `deadLetterSender` when one is configured, then `accept`ed. A missing or blank value (empty or only
+  ASCII whitespace) keeps the existing decode path. The envelope and the producer are unchanged.
+
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
   `HeaderCarrier` from `@babelqueue/core@^1.4.0` as additional AMQP **`application_properties`**

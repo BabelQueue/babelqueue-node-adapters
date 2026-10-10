@@ -23,9 +23,15 @@
  * the inbound record headers are surfaced as a `Record<string,string>` so the core's `otel` extract
  * sees the `traceparent` and links the consumer span as a child. A header-less publish is
  * byte-identical. GR-1: the wire envelope (the record value) is never touched.
+ *
+ * **Version gate (§6.7).** Before decoding the record value the consumer reads the `bq-schema-version`
+ * header. A missing or blank value (empty or only ASCII whitespace) follows the normal decode path;
+ * any other value is compared, untrimmed, to the supported `"1"`, and a record that does not match is
+ * rejected undecoded down the poison path — reported to `onError`, the raw value forwarded to the
+ * DLQ (when configured) and the offset committed.
  */
 
-import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
+import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { mergeInto } from "./headers.js";
@@ -97,6 +103,19 @@ function headerInt(headers: IncomingHeaders | undefined, key: string, fallback: 
   if (s === undefined) return fallback;
   const n = Number.parseInt(s.trim(), 10);
   return Number.isNaN(n) ? fallback : n;
+}
+
+/** Blank = empty or only ASCII whitespace (GR-5: the same set in every SDK, never `String.trim()`). */
+const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * The inbound `bq-schema-version` header when it is present, non-blank and not exactly the supported
+ * version (compared untrimmed), else `undefined` (the record may be decoded).
+ */
+function unsupportedSchemaVersion(message: KafkaIncomingMessage): string | undefined {
+  const value = headerString(message.headers, "bq-schema-version");
+  if (value === undefined || BLANK_ASCII.test(value)) return undefined;
+  return value === String(SCHEMA_VERSION) ? undefined : value;
 }
 
 /**
@@ -294,6 +313,20 @@ export class KafkaConsumer {
   /** Route + settle one record (process-then-commit). Exposed for testing. */
   async handle(payload: EachMessagePayload): Promise<void> {
     const { message } = payload;
+
+    // Version gate (§6.7): decided on the header alone, before the value is decoded.
+    const unsupported = unsupportedSchemaVersion(message);
+    if (unsupported !== undefined) {
+      this.report(
+        new BabelQueueError(`Rejected a record from Kafka with unsupported bq-schema-version "${unsupported}" (supported: ${SCHEMA_VERSION}).`),
+        null,
+        payload,
+      );
+      await this.deadLetterRaw(payload);
+      await this.commit(payload);
+      return;
+    }
+
     const raw = message.value ? message.value.toString("utf8") : "";
 
     let envelope: IncomingEnvelope;
