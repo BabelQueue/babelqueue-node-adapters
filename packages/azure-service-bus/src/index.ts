@@ -104,6 +104,9 @@ const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
 /** Reason recorded on a message dead-lettered by the version gate. */
 const UNSUPPORTED_SCHEMA_VERSION_REASON = "unsupported schema version";
 
+/** Longest rejected value echoed into reports; Service Bus caps the dead-letter description at 4096 chars. */
+const MAX_REPORTED_SCHEMA_VERSION_LENGTH = 64;
+
 /**
  * The `bq-schema-version` application property rendered for reporting when it is present, non-blank
  * and not the supported version (compared against the core's `SCHEMA_VERSION`). The string must be
@@ -290,7 +293,11 @@ export class AsbConsumer {
     // explicitly (never abandoned) so it does not loop back to the same consumer.
     const rejectedVersion = unsupportedSchemaVersion(message);
     if (rejectedVersion !== undefined) {
-      const description = `Rejected a message from Azure Service Bus with unsupported bq-schema-version "${rejectedVersion}" (supported: ${SCHEMA_VERSION}).`;
+      const reported =
+        rejectedVersion.length > MAX_REPORTED_SCHEMA_VERSION_LENGTH
+          ? `${rejectedVersion.slice(0, MAX_REPORTED_SCHEMA_VERSION_LENGTH)}...`
+          : rejectedVersion;
+      const description = `Rejected a message from Azure Service Bus with unsupported bq-schema-version "${reported}" (supported: ${SCHEMA_VERSION}).`;
       const deadLetter = this.receiver.deadLetterMessage?.bind(this.receiver);
       this.options.onError?.(
         new BabelQueueError(

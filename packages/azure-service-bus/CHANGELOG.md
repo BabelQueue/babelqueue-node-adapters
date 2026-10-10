@@ -17,6 +17,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
   with reason `unsupported schema version` — never abandoned. A missing or blank value (empty or only
   ASCII whitespace) keeps the existing decode path. A receiver without `deadLetterMessage` degrades
   to `abandonMessage` (the `onError` message says so). The envelope and the producer are unchanged.
+  The rejected value is echoed into the dead-letter description and the `onError` message truncated
+  to its first 64 characters (plus `...`), so an oversized value stays under Service Bus's
+  4096-character description limit.
 
 ### Added
 - **`AsbReceiver.deadLetterMessage?` (new optional public-type member).** A `ServiceBusReceiver`

@@ -208,6 +208,18 @@ test("gate: an unsupported bq-schema-version is dead-lettered explicitly, undeco
   }
 });
 
+test("gate: an oversized bq-schema-version is truncated in the dead-letter description", async () => {
+  const receiver = new FakeReceiver([gated("9".repeat(5000))]);
+  let captured: unknown = null;
+  await new AsbConsumer(receiver, {}, { onError: (e) => { captured = e; } }).poll();
+  assert.equal(receiver.deadLettered.length, 1);
+  const description = receiver.deadLettered[0]?.description ?? "";
+  assert.ok(description.includes(`"${"9".repeat(64)}..."`));
+  assert.ok(!description.includes("9".repeat(65)));
+  assert.ok(description.length < 4096);
+  assert.equal((captured as Error).message, description);
+});
+
 test("gate: the version is decided before decode - an undecodable body with version 2 is dead-lettered by the gate", async () => {
   const receiver = new FakeReceiver([{ body: "{not json", deliveryCount: 1, applicationProperties: { "bq-schema-version": "2" } }]);
   await new AsbConsumer(receiver, {}).poll();
