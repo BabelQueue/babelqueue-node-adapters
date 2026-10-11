@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-11
+
 ### Fixed
 - **The non-gate dead-letter paths no longer lose a message when the DLQ write fails.** The terminal
   handler failure (`MaxTries`), the unknown-URN `dead_letter` strategy and the poison (non-conformant)

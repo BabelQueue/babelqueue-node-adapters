@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-10-11
+
 ### Fixed
 
 - A `bq-schema-version` header present with a null value is now treated as absent (§6.7), like
