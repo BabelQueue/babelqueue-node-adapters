@@ -6,6 +6,8 @@ All notable changes to `@babelqueue/nestjs` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** `BabelQueuePublisher.publish`
   accepts an optional out-of-band `headers` carrier (e.g. a W3C `traceparent`) and threads it

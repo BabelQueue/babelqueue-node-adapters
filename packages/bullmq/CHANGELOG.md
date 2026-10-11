@@ -6,6 +6,8 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OpenTelemetry v0.2 — `traceparent` transport wiring (ADR-0028).** Carries the out-of-band
   `HeaderCarrier` from `@babelqueue/core@^1.4.0` in BullMQ's native context-propagation slot,
