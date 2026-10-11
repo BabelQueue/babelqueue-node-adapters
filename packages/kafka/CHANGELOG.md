@@ -7,6 +7,23 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+
+- **`KafkaRedriveIO` rewinds on a run that stops on a failed message.** New optional `consumer`
+  (`KafkaSeekClient`, i.e. `consumer.seek`) option and `KafkaRedriveMessage` `topic` / `partition` /
+  `offset` fields: with a consumer the IO offers core's optional `RedriveIO.rewind`, which seeks the
+  consumer back to the record - and, because redrive pops the whole batch before processing it, every
+  affected partition back to its first unacknowledged record - so a later cumulative offset commit
+  cannot skip any of them. A record whose restore failed is never acked; if the rewind fails too both
+  errors are thrown together. A record that was acknowledged (restored after a failed redrive write) is
+  skipped by the rewind, so only the rest of the batch is redelivered. `pop` no longer mutates the caller's
+  message: it returns a tracked copy built from the message's `body`, `key`, `topic`, `partition` and
+  `offset` fields (read one by one, so a message class exposing them as getters keeps them). Without
+  `consumer` nothing changes.
+  Needs the `@babelqueue/core` release that adds `RedriveIO.rewind` (older cores simply never call it).
+
 ## [1.2.0] - 2026-10-11
 
 ### Added

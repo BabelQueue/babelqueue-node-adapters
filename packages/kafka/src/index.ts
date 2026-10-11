@@ -81,6 +81,11 @@ export interface KafkaConsumerClient {
   commitOffsets(offsets: { topic: string; partition: number; offset: string }[]): Promise<void>;
 }
 
+/** The subset of the KafkaJS consumer {@link KafkaRedriveIO} calls to rewind a record (`consumer.seek`). */
+export interface KafkaSeekClient {
+  seek(position: { topic: string; partition: number; offset: string }): void | Promise<void>;
+}
+
 // --- Header projection (contract §6.3) -----------------------------------------
 
 /** Project the envelope's contract fields onto Kafka record headers (UTF-8 string values). */
@@ -301,6 +306,10 @@ export class KafkaPublisher {
 export interface KafkaRedriveMessage {
   body: string;
   key?: Buffer | null;
+  /** The record's position, needed by {@link KafkaRedriveIO.rewind}; the offset is a KafkaJS string. */
+  topic?: string;
+  partition?: number;
+  offset?: string;
   ack(): Promise<void>;
 }
 
@@ -314,6 +323,19 @@ export interface KafkaRedriveIOOptions {
    * its `ack` commits the offset. Return the record's `key` so the redrive can carry it.
    */
   pop(queue: string): Promise<KafkaRedriveMessage | null>;
+  /**
+   * The consumer the DLQ records are fetched with. When given, {@link KafkaRedriveIO.rewind} is offered:
+   * when the run stops (a failed restore write, a failed redrive write, a throwing `select` or a failed
+   * `ack`) it seeks this consumer back to the first unacknowledged record of every affected partition, so
+   * a later (cumulative) offset commit cannot skip a record that was not safely handled. Without it the IO
+   * has no `rewind` and a failed restore only leaves the record unacknowledged.
+   *
+   * The IO only knows the records it handed out. If {@link KafkaRedriveIOOptions.pop} reads ahead (buffers
+   * records it has not returned yet), the caller must discard that buffer after a rewind and must not
+   * reuse the IO: e.g. `pop` buffered p0@5..7, the run stopped at p0@6 and the seek went back to p0@5; a
+   * buffered p0@7 returned and acknowledged afterwards would commit offset 8 and skip 5 and 6.
+   */
+  consumer?: KafkaSeekClient;
 }
 
 /**
@@ -327,12 +349,82 @@ export interface KafkaRedriveIOOptions {
  *
  * Plain {@link KafkaRedriveIO.publish} writes a keyless record. `publishWithHeaders` is not offered, so
  * `bypass` is a no-op on this transport (as in the Go reference's keyed path).
+ *
+ * When `options.consumer` is supplied the IO also offers {@link KafkaRedriveIO.rewind} (core's optional
+ * `RedriveIO.rewind`): if the restore write of a record back to the DLQ fails, the consumer is sought
+ * back, because a Kafka offset commit is cumulative and a later commit would otherwise skip a record
+ * for good. Core's `redrive()` pops the whole batch before processing it, so the consumer position is
+ * already past every record handed out and not yet acknowledged; the IO tracks those and seeks every
+ * affected partition back to its first unacknowledged record, not only the failed one.
  */
 export class KafkaRedriveIO {
-  constructor(private readonly options: KafkaRedriveIOOptions) {}
+  /** Seek the consumer back to every unacknowledged record (`from` included unless it was acknowledged already); defined only when a `consumer` was supplied. */
+  readonly rewind?: (from: KafkaRedriveMessage) => Promise<void>;
 
-  pop(queue: string): Promise<KafkaRedriveMessage | null> {
-    return this.options.pop(queue);
+  /** Records handed out by {@link KafkaRedriveIO.pop} that carry a position and are not acknowledged yet. */
+  private readonly inFlight = new Set<KafkaRedriveMessage>();
+
+  /** Records handed out by {@link KafkaRedriveIO.pop} that were acknowledged since; a rewind never re-reads them. */
+  private readonly acknowledged = new WeakSet<KafkaRedriveMessage>();
+
+  constructor(private readonly options: KafkaRedriveIOOptions) {
+    const consumer = options.consumer;
+    if (consumer) {
+      this.rewind = async (from: KafkaRedriveMessage): Promise<void> => {
+        if (from.topic === undefined || from.partition === undefined || from.offset === undefined) {
+          throw new Error("kafka redrive: cannot rewind a record without topic, partition and offset");
+        }
+        // First (lowest) unacknowledged offset per partition: everything still in flight, plus `from` unless it
+        // was acknowledged already (a record restored and acked after a failed redrive write is committed past,
+        // and seeking back to it would redeliver a copy).
+        const pending = new Set<KafkaRedriveMessage>(this.inFlight);
+        if (!this.acknowledged.has(from)) pending.add(from);
+        const first = new Map<string, { topic: string; partition: number; offset: bigint }>();
+        for (const m of pending) {
+          if (m.topic === undefined || m.partition === undefined || m.offset === undefined) continue;
+          const key = `${m.topic}\u0000${m.partition}`;
+          const offset = BigInt(m.offset);
+          const seen = first.get(key);
+          if (!seen || offset < seen.offset) first.set(key, { topic: m.topic, partition: m.partition, offset });
+        }
+        this.inFlight.clear();
+        const failures: unknown[] = [];
+        for (const { topic, partition, offset } of first.values()) {
+          try {
+            await consumer.seek({ topic, partition, offset: offset.toString() });
+          } catch (err) {
+            failures.push(err); // keep rewinding the other partitions
+          }
+        }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) throw new AggregateError(failures, "kafka redrive: seeking several partitions back failed");
+      };
+    }
+  }
+
+  async pop(queue: string): Promise<KafkaRedriveMessage | null> {
+    const message = await this.options.pop(queue);
+    if (message && this.rewind && message.topic !== undefined && message.partition !== undefined && message.offset !== undefined) {
+      // Hand out a copy and leave the caller's message untouched (it may be frozen or expose accessors). The
+      // fields are read one by one: a spread copies own enumerable properties only, so a class instance with
+      // prototype getters (`get body()`) would lose them and its DLQ body would be restored as an empty record.
+      // The copy forgets the record once it is acknowledged: a rewind must never re-read a committed record.
+      const tracked: KafkaRedriveMessage = {
+        body: message.body,
+        key: message.key,
+        topic: message.topic,
+        partition: message.partition,
+        offset: message.offset,
+        ack: async (): Promise<void> => {
+          await message.ack();
+          this.inFlight.delete(tracked);
+          this.acknowledged.add(tracked);
+        },
+      };
+      this.inFlight.add(tracked);
+      return tracked;
+    }
+    return message;
   }
 
   /** Append an already-encoded body to `queue` as a keyless record. */

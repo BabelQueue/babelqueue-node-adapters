@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
-import { EnvelopeCodec, UnknownUrnStrategy, redrive } from "@babelqueue/core";
+import { EnvelopeCodec, UnknownUrnStrategy, annotate, redrive } from "@babelqueue/core";
 import type { Envelope } from "@babelqueue/core";
 
 import {
@@ -824,4 +824,305 @@ test("core redrive() over KafkaRedriveIO keeps the DLQ record key end to end", a
       assert.deepEqual(sent.messages[0]!.key, key);
     }
   }
+});
+
+// --- DLQ redrive: rewind of a record whose restore write failed ----------------
+
+class FakeSeeker {
+  seeks: { topic: string; partition: number; offset: string }[] = [];
+  failure?: Error;
+  seek(position: { topic: string; partition: number; offset: string }): void {
+    this.seeks.push(position);
+    if (this.failure) throw this.failure;
+  }
+}
+
+/** A producer whose every send is refused, so the restore write back to the DLQ fails. */
+const refusingProducer: KafkaProducerClient = {
+  async send(): Promise<unknown> {
+    throw new Error("broker refused the write");
+  },
+};
+
+function positioned(offset: string, partition = 2, body = "not an envelope"): KafkaRedriveMessage & { acked: boolean } {
+  const m = {
+    body,
+    key: Buffer.from("k"),
+    topic: "orders.dlq",
+    partition,
+    offset,
+    acked: false,
+    async ack(): Promise<void> {
+      m.acked = true;
+    },
+  };
+  return m;
+}
+
+test("KafkaRedriveIO offers rewind only when a consumer is supplied", () => {
+  assert.equal(new KafkaRedriveIO({ producer: new FakeProducer(), pop: async () => null }).rewind, undefined);
+  const io = new KafkaRedriveIO({ producer: new FakeProducer(), pop: async () => null, consumer: new FakeSeeker() });
+  assert.equal(typeof io.rewind, "function");
+});
+
+test("KafkaRedriveIO rewind seeks the consumer to the record's own offset", async () => {
+  const seeker = new FakeSeeker();
+  const io = new KafkaRedriveIO({ producer: new FakeProducer(), pop: async () => null, consumer: seeker });
+  await io.rewind!(positioned("41"));
+  assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 2, offset: "41" }]);
+});
+
+test("KafkaRedriveIO rewind refuses a record that carries no position", async () => {
+  const seeker = new FakeSeeker();
+  const io = new KafkaRedriveIO({ producer: new FakeProducer(), pop: async () => null, consumer: seeker });
+  await assert.rejects(io.rewind!(dlqMessage(Buffer.from("k"))), /cannot rewind a record without topic, partition and offset/);
+  assert.deepEqual(seeker.seeks, []);
+});
+
+/** An IO whose `pop` hands out `messages` in order, then `null`. */
+function queuedIO(messages: KafkaRedriveMessage[], seeker: FakeSeeker, producer: KafkaProducerClient = new FakeProducer()) {
+  const queue = [...messages];
+  return new KafkaRedriveIO({ producer, consumer: seeker, pop: async () => queue.shift() ?? null });
+}
+
+const sortedSeeks = (seeker: FakeSeeker) =>
+  [...seeker.seeks].sort((a, b) => a.partition - b.partition || Number(BigInt(a.offset) - BigInt(b.offset)));
+
+test("KafkaRedriveIO rewind seeks every partition back to its first unacknowledged record", async () => {
+  const seeker = new FakeSeeker();
+  const batch = [positioned("41", 0), positioned("42", 0), positioned("9", 1)];
+  const io = queuedIO(batch, seeker);
+  // The whole batch is popped before it is processed, so the consumer is already past all three records.
+  const popped: KafkaRedriveMessage[] = [];
+  for (let m = await io.pop("orders.dlq"); m; m = await io.pop("orders.dlq")) popped.push(m);
+  await io.rewind!(popped[0]!);
+  assert.deepEqual(sortedSeeks(seeker), [
+    { topic: "orders.dlq", partition: 0, offset: "41" },
+    { topic: "orders.dlq", partition: 1, offset: "9" },
+  ]);
+});
+
+test("KafkaRedriveIO rewind leaves already acknowledged records alone", async () => {
+  const seeker = new FakeSeeker();
+  const batch = [positioned("41", 0), positioned("42", 0), positioned("9", 1)];
+  const io = queuedIO(batch, seeker);
+  const popped: KafkaRedriveMessage[] = [];
+  for (let m = await io.pop("orders.dlq"); m; m = await io.pop("orders.dlq")) popped.push(m);
+  await popped[0]!.ack();
+  await io.rewind!(popped[1]!);
+  assert.deepEqual(sortedSeeks(seeker), [
+    { topic: "orders.dlq", partition: 0, offset: "42" },
+    { topic: "orders.dlq", partition: 1, offset: "9" },
+  ]);
+});
+
+test("KafkaRedriveIO rewind skips an acknowledged `from` and rewinds the rest of the batch", async () => {
+  const seeker = new FakeSeeker();
+  const io = queuedIO([positioned("41", 0), positioned("42", 0), positioned("9", 1)], seeker);
+  const popped: KafkaRedriveMessage[] = [];
+  for (let m = await io.pop("orders.dlq"); m; m = await io.pop("orders.dlq")) popped.push(m);
+  // Restored and acknowledged after a failed redrive write: committed past, so it must not come back.
+  await popped[0]!.ack();
+  await io.rewind!(popped[0]!);
+  assert.deepEqual(sortedSeeks(seeker), [
+    { topic: "orders.dlq", partition: 0, offset: "42" },
+    { topic: "orders.dlq", partition: 1, offset: "9" },
+  ]);
+});
+
+test("KafkaRedriveIO rewind of an acknowledged sole record seeks nothing", async () => {
+  const seeker = new FakeSeeker();
+  const io = queuedIO([positioned("41", 0)], seeker);
+  const only = await io.pop("orders.dlq");
+  await only!.ack();
+  await io.rewind!(only!);
+  assert.deepEqual(seeker.seeks, [], "seeking an acknowledged record back would redeliver a duplicate");
+});
+
+test("KafkaRedriveIO pop leaves the caller's message untouched", async () => {
+  const seeker = new FakeSeeker();
+  let acked = false;
+  const ackFn = async (): Promise<void> => {
+    acked = true;
+  };
+  // Frozen: assigning `ack` on it would throw in strict mode, so pop must not mutate it.
+  const frozen = Object.freeze({ body: "not an envelope", topic: "orders.dlq", partition: 0, offset: "41", ack: ackFn });
+  const io = queuedIO([frozen], seeker);
+  const handedOut = await io.pop("orders.dlq");
+  assert.notEqual(handedOut, frozen, "a tracked copy is handed out");
+  assert.equal(frozen.ack, ackFn, "the caller's own ack is not replaced");
+  assert.equal(handedOut!.offset, "41");
+  await handedOut!.ack();
+  assert.equal(acked, true, "acknowledging the copy acknowledges the original");
+  await io.rewind!(handedOut!);
+  assert.deepEqual(seeker.seeks, []);
+});
+
+test("KafkaRedriveIO pop keeps the fields of a message that exposes them as prototype getters", async () => {
+  const seeker = new FakeSeeker();
+  class GetterMessage implements KafkaRedriveMessage {
+    get body(): string {
+      return "not an envelope";
+    }
+    get key(): Buffer {
+      return Buffer.from("order-7");
+    }
+    get topic(): string {
+      return "orders.dlq";
+    }
+    get partition(): number {
+      return 2;
+    }
+    get offset(): string {
+      return "41";
+    }
+    async ack(): Promise<void> {}
+  }
+  const io = queuedIO([new GetterMessage()], seeker);
+  const handedOut = await io.pop("orders.dlq");
+  assert.equal(handedOut!.body, "not an envelope", "a spread copy would have lost the body");
+  assert.deepEqual(handedOut!.key, Buffer.from("order-7"));
+  assert.equal(handedOut!.topic, "orders.dlq");
+  assert.equal(handedOut!.partition, 2);
+  assert.equal(handedOut!.offset, "41");
+  await io.rewind!(handedOut!);
+  assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 2, offset: "41" }]);
+});
+
+test("KafkaRedriveIO rewind compares offsets numerically, not as strings", async () => {
+  const seeker = new FakeSeeker();
+  const io = queuedIO([positioned("9"), positioned("10")], seeker);
+  const first = await io.pop("orders.dlq");
+  await io.pop("orders.dlq");
+  await io.rewind!(first!);
+  assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 2, offset: "9" }]);
+});
+
+test("KafkaRedriveIO rewind keeps seeking the other partitions when one seek fails", async () => {
+  const seeker = new FakeSeeker();
+  const failing = new Error("seek failed");
+  const origSeek = seeker.seek.bind(seeker);
+  seeker.seek = (position) => {
+    origSeek(position);
+    if (position.partition === 0) throw failing;
+  };
+  const io = queuedIO([positioned("41", 0), positioned("9", 1)], seeker);
+  const first = await io.pop("orders.dlq");
+  await io.pop("orders.dlq");
+  await assert.rejects(io.rewind!(first!), (err: unknown) => err === failing);
+  assert.equal(seeker.seeks.length, 2);
+});
+
+/** True when the installed `@babelqueue/core` calls `RedriveIO.rewind` (added after core 1.9.0). */
+async function coreSupportsRewind(): Promise<boolean> {
+  let called = false;
+  let popped = false;
+  const probe = {
+    async pop(): Promise<{ body: string; ack(): Promise<void> } | null> {
+      if (popped) return null;
+      popped = true;
+      return { body: "x", ack: async () => {} };
+    },
+    async publish(): Promise<void> {
+      throw new Error("refused");
+    },
+    async rewind(): Promise<void> {
+      called = true;
+    },
+  };
+  await redrive(probe, "q").catch(() => undefined);
+  return called;
+}
+
+test("core redrive(): a failed restore seeks the consumer back and never acks", async (t) => {
+  if (!(await coreSupportsRewind())) {
+    t.skip("the installed @babelqueue/core predates RedriveIO.rewind");
+    return;
+  }
+  const seeker = new FakeSeeker();
+  const msg = positioned("41");
+  let pending: KafkaRedriveMessage | null = msg;
+  const io = new KafkaRedriveIO({
+    producer: refusingProducer,
+    consumer: seeker,
+    pop: async () => {
+      const m = pending;
+      pending = null;
+      return m;
+    },
+  });
+  await assert.rejects(redrive(io, "orders.dlq", { toQueue: "orders" }), /broker refused the write/);
+  assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 2, offset: "41" }]);
+  assert.equal(msg.acked, false, "a record whose restore failed must not be committed");
+});
+
+test("core redrive(): a failing seek is reported together with the restore error", async (t) => {
+  if (!(await coreSupportsRewind())) {
+    t.skip("the installed @babelqueue/core predates RedriveIO.rewind");
+    return;
+  }
+  const seeker = new FakeSeeker();
+  seeker.failure = new Error("seek failed");
+  const msg = positioned("41");
+  let pending: KafkaRedriveMessage | null = msg;
+  const io = new KafkaRedriveIO({
+    producer: refusingProducer,
+    consumer: seeker,
+    pop: async () => {
+      const m = pending;
+      pending = null;
+      return m;
+    },
+  });
+  await assert.rejects(redrive(io, "orders.dlq", { toQueue: "orders" }), (err: unknown) => {
+    assert.ok(err instanceof AggregateError);
+    assert.deepEqual(
+      err.errors.map((e: Error) => e.message),
+      ["broker refused the write", "seek failed"],
+    );
+    return true;
+  });
+  assert.equal(msg.acked, false);
+});
+
+test("core redrive(): a failed restore in a multi-partition batch seeks every partition back", async (t) => {
+  if (!(await coreSupportsRewind())) {
+    t.skip("the installed @babelqueue/core predates RedriveIO.rewind");
+    return;
+  }
+  const seeker = new FakeSeeker();
+  const first = positioned("41", 0);
+  const second = positioned("9", 1);
+  const io = queuedIO([first, second], seeker, refusingProducer);
+  await assert.rejects(redrive(io, "orders.dlq", { toQueue: "orders" }), /broker refused the write/);
+  assert.deepEqual(sortedSeeks(seeker), [
+    { topic: "orders.dlq", partition: 0, offset: "41" },
+    { topic: "orders.dlq", partition: 1, offset: "9" },
+  ]);
+  assert.equal(first.acked, false);
+  assert.equal(second.acked, false);
+});
+
+test("core redrive(): a failed work write with a successful restore rewinds the rest, not the acknowledged record", async (t) => {
+  if (!(await coreSupportsRewind())) {
+    t.skip("the installed @babelqueue/core predates RedriveIO.rewind");
+    return;
+  }
+  const seeker = new FakeSeeker();
+  const body = EnvelopeCodec.encode(annotate(envelope(0), "failed", "orders"));
+  const first = positioned("41", 0, body);
+  const second = positioned("9", 1, body);
+  // The work topic refuses the write, the DLQ restore goes through.
+  const workRefused: KafkaProducerClient = {
+    async send(record: { topic: string }): Promise<unknown> {
+      if (record.topic !== "orders.dlq") throw new Error("work topic refused the write");
+      return {};
+    },
+  };
+  const io = queuedIO([first, second], seeker, workRefused);
+  await assert.rejects(redrive(io, "orders.dlq"), /work topic refused the write/);
+  assert.equal(first.acked, true, "the restored record was acknowledged (committed)");
+  assert.equal(second.acked, false);
+  // Only the unprocessed record comes back; seeking partition 0 would redeliver the restored copy.
+  assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 1, offset: "9" }]);
 });
