@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-10-11
+
 ### Fixed
 
 - **The original record key now survives retry republish, unknown-URN release, and the envelope
