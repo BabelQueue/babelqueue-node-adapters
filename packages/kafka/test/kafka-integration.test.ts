@@ -10,13 +10,18 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 
+import { EnvelopeCodec, redrive } from "@babelqueue/core";
+
 import {
   KafkaConsumer,
   KafkaPublisher,
+  KafkaRedriveIO,
   RetryTopics,
+  kafkaHeaders,
   type EachMessagePayload,
   type KafkaConsumerClient,
   type KafkaProducerClient,
+  type KafkaRedriveMessage,
 } from "../src/index.js";
 
 const URN = "urn:babel:orders:created";
@@ -208,3 +213,167 @@ test("schema-version gate rejection forwards the raw record to the DLQ", { skip:
     await producer.disconnect();
   }
 });
+
+// --- Record key carry (contract §6.5): null stays null, empty stays empty, non-empty stays distinct ---
+
+/** The three key shapes of §6.5. `null` = no key on the record (length -1), `empty` = zero-length key. */
+const KEY_CASES: { name: string; key: Buffer | null }[] = [
+  { name: "null", key: null },
+  { name: "empty", key: Buffer.alloc(0) },
+  { name: "non-empty", key: Buffer.from("order-7", "utf8") },
+];
+
+/** Assert a record's key equals the expected one, comparing null-ness first (KafkaJS: -1 → null, 0 → empty Buffer). */
+function assertSameKey(actual: Buffer | null | undefined, expected: Buffer | null, where: string): void {
+  const got = actual ?? null;
+  if (expected === null) {
+    assert.equal(got, null, `${where}: a null key must stay null, got ${got === null ? "null" : `${got.length} bytes`}`);
+    return;
+  }
+  assert.notEqual(got, null, `${where}: a ${expected.length === 0 ? "empty" : "non-null"} key must not become null`);
+  assert.equal(got!.length, expected.length, `${where}: key length`);
+  assert.ok(got!.equals(expected), `${where}: key bytes`);
+}
+
+/** Produce one keyed (or key-less) envelope record to `topic`, as an external producer would. */
+async function seedRecord(producer: KafkaProducerClient, topic: string, key: Buffer | null, envelope = EnvelopeCodec.make(URN, { order_id: 7 }, { queue: topic, traceId: "trace-key" })): Promise<void> {
+  const message: { key?: Buffer; value: string; headers: { [name: string]: string } } = {
+    value: EnvelopeCodec.encode(envelope),
+    headers: kafkaHeaders(envelope),
+  };
+  if (key !== null) message.key = Buffer.from(key);
+  await producer.send({ topic, messages: [message] });
+}
+
+for (const { name, key } of KEY_CASES) {
+  test(`${name} record key survives retry and DLQ`, { skip: SKIP }, async () => {
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
+    const work = `bq-it-key-${suffix}`;
+    const topology = new RetryTopics(work, [1000]);
+    const retry = topology.tiers[0]!.topic;
+    const dlq = topology.dlqTopic!;
+    const client = await newClient();
+    await createTopics(client, [work, retry, dlq]);
+
+    const producer = client.producer();
+    const raw = client.consumer({ groupId: `bq-it-group-${suffix}` });
+    await producer.connect();
+    await raw.connect();
+    await raw.subscribe({ topics: [work, retry], fromBeginning: true });
+    const onWork = await collect(client, work);
+    const onRetry = await collect(client, retry);
+    const onDlq = await collect(client, dlq);
+
+    const consumer = new KafkaConsumer(
+      raw,
+      {
+        [URN]: () => {
+          throw new Error("boom");
+        },
+      },
+      { producer, retryTopics: topology, maxTries: 2 },
+    );
+
+    try {
+      await consumer.run();
+      await seedRecord(producer, work, key);
+
+      await waitFor(() => onDlq.records.length >= 1, `a record on ${dlq}`);
+      assert.equal(onWork.records.length, 1, "exactly one record on the work topic");
+      assert.equal(onRetry.records.length, 1, "exactly one record on the retry tier");
+      assert.equal(onDlq.records.length, 1, "exactly one record on the DLQ");
+      assertSameKey(onWork.records[0]!.message.key, key, "work record (as produced)");
+      assertSameKey(onRetry.records[0]!.message.key, key, "retry republish");
+      assertSameKey(onDlq.records[0]!.message.key, key, "DLQ write");
+    } finally {
+      await onWork.stop();
+      await onRetry.stop();
+      await onDlq.stop();
+      await raw.stop();
+      await raw.disconnect();
+      await producer.disconnect();
+    }
+  });
+}
+
+/**
+ * A bounded pull over a push-based KafkaJS consumer (manual commit): buffers delivered records and hands
+ * out one per `pop`, returning `null` when nothing arrives within `timeoutMs`.
+ */
+async function pullFrom(client: KjsClient, topic: string, timeoutMs: number): Promise<{ pop: (queue: string) => Promise<KafkaRedriveMessage | null>; stop: () => Promise<void> }> {
+  const consumer = client.consumer({ groupId: `bq-it-redrive-${randomUUID()}` }) as KjsConsumer & KafkaConsumerClient;
+  await consumer.connect();
+  await consumer.subscribe({ topics: [topic], fromBeginning: true });
+  const pending: EachMessagePayload[] = [];
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async (payload) => {
+      pending.push(payload);
+    },
+  });
+  return {
+    pop: async () => {
+      const stop = Date.now() + timeoutMs;
+      while (pending.length === 0) {
+        if (Date.now() > stop) return null;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const payload = pending.shift()!;
+      return {
+        body: payload.message.value!.toString("utf8"),
+        key: payload.message.key ?? null,
+        ack: () => consumer.commitOffsets([{ topic: payload.topic, partition: payload.partition, offset: String(Number(payload.message.offset) + 1) }]),
+      };
+    },
+    stop: async () => {
+      await consumer.stop();
+      await consumer.disconnect();
+    },
+  };
+}
+
+for (const { name, key } of KEY_CASES) {
+  test(`${name} record key survives DLQ redrive`, { skip: SKIP }, async () => {
+    const suffix = randomUUID().replace(/-/g, "").slice(0, 8);
+    const work = `bq-it-redrive-${suffix}`;
+    const topology = new RetryTopics(work, [1000]);
+    const dlq = topology.dlqTopic!;
+    const sandbox = `bq-it-sandbox-${suffix}`;
+    const client = await newClient();
+    await createTopics(client, [work, topology.tiers[0]!.topic, dlq, sandbox]);
+
+    const producer = client.producer();
+    await producer.connect();
+    const onDlq = await collect(client, dlq);
+    const onSandbox = await collect(client, sandbox);
+    const pull = await pullFrom(client, dlq, 30_000);
+    const io = new KafkaRedriveIO({ producer, pop: pull.pop });
+
+    try {
+      // A dead-lettered record, as the consumer would have written it (carrying the key under test).
+      const dead = EnvelopeCodec.make(URN, { order_id: 7 }, { queue: work, traceId: "trace-key" });
+      dead.dead_letter = { reason: "failed", error: "boom", exception: "Error", failed_at: Date.now(), original_queue: work, attempts: 2, lang: "node" };
+      await seedRecord(producer, dlq, key, dead);
+      await waitFor(() => onDlq.records.length >= 1, `the seeded record on ${dlq}`);
+      assertSameKey(onDlq.records[0]!.message.key, key, "DLQ record (as seeded)");
+
+      // Dry run: the record is popped and restored to the DLQ unchanged — the restore must carry the key.
+      const dry = await redrive(io, dlq, { dryRun: true, max: 1 });
+      assert.equal(dry.skipped, 1);
+      await waitFor(() => onDlq.records.length >= 2, `the dry-run restore on ${dlq}`);
+      assertSameKey(onDlq.records[1]!.message.key, key, "dry-run restore to the DLQ");
+
+      // Real redrive of the restored record into a sandbox topic — the redrive write must carry the key.
+      const real = await redrive(io, dlq, { toQueue: sandbox, max: 1 });
+      assert.equal(real.redriven, 1);
+      await waitFor(() => onSandbox.records.length >= 1, `a record on ${sandbox}`);
+      assert.equal(onSandbox.records.length, 1);
+      assertSameKey(onSandbox.records[0]!.message.key, key, "redrive write");
+    } finally {
+      await pull.stop();
+      await onDlq.stop();
+      await onSandbox.stop();
+      await producer.disconnect();
+    }
+  });
+}
