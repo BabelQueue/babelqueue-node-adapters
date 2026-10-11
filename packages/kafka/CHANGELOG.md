@@ -7,7 +7,7 @@ this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-11
 
 ### Added
 
@@ -15,10 +15,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `KafkaProducerClient` + a caller-supplied `pop`. Its `publishFrom` re-publishes with the reserved DLQ
   record's key byte-for-byte (null stays null, empty stays empty) for both the redrive write and the
   restore write back to the DLQ, per contract §6.5 "Record key on republish". **Requires
-  `@babelqueue/core` newer than 1.8.0** (the next core release, which adds the optional
-  `RedriveIO.publishFrom` capability): with core <= 1.8.0 `redrive()` ignores `publishFrom`, falls back
-  to the keyless `publish` and the redriven record silently loses its key. The `@babelqueue/core`
-  dependency range is raised to that release at publish time. No wire, header or `dead_letter` change.
+  `@babelqueue/core` ^1.9.0**, which adds the optional `RedriveIO.publishFrom` capability (with core
+  <= 1.8.0 `redrive()` ignores `publishFrom`, falls back to the keyless `publish` and the redriven
+  record loses its key); the dependency range is raised accordingly. No wire, header or
+  `dead_letter` change.
 
 ### Fixed
 
