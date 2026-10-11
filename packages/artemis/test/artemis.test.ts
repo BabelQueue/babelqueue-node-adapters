@@ -65,6 +65,29 @@ function context(message: AmqpMessage, delivery = new FakeDelivery()): { context
   return { context: { message, delivery }, delivery };
 }
 
+/**
+ * Run `fn` with a ref'd keep-alive timer. The consumer's `deadLetterRetryDelayMs` backoff timer is unref()'d on
+ * purpose (it must not hold a process open on shutdown; in production the AMQP connection keeps the loop alive).
+ * Once a test's own short wait fires, that unref()'d timer is the only one left, so Node < 24 resolves the event
+ * loop while the awaited promise is still pending ("Promise resolution is still pending but the event loop has
+ * already resolved") and cancels the rest of the file. The keep-alive stands in for the connection.
+ *
+ * Callers must pass a per-test `timeout` and the test's `t.signal`. `node:test` marks a timed-out test as failed but
+ * does not cancel its function, so without the abort hook the interval would outlive a regressed (never-resolving)
+ * test and keep the file's process alive indefinitely.
+ */
+async function withKeepAlive<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  const keepAlive = setInterval(() => undefined, 1_000);
+  const stop = (): void => clearInterval(keepAlive);
+  signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await fn();
+  } finally {
+    signal.removeEventListener("abort", stop);
+    stop();
+  }
+}
+
 // --- projection ---------------------------------------------------------------
 
 test("artemisMessage projects body, correlation, jms-type annotation and bq_ properties", () => {
@@ -369,13 +392,15 @@ test("gate: no broker verdict before deadLetterTimeoutMs releases the source mes
   assert.equal(dlq.listenerCount(), 0);
 });
 
-test("gate: a failed DLQ write never uses delivery_failed and waits deadLetterRetryDelayMs before releasing", async () => {
+test("gate: a failed DLQ write never uses delivery_failed and waits deadLetterRetryDelayMs before releasing", { timeout: 5_000 }, async (t) => {
   const { context: ctx, delivery } = context(gated("2"));
   const pending = new ArtemisConsumer({}, { deadLetterSender: new EventSender("rejected"), deadLetterRetryDelayMs: 60 }).handle(ctx);
-  await new Promise((resolve) => setTimeout(resolve, 25));
-  assert.equal(delivery.released.length, 0, "no hot-loop release before the backoff elapsed");
-  assert.equal(delivery.accepted, 0);
-  await pending;
+  await withKeepAlive(t.signal, async () => {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(delivery.released.length, 0, "no hot-loop release before the backoff elapsed");
+    assert.equal(delivery.accepted, 0);
+    await pending;
+  });
   assert.deepEqual(delivery.released, [{}]);
   assert.ok(delivery.released.every((p) => (p as { delivery_failed?: boolean }).delivery_failed === undefined));
 });
@@ -536,13 +561,15 @@ test("non-gate DLQ paths: no broker verdict before deadLetterTimeoutMs releases 
   }
 });
 
-test("non-gate DLQ paths: a failed DLQ write waits deadLetterRetryDelayMs before the plain release", async () => {
+test("non-gate DLQ paths: a failed DLQ write waits deadLetterRetryDelayMs before the plain release", { timeout: 5_000 }, async (t) => {
   for (const path of dlqPaths) {
     let result: FakeDelivery | undefined;
     const pending = path.run(new EventSender("rejected"), () => undefined, 60).then((d) => (result = d));
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    assert.equal(result, undefined, `${path.name}: still waiting`);
-    const delivery = await pending;
+    const delivery = await withKeepAlive(t.signal, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.equal(result, undefined, `${path.name}: still waiting`);
+      return pending;
+    });
     assert.equal(delivery.accepted, 0, path.name);
     assert.deepEqual(delivery.released, [{}], path.name);
   }
