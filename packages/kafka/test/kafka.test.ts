@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
+import { mock, test } from "node:test";
 
 import { EnvelopeCodec, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope } from "@babelqueue/core";
@@ -566,3 +566,169 @@ for (const { name, key } of KEY_CASES) {
     assertKeyCarried(producer, "orders.dlq", key);
   });
 }
+
+// --- onError isolation: a throwing callback never bypasses settlement ---------------
+
+const throwingOnError = (): never => {
+  throw new Error("onError exploded");
+};
+
+function rawPayload(value: string, headers: IncomingHeaders = {}): EachMessagePayload {
+  return { topic: "orders", partition: 0, message: { value: Buffer.from(value, "utf8"), headers, offset: "4" } };
+}
+
+test("onError isolation: a throwing onError on a non-JSON body (rejected by the conformance check) still dead-letters and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = rawPayload("not-json");
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: throwingOnError }).handle(payload);
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("onError isolation: a throwing onError when decode itself throws still dead-letters the raw record and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = rawPayload("{}");
+  const decode = mock.method(EnvelopeCodec, "decode", () => {
+    throw new Error("decode exploded");
+  });
+  try {
+    await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: throwingOnError }).handle(payload);
+  } finally {
+    decode.mock.restore();
+  }
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("onError isolation: an async onError that rejects neither crashes the process nor bypasses settlement", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await new KafkaConsumer(consumer, {}, {
+      producer,
+      retryTopics: topology(),
+      onError: async () => {
+        throw new Error("async onError exploded");
+      },
+    }).handle(rawPayload('{"foo":"bar"}'));
+    // Let any unhandled rejection surface before asserting.
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("onError isolation: a throwing onError on a non-conformant envelope still dead-letters and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  const payload = rawPayload('{"foo":"bar"}');
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: throwingOnError }).handle(payload);
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("onError isolation: a throwing onError on an unsupported schema version still dead-letters and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  let calls = 0;
+  await new KafkaConsumer(consumer, { [URN]: () => void (calls += 1) }, {
+    producer,
+    retryTopics: topology(),
+    onError: throwingOnError,
+  }).handle(gatePayload("2"));
+  assert.equal(calls, 0);
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "11" }]);
+});
+
+test("onError isolation: a throwing onError on a handler failure still retries and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  await new KafkaConsumer(
+    consumer,
+    {
+      [URN]: () => {
+        throw new Error("boom");
+      },
+    },
+    { producer, retryTopics: topology(), maxTries: 3, onError: throwingOnError },
+  ).handle(payloadFor(envelope(0), "10"));
+  assert.equal(producer.sent[0]!.topic, "orders.retry.1");
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "11" }]);
+});
+
+test("onError isolation: a throwing onError on a terminal handler failure still dead-letters and commits", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  await new KafkaConsumer(
+    consumer,
+    {
+      [URN]: () => {
+        throw new Error("boom");
+      },
+    },
+    { producer, retryTopics: topology(), maxTries: 3, onError: throwingOnError },
+  ).handle(payloadFor(envelope(2), "10"));
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "11" }]);
+});
+
+test("onError isolation: the consumer keeps running — the next record is processed after a throwing onError", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  let seen = 0;
+  const worker = new KafkaConsumer(consumer, { [URN]: () => void (seen += 1) }, {
+    producer,
+    retryTopics: topology(),
+    onError: throwingOnError,
+  });
+  await worker.handle(rawPayload("not-json"));
+  await worker.handle(payloadFor(envelope(0), "6"));
+  assert.equal(seen, 1);
+  assert.deepEqual(consumer.committed, [
+    { topic: "orders", partition: 0, offset: "5" },
+    { topic: "orders", partition: 0, offset: "7" },
+  ]);
+});
+
+test("onError isolation: a failing DLQ write is not committed and the original error is still reported", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  producer.send = async () => {
+    throw new Error("dlq produce failed");
+  };
+  const errors: unknown[] = [];
+  await assert.rejects(
+    new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: (e) => void errors.push(e) }).handle(
+      rawPayload("not-json"),
+    ),
+    /dlq produce failed/,
+  );
+  assert.deepEqual(consumer.committed, []);
+  assert.equal(errors.length, 1);
+});
+
+test("onError isolation: unknown-URN FAIL still surfaces UnknownUrnError when onError throws", async () => {
+  const consumer = new FakeConsumer();
+  await assert.rejects(
+    new KafkaConsumer(consumer, {}, { onError: throwingOnError }).handle(payloadFor(envelope(0), "10")),
+    (e: Error) => e.name === "UnknownUrnError" || /urn/i.test(e.message),
+  );
+  assert.deepEqual(consumer.committed, []);
+});

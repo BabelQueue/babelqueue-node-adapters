@@ -130,6 +130,14 @@ function headerInt(headers: IncomingHeaders | undefined, key: string, fallback: 
   return Number.isNaN(n) ? fallback : n;
 }
 
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
 /** Blank = empty or only ASCII whitespace (GR-5: the same set in every SDK, never `String.trim()`). */
 const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
 
@@ -342,13 +350,15 @@ export class KafkaConsumer {
     // Version gate (§6.7): decided on the header alone, before the value is decoded.
     const unsupported = unsupportedSchemaVersion(message);
     if (unsupported !== undefined) {
-      this.report(
-        new BabelQueueError(`Rejected a record from Kafka with unsupported bq-schema-version "${unsupported}" (supported: ${SCHEMA_VERSION}).`),
-        null,
-        payload,
+      const rejected = new BabelQueueError(
+        `Rejected a record from Kafka with unsupported bq-schema-version "${unsupported}" (supported: ${SCHEMA_VERSION}).`,
       );
-      await this.deadLetterRaw(payload);
-      await this.commit(payload);
+      try {
+        await this.deadLetterRaw(payload);
+        await this.commit(payload);
+      } finally {
+        this.report(rejected, null, payload);
+      }
       return;
     }
 
@@ -358,18 +368,25 @@ export class KafkaConsumer {
     try {
       envelope = this.reconcile(EnvelopeCodec.decode(raw), message);
     } catch (decodeError) {
-      this.report(decodeError, null, payload);
-      await this.deadLetterRaw(payload);
-      await this.commit(payload);
+      try {
+        await this.deadLetterRaw(payload);
+        await this.commit(payload);
+      } finally {
+        this.report(decodeError, null, payload);
+      }
       return;
     }
 
     if (!EnvelopeCodec.accepts(envelope)) {
       // A non-conformant / poison envelope may be missing the fields needed to annotate, so
       // forward the raw record to the DLQ rather than building a dead_letter block.
-      this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Kafka."), envelope, payload);
-      await this.deadLetterRaw(payload);
-      await this.commit(payload);
+      const rejected = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Kafka.");
+      try {
+        await this.deadLetterRaw(payload);
+        await this.commit(payload);
+      } finally {
+        this.report(rejected, envelope, payload);
+      }
       return;
     }
 
@@ -384,9 +401,12 @@ export class KafkaConsumer {
       await handler(envelope, message, headersOf(message));
       await this.commit(payload);
     } catch (error) {
-      this.report(error, envelope, payload);
-      await this.retryOrDeadLetter(payload, envelope as Envelope, error);
-      await this.commit(payload);
+      try {
+        await this.retryOrDeadLetter(payload, envelope as Envelope, error);
+        await this.commit(payload);
+      } finally {
+        this.report(error, envelope, payload);
+      }
     }
   }
 
@@ -421,7 +441,7 @@ export class KafkaConsumer {
     const hasTiers = this.options.retryTopics?.hasTiers() ?? false;
     const hasDlq = (this.options.retryTopics?.dlqTopic ?? null) !== null;
     if (!hasTiers && !hasDlq) {
-      void error; // reported via onError before this; Kafka has nowhere to put the failure
+      void error; // reported via onError afterwards; Kafka has nowhere to put the failure
       throw new BabelQueueError("Kafka per-record retry requires retry topics and/or a DLQ; neither is configured.");
     }
     if (hasTiers && (envelope.attempts ?? 0) + 1 < this.maxTries) {
@@ -508,7 +528,21 @@ export class KafkaConsumer {
     }
   }
 
+  /**
+   * Hand a failure to the user's `onError` callback. Callers invoke this only AFTER the record has been
+   * settled (dead-lettered / retried and committed). A callback that throws synchronously, or returns a
+   * promise that later rejects (an `async` function is assignable to the `void` callback type), is
+   * swallowed here so user code can never bypass settlement or stop the consumer.
+   */
   private report(error: unknown, envelope: IncomingEnvelope | null, payload: EachMessagePayload): void {
-    this.options.onError?.(error, envelope, payload);
+    try {
+      const returned: unknown = this.options.onError?.(error, envelope, payload);
+      if (isThenable(returned)) {
+        // An async callback's rejection would otherwise surface as an unhandled rejection.
+        returned.then(undefined, () => undefined);
+      }
+    } catch {
+      // user callback failure must not escape the consume loop
+    }
   }
 }

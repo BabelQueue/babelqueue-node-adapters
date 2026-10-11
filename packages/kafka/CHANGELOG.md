@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **A throwing `onError` callback can no longer bypass settlement.** The version-gate, undecodable
+  (decode error) and non-conformant-envelope branches reported to `onError` *before* the DLQ write
+  and the offset commit, so a callback that threw skipped both and the record redelivered forever.
+  Every branch now settles first (DLQ / retry + commit), then reports through a guarded `report()`
+  that swallows callback exceptions; the original error is still reported when settlement itself
+  fails. Behaviour change: a throwing `onError` is now swallowed instead of propagating out of
+  `handle()`. An `async` `onError` whose promise rejects is swallowed too (no unhandled
+  rejection). No wire, header or `dead_letter` change.
+
 ## [1.1.3] - 2026-10-11
 
 ### Fixed
