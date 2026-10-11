@@ -322,6 +322,12 @@ async function pullFrom(client: KjsClient, topic: string, timeoutMs: number): Pr
       return {
         body: payload.message.value!.toString("utf8"),
         key: payload.message.key ?? null,
+        // The consumed record as received, so a restore write can re-write it verbatim.
+        value: payload.message.value,
+        headers: payload.message.headers,
+        topic: payload.topic,
+        partition: payload.partition,
+        offset: payload.message.offset,
         ack: () => consumer.commitOffsets([{ topic: payload.topic, partition: payload.partition, offset: String(Number(payload.message.offset) + 1) }]),
       };
     },
@@ -362,6 +368,9 @@ for (const { name, key } of KEY_CASES) {
       assert.equal(dry.skipped, 1);
       await waitFor(() => onDlq.records.length >= 2, `the dry-run restore on ${dlq}`);
       assertSameKey(onDlq.records[1]!.message.key, key, "dry-run restore to the DLQ");
+      // ... and the rest of the record verbatim: value bytes and every header as consumed.
+      assert.deepEqual(onDlq.records[1]!.message.value, onDlq.records[0]!.message.value, "dry-run restore: value bytes");
+      assert.deepEqual(onDlq.records[1]!.message.headers, onDlq.records[0]!.message.headers, "dry-run restore: headers");
 
       // Real redrive of the restored record into a sandbox topic — the redrive write must carry the key.
       const real = await redrive(io, dlq, { toQueue: sandbox, max: 1 });

@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **`KafkaRedriveIO` restore writes the consumed DLQ record back verbatim** (Go/Java/.NET parity). A restore
+  write (`publishFrom` where the queue is the record's own `topic` and the body is unchanged: dry run,
+  unselected, undecodable, failed redrive write) used to re-derive the `bq-*` headers from the body and stamp
+  the record with `meta.created_at`. It now re-writes the original value bytes, headers and key and stamps a
+  fresh timestamp, so the restored copy keeps its provenance (`bq-original-topic`, ...) and does not age out
+  of the DLQ early. New optional `KafkaRedriveMessage` `value` / `headers` fields carry the consumed record;
+  `pop` keeps them on its tracked copy. A message without them still restores (body as value; `bq-*`
+  projection when no headers), only with the fresh timestamp. The redrive to the work topic is unchanged.
+  Restore detection needs `topic` to be set on the reserved message (the `pop` option now documents this).
+  A header the consumer decoded as `null` is not re-written on restore (known limit).
+
 ### Added
 
 - **`KafkaRedriveIO` rewinds on a run that stops on a failed message.** New optional `consumer`

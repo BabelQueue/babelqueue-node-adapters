@@ -306,6 +306,14 @@ export class KafkaPublisher {
 export interface KafkaRedriveMessage {
   body: string;
   key?: Buffer | null;
+  /**
+   * The consumed record's value bytes (`null` for a tombstone) and headers. When supplied, a restore write
+   * (see {@link KafkaRedriveIO.publishFrom}) re-writes the original record verbatim — value bytes and
+   * headers as they were consumed — instead of re-deriving them from `body` (a lossy UTF-8 round trip
+   * for a non-UTF-8 value, and a re-projection of the `bq-*` headers).
+   */
+  value?: Buffer | null;
+  headers?: IncomingHeaders;
   /** The record's position, needed by {@link KafkaRedriveIO.rewind}; the offset is a KafkaJS string. */
   topic?: string;
   partition?: number;
@@ -321,6 +329,14 @@ export interface KafkaRedriveIOOptions {
    * Reserve the next record from `queue` (the DLQ topic), or `null` when it is empty. Kafka consumption
    * is push-based in KafkaJS, so the caller supplies the pull (a bounded fetch with manual commit) and
    * its `ack` commits the offset. Return the record's `key` so the redrive can carry it.
+   *
+   * For a **verbatim restore** (a record written back to the DLQ unchanged: dry run, unselected, undecodable,
+   * failed redrive write) also return the consumed record's `topic`, `value` and `headers`: the IO treats a
+   * write as a restore only when the reserved message carries `topic` (the queue written to is that topic and
+   * the body is unchanged), and then re-writes `value` / `headers` / `key` as they were consumed with a fresh
+   * timestamp. A message without `topic` is restored through the republish path (`bq-*` headers re-projected
+   * from the body, `meta.created_at` as timestamp); without `value` / `headers` the body / projected headers
+   * stand in for them. `topic`, `partition` and `offset` are also what {@link KafkaRedriveIO.rewind} needs.
    */
   pop(queue: string): Promise<KafkaRedriveMessage | null>;
   /**
@@ -412,6 +428,8 @@ export class KafkaRedriveIO {
       const tracked: KafkaRedriveMessage = {
         body: message.body,
         key: message.key,
+        value: message.value,
+        headers: message.headers,
         topic: message.topic,
         partition: message.partition,
         offset: message.offset,
@@ -432,9 +450,44 @@ export class KafkaRedriveIO {
     await this.send(queue, body, null);
   }
 
-  /** Append `body` to `queue`, carrying the key of the reserved record `from` byte-for-byte. */
+  /**
+   * Append `body` to `queue` on behalf of the reserved record `from`. Two modes (Go/Java/.NET parity):
+   *
+   * - **Restore** — `queue` is the topic `from` was consumed from and `body` is the body `pop` returned for
+   *   it (redrive writing an unchanged DLQ record back). The original record is re-written verbatim: its
+   *   value bytes (`from.value`), headers (`from.headers`) and key, with a fresh timestamp so the restored
+   *   copy does not age out of the DLQ early (never `meta.created_at`). A message that carries no `value`
+   *   re-writes `body`; one that carries no `headers` falls back to the `bq-*` projection of a decodable body.
+   *   Needs `from.topic` to be set; without it a restore is indistinguishable from a republish.
+   *   Header values the consumer decoded as `null` (a header with a -1 length) are not re-written: the
+   *   restore copy goes through `copyHeaders`, which drops them (a deliberate bound; the Go reference
+   *   writes them as they are).
+   * - **Republish** — any other queue/body (a redrive to the work topic): the `bq-*` header projection and
+   *   the `meta.created_at` timestamp, plus the key of `from` byte-for-byte (§6.5).
+   */
   async publishFrom(queue: string, body: string, from: KafkaRedriveMessage): Promise<void> {
+    if (from.topic !== undefined && queue === from.topic && body === from.body) {
+      await this.restoreVerbatim(queue, body, from);
+      return;
+    }
     await this.send(queue, body, from.key ?? null);
+  }
+
+  private async restoreVerbatim(queue: string, body: string, from: KafkaRedriveMessage): Promise<void> {
+    const record: KafkaProducerMessage = {
+      // A tombstone stays a tombstone; KafkaJS accepts a null value although the structural type does not.
+      value: from.value === undefined ? body : (from.value as unknown as Buffer),
+      timestamp: String(Date.now()),
+    };
+    if (from.headers !== undefined) {
+      // KafkaJS accepts Buffer / array header values; the published structural type stays string-only.
+      record.headers = copyHeaders(from.headers) as unknown as KafkaProducerMessage["headers"];
+    } else {
+      const decoded = EnvelopeCodec.decode(body);
+      if (EnvelopeCodec.accepts(decoded)) record.headers = kafkaHeaders(decoded);
+    }
+    if (from.key !== undefined && from.key !== null) record.key = Buffer.from(from.key);
+    await this.options.producer.send({ topic: queue, messages: [record] });
   }
 
   private async send(queue: string, body: string, key: Buffer | null): Promise<void> {

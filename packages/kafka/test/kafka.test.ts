@@ -794,6 +794,122 @@ test("redrive plain publish stays keyless (non-keyed behaviour unchanged)", asyn
   assert.ok(!("key" in producer.sent[0]!.messages[0]!));
 });
 
+// --- DLQ redrive: restore writes the consumed record back verbatim -------------
+
+/** A DLQ record as consumed: odd value bytes, custom + stale headers, a key, an old `meta.created_at`. */
+function consumedDlqRecord(body: string, value: Buffer | null, ack: () => Promise<void> = async () => {}): KafkaRedriveMessage {
+  return {
+    body,
+    value,
+    key: Buffer.from([0x00, 0xff, 0x10]),
+    headers: {
+      "bq-job": Buffer.from("urn:babel:stale:job"),
+      "bq-original-topic": Buffer.from("orders"),
+      "x-custom": [Buffer.from("a"), Buffer.from([0xfe, 0xff])],
+    },
+    topic: "orders.dlq",
+    partition: 0,
+    offset: "5",
+    ack,
+  };
+}
+
+test("redrive restore re-writes value bytes, headers and key verbatim with a fresh timestamp", async () => {
+  const producer = new FakeProducer();
+  const env = envelope(2);
+  env.meta.created_at = 1_000;
+  // Same JSON, different bytes than the re-encoded body: trailing newline + double space.
+  const value = Buffer.from(EnvelopeCodec.encode(env) + "\n  ", "utf8");
+  const from = consumedDlqRecord(EnvelopeCodec.encode(env), value);
+  const before = Date.now();
+  await redriveIO(producer).publishFrom("orders.dlq", from.body, from);
+  const sent = producer.sent[0]!;
+  assert.equal(sent.topic, "orders.dlq");
+  const rec = sent.messages[0]!;
+  assert.ok(Buffer.isBuffer(rec.value));
+  assert.deepEqual(rec.value, value, "value bytes verbatim");
+  assert.deepEqual(rec.key, from.key);
+  assert.deepEqual(rec.headers, {
+    "bq-job": Buffer.from("urn:babel:stale:job"),
+    "bq-original-topic": Buffer.from("orders"),
+    "x-custom": [Buffer.from("a"), Buffer.from([0xfe, 0xff])],
+  }, "headers verbatim, not re-projected from the body");
+  assert.notEqual(rec.timestamp, "1000", "timestamp is not meta.created_at");
+  assert.ok(Number(rec.timestamp) >= before && Number(rec.timestamp) <= Date.now(), "timestamp is fresh");
+});
+
+test("redrive restore keeps a non-UTF-8 value byte-for-byte", async () => {
+  const producer = new FakeProducer();
+  const value = Buffer.from([0xff, 0xfe, 0x00, 0x80]);
+  const from = consumedDlqRecord(value.toString("utf8"), value);
+  await redriveIO(producer).publishFrom("orders.dlq", from.body, from);
+  assert.deepEqual(producer.sent[0]!.messages[0]!.value, value);
+});
+
+test("redrive restore keeps a null value null and an absent key off the record", async () => {
+  const producer = new FakeProducer();
+  const from = { ...consumedDlqRecord("", null), key: null };
+  await redriveIO(producer).publishFrom("orders.dlq", from.body, from);
+  const rec = producer.sent[0]!.messages[0]!;
+  assert.equal(rec.value, null);
+  assert.ok(!("key" in rec));
+});
+
+test("redrive republish to the work topic still projects headers and mirrors meta.created_at", async () => {
+  const producer = new FakeProducer();
+  const env = envelope(0);
+  env.meta.created_at = 1_000;
+  const from = consumedDlqRecord(EnvelopeCodec.encode(env), Buffer.from(EnvelopeCodec.encode(env)));
+  await redriveIO(producer).publishFrom("orders", EnvelopeCodec.encode(env), from);
+  const rec = producer.sent[0]!.messages[0]!;
+  assert.equal(rec.headers!["bq-job"], URN);
+  assert.equal(rec.timestamp, "1000");
+  assert.equal(rec.value, EnvelopeCodec.encode(env));
+  assert.deepEqual(rec.key, from.key);
+});
+
+test("redrive writes to the DLQ topic with a changed body are a republish, not a restore", async () => {
+  const producer = new FakeProducer();
+  const env = envelope(0);
+  const from = consumedDlqRecord("something else", Buffer.from("something else"));
+  env.meta.created_at = 1_000;
+  const changed = EnvelopeCodec.encode(env);
+  await redriveIO(producer).publishFrom("orders.dlq", changed, from);
+  const rec = producer.sent[0]!.messages[0]!;
+  assert.equal(rec.headers!["bq-job"], URN, "headers projected from the new body, not copied from the record");
+  assert.equal(rec.value, changed, "value is the new body, not from.value");
+  assert.equal(rec.timestamp, "1000", "timestamp mirrors meta.created_at (republish)");
+  assert.deepEqual(rec.key, from.key);
+});
+
+test("core redrive() dry run restores the DLQ record verbatim through the tracked copy", async () => {
+  const producer = new FakeProducer();
+  const env = envelope(1);
+  env.meta.created_at = 1_000;
+  const value = Buffer.from(EnvelopeCodec.encode(env) + "\n", "utf8");
+  let acked = false;
+  let pending: KafkaRedriveMessage | null = consumedDlqRecord(EnvelopeCodec.encode(env), value, async () => {
+    acked = true;
+  });
+  const io = new KafkaRedriveIO({
+    producer,
+    consumer: { seek: () => {} },
+    pop: async () => {
+      const m = pending;
+      pending = null;
+      return m;
+    },
+  });
+  const result = await redrive(io, "orders.dlq", { toQueue: "orders", dryRun: true });
+  assert.equal(result.skipped, 1);
+  assert.equal(acked, true);
+  const rec = producer.sent[0]!.messages[0]!;
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(rec.value, value);
+  assert.equal((rec.headers as unknown as Record<string, Buffer>)["bq-job"].toString(), "urn:babel:stale:job");
+  assert.notEqual(rec.timestamp, "1000");
+});
+
 test("redrive pop delegates to the caller-supplied reserve", async () => {
   const producer = new FakeProducer();
   const msg = dlqMessage(Buffer.from("k"));
