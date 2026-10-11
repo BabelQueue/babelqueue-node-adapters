@@ -7,6 +7,7 @@ import type { Envelope } from "@babelqueue/core";
 import {
   KafkaConsumer,
   KafkaPublisher,
+  KafkaRedriveIO,
   RetryTopics,
   kafkaHeaders,
   type BabelHandlers,
@@ -15,6 +16,7 @@ import {
   type KafkaConsumerClient,
   type KafkaProducerClient,
   type KafkaProducerMessage,
+  type KafkaRedriveMessage,
 } from "../src/index.js";
 
 const URN = "urn:babel:orders:created";
@@ -731,4 +733,71 @@ test("onError isolation: unknown-URN FAIL still surfaces UnknownUrnError when on
     (e: Error) => e.name === "UnknownUrnError" || /urn/i.test(e.message),
   );
   assert.deepEqual(consumer.committed, []);
+});
+
+// --- DLQ redrive: record key preservation (contract §6.5) ---------------------
+
+function redriveIO(producer: FakeProducer): KafkaRedriveIO {
+  return new KafkaRedriveIO({ producer, pop: async () => null });
+}
+
+function dlqMessage(key: Buffer | null | undefined): KafkaRedriveMessage {
+  return { body: EnvelopeCodec.encode(envelope(0)), key, ack: async () => {} };
+}
+
+test("redrive publishFrom carries a non-empty key byte-for-byte", async () => {
+  const producer = new FakeProducer();
+  const key = Buffer.from([0x00, 0xff, 0x10, 0x7f]);
+  const from = dlqMessage(key);
+  await redriveIO(producer).publishFrom("orders", from.body, from);
+  const sent = producer.sent[0]!;
+  assert.equal(sent.topic, "orders");
+  assert.ok(Buffer.isBuffer(sent.messages[0]!.key));
+  assert.deepEqual(sent.messages[0]!.key, key);
+});
+
+test("redrive publishFrom keeps an empty key empty", async () => {
+  const producer = new FakeProducer();
+  const from = dlqMessage(Buffer.alloc(0));
+  await redriveIO(producer).publishFrom("orders", from.body, from);
+  const key = producer.sent[0]!.messages[0]!.key;
+  assert.ok(Buffer.isBuffer(key) && key.length === 0, "empty key must stay empty, not null");
+});
+
+test("redrive publishFrom keeps a null / absent key null (never synthesised)", async () => {
+  for (const key of [null, undefined]) {
+    const producer = new FakeProducer();
+    const from = dlqMessage(key);
+    await redriveIO(producer).publishFrom("orders", from.body, from);
+    assert.ok(!("key" in producer.sent[0]!.messages[0]!), "no key on the record");
+  }
+});
+
+test("redrive publishFrom projects the contract headers from the body, and restores an undecodable body verbatim", async () => {
+  const producer = new FakeProducer();
+  const from = dlqMessage(Buffer.from("k"));
+  await redriveIO(producer).publishFrom("orders", from.body, from);
+  const msg = producer.sent[0]!.messages[0]!;
+  assert.equal(msg.headers!["bq-job"], URN);
+  assert.equal(msg.headers!["bq-attempts"], "0");
+
+  await redriveIO(producer).publishFrom("orders.dlq", "not-json", from);
+  const raw = producer.sent[1]!.messages[0]!;
+  assert.equal(raw.value, "not-json");
+  assert.equal(raw.headers, undefined);
+  assert.deepEqual(raw.key, Buffer.from("k"));
+});
+
+test("redrive plain publish stays keyless (non-keyed behaviour unchanged)", async () => {
+  const producer = new FakeProducer();
+  await redriveIO(producer).publish("orders", EnvelopeCodec.encode(envelope(0)));
+  assert.ok(!("key" in producer.sent[0]!.messages[0]!));
+});
+
+test("redrive pop delegates to the caller-supplied reserve", async () => {
+  const producer = new FakeProducer();
+  const msg = dlqMessage(Buffer.from("k"));
+  const io = new KafkaRedriveIO({ producer, pop: async (q) => (q === "orders.dlq" ? msg : null) });
+  assert.equal(await io.pop("orders.dlq"), msg);
+  assert.equal(await io.pop("other"), null);
 });

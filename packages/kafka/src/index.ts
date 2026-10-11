@@ -291,6 +291,72 @@ export class KafkaPublisher {
   }
 }
 
+// --- DLQ redrive IO (ADR-0026, §6.5 "Record key on republish") -------------------
+
+/**
+ * A DLQ record reserved for {@link KafkaRedriveIO}: the structural shape `@babelqueue/core`'s
+ * `RedriveMessage` expects (`body` + `ack`), plus the consumed record's `key` — `null`/absent for a
+ * keyless record, a (possibly empty) `Buffer` otherwise.
+ */
+export interface KafkaRedriveMessage {
+  body: string;
+  key?: Buffer | null;
+  ack(): Promise<void>;
+}
+
+/** Options for {@link KafkaRedriveIO}. */
+export interface KafkaRedriveIOOptions {
+  /** The producer used for every write the redrive makes (redrive write + restore to the DLQ). */
+  producer: KafkaProducerClient;
+  /**
+   * Reserve the next record from `queue` (the DLQ topic), or `null` when it is empty. Kafka consumption
+   * is push-based in KafkaJS, so the caller supplies the pull (a bounded fetch with manual commit) and
+   * its `ack` commits the offset. Return the record's `key` so the redrive can carry it.
+   */
+  pop(queue: string): Promise<KafkaRedriveMessage | null>;
+}
+
+/**
+ * A `@babelqueue/core` `RedriveIO` over Kafka that carries the DLQ record key byte-for-byte through the
+ * redrive (contract §6.5): the redrive write back to the work topic and the restore write back to the
+ * DLQ both go through {@link KafkaRedriveIO.publishFrom}, which copies the reserved record's key — a null
+ * key stays null (no key on the record), an empty key stays empty — and never synthesises one. Partition
+ * equality is not guaranteed (client partitioners differ). The §6.3 header projection is rebuilt from
+ * the body being written (`bq-attempts` therefore reads 0 for a reset envelope); a body that is not a
+ * canonical envelope (an undecodable record being restored) is written verbatim with no `bq-*` headers.
+ *
+ * Plain {@link KafkaRedriveIO.publish} writes a keyless record. `publishWithHeaders` is not offered, so
+ * `bypass` is a no-op on this transport (as in the Go reference's keyed path).
+ */
+export class KafkaRedriveIO {
+  constructor(private readonly options: KafkaRedriveIOOptions) {}
+
+  pop(queue: string): Promise<KafkaRedriveMessage | null> {
+    return this.options.pop(queue);
+  }
+
+  /** Append an already-encoded body to `queue` as a keyless record. */
+  async publish(queue: string, body: string): Promise<void> {
+    await this.send(queue, body, null);
+  }
+
+  /** Append `body` to `queue`, carrying the key of the reserved record `from` byte-for-byte. */
+  async publishFrom(queue: string, body: string, from: KafkaRedriveMessage): Promise<void> {
+    await this.send(queue, body, from.key ?? null);
+  }
+
+  private async send(queue: string, body: string, key: Buffer | null): Promise<void> {
+    const record: KafkaProducerMessage = { value: body };
+    const decoded = EnvelopeCodec.decode(body);
+    if (EnvelopeCodec.accepts(decoded)) {
+      record.headers = kafkaHeaders(decoded);
+      record.timestamp = String(decoded.meta.created_at);
+    }
+    if (key !== null) record.key = Buffer.from(key);
+    await this.options.producer.send({ topic: queue, messages: [record] });
+  }
+}
+
 // --- Consumer ------------------------------------------------------------------
 
 /**

@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **`KafkaRedriveIO` — DLQ redrive carries the record key.** A `@babelqueue/core` `RedriveIO` over a
+  `KafkaProducerClient` + a caller-supplied `pop`. Its `publishFrom` re-publishes with the reserved DLQ
+  record's key byte-for-byte (null stays null, empty stays empty) for both the redrive write and the
+  restore write back to the DLQ, per contract §6.5 "Record key on republish". **Requires
+  `@babelqueue/core` newer than 1.8.0** (the next core release, which adds the optional
+  `RedriveIO.publishFrom` capability): with core <= 1.8.0 `redrive()` ignores `publishFrom`, falls back
+  to the keyless `publish` and the redriven record silently loses its key. The `@babelqueue/core`
+  dependency range is raised to that release at publish time. No wire, header or `dead_letter` change.
+
 ### Fixed
 
 - **A throwing `onError` callback can no longer bypass settlement.** The version-gate, undecodable
