@@ -441,7 +441,7 @@ export class KafkaConsumer {
     const headers = kafkaHeaders(bumped);
     headers["bq-delay"] = String(tier.delayMs);
     headers["bq-original-topic"] = this.originalTopic(payload);
-    await this.produce(tier.topic, bumped, headers);
+    await this.produce(tier.topic, bumped, headers, payload.message.key);
   }
 
   private async deadLetter(envelope: Envelope, payload: EachMessagePayload, reason: string, error?: unknown): Promise<void> {
@@ -455,7 +455,7 @@ export class KafkaConsumer {
     });
     const headers = kafkaHeaders(annotated);
     headers["bq-original-topic"] = original;
-    await this.produce(dlq, annotated, headers);
+    await this.produce(dlq, annotated, headers, payload.message.key);
   }
 
   private async deadLetterRaw(payload: EachMessagePayload): Promise<void> {
@@ -464,7 +464,7 @@ export class KafkaConsumer {
     this.requireProducer();
     const { message } = payload;
     // Forward the original record verbatim (value, key, headers) so the DLQ copy keeps its provenance
-    // (Java reference; the .NET consumer forwards value + headers). Only the timestamp is re-stamped.
+    // (Java reference). Only the timestamp is re-stamped.
     const forwarded: KafkaProducerMessage = {
       value: message.value ?? Buffer.alloc(0),
       // KafkaJS accepts Buffer / array header values; the published structural type stays string-only.
@@ -475,12 +475,21 @@ export class KafkaConsumer {
     await this.options.producer!.send({ topic: dlq, messages: [forwarded] });
   }
 
-  private async produce(topic: string, envelope: Envelope, headers: { [key: string]: string }): Promise<void> {
+  /**
+   * Republish an envelope. The consumed record's key is carried over byte-for-byte (an empty key stays
+   * empty); a null/absent key is left off the record, never synthesised. Partition equality is not
+   * guaranteed.
+   */
+  private async produce(
+    topic: string,
+    envelope: Envelope,
+    headers: { [key: string]: string },
+    key?: Buffer | null,
+  ): Promise<void> {
     this.requireProducer();
-    await this.options.producer!.send({
-      topic,
-      messages: [{ value: EnvelopeCodec.encode(envelope), headers, timestamp: String(Date.now()) }],
-    });
+    const record: KafkaProducerMessage = { value: EnvelopeCodec.encode(envelope), headers, timestamp: String(Date.now()) };
+    if (key !== undefined && key !== null) record.key = Buffer.from(key);
+    await this.options.producer!.send({ topic, messages: [record] });
   }
 
   private async commit(payload: EachMessagePayload): Promise<void> {

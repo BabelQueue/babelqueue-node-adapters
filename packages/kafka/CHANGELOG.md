@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **The original record key now survives retry republish, unknown-URN release, and the envelope
+  DLQ write.** Only the raw (poison) DLQ forward kept the key before; the retry-topic and envelope
+  DLQ writes dropped it, so a keyed record lost its key after the first retry. The key is carried
+  byte-for-byte (an empty key stays empty); a null/absent key stays null and is never synthesised.
+  Partition equality is not guaranteed. The envelope, the `dead_letter` block and the header
+  projection are unchanged. No public API change.
+
 ## [1.1.2] - 2026-10-11
 
 ### Fixed

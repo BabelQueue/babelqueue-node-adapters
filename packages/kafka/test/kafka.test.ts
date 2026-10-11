@@ -475,3 +475,94 @@ test("gate: a DLQ configured without a producer does not commit and never reache
   assert.equal(calls, 0);
   assert.deepEqual(consumer.committed, []);
 });
+
+// --- record key preservation (retry / release / envelope DLQ / raw DLQ) ---------
+
+const KEY_CASES: { name: string; key: Buffer | null | undefined }[] = [
+  { name: "keyed", key: Buffer.from("order-1042", "utf8") },
+  { name: "empty key", key: Buffer.alloc(0) },
+  { name: "null key", key: null },
+  { name: "absent key", key: undefined },
+];
+
+function keyedPayload(env: Envelope, key: Buffer | null | undefined): EachMessagePayload {
+  const payload = payloadFor(env);
+  if (key !== undefined) payload.message.key = key;
+  return payload;
+}
+
+/** Asserts the single produced record carries `key` as-is (null/absent stays off the record). */
+function assertKeyCarried(producer: FakeProducer, topic: string, key: Buffer | null | undefined): void {
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, topic);
+  const sent = producer.sent[0]!.messages[0]!;
+  if (key === undefined || key === null) {
+    assert.ok(sent.key === undefined || sent.key === null, "a null key must not be synthesised");
+  } else {
+    assert.ok(Buffer.isBuffer(sent.key), "the key must be carried");
+    assert.deepEqual(sent.key, key);
+    assert.notEqual(sent.key, key, "the key is a copy, not the inbound instance");
+  }
+}
+
+for (const { name, key } of KEY_CASES) {
+  test(`key: a failing handler's retry republish keeps the key (${name})`, async () => {
+    const producer = new FakeProducer();
+    const handlers: BabelHandlers = {
+      [URN]: () => {
+        throw new Error("boom");
+      },
+    };
+    await new KafkaConsumer(new FakeConsumer(), handlers, { producer, retryTopics: topology(), maxTries: 3 }).handle(
+      keyedPayload(envelope(0), key),
+    );
+    assertKeyCarried(producer, "orders.retry.1", key);
+  });
+
+  test(`key: the envelope DLQ write keeps the key (${name})`, async () => {
+    const producer = new FakeProducer();
+    const handlers: BabelHandlers = {
+      [URN]: () => {
+        throw new Error("boom");
+      },
+    };
+    await new KafkaConsumer(new FakeConsumer(), handlers, { producer, retryTopics: topology(), maxTries: 3 }).handle(
+      keyedPayload(envelope(2), key),
+    );
+    assertKeyCarried(producer, "orders.dlq", key);
+  });
+
+  test(`key: unknown-URN release keeps the key (${name})`, async () => {
+    const producer = new FakeProducer();
+    await new KafkaConsumer(new FakeConsumer(), {}, {
+      producer,
+      retryTopics: topology(),
+      unknownUrn: UnknownUrnStrategy.RELEASE,
+    }).handle(keyedPayload(envelope(0), key));
+    assertKeyCarried(producer, "orders.retry.1", key);
+  });
+
+  test(`key: unknown-URN dead_letter keeps the key (${name})`, async () => {
+    const producer = new FakeProducer();
+    await new KafkaConsumer(new FakeConsumer(), {}, {
+      producer,
+      retryTopics: topology(),
+      unknownUrn: UnknownUrnStrategy.DEAD_LETTER,
+    }).handle(keyedPayload(envelope(0), key));
+    assertKeyCarried(producer, "orders.dlq", key);
+  });
+
+  test(`key: the raw (poison) DLQ write keeps the key (${name})`, async () => {
+    const producer = new FakeProducer();
+    const payload: EachMessagePayload = {
+      topic: "orders",
+      partition: 0,
+      message: { value: Buffer.from("not-json", "utf8"), headers: {}, offset: "4" },
+    };
+    if (key !== undefined) payload.message.key = key;
+    await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology(), onError: () => undefined }).handle(
+      payload,
+    );
+    assertKeyCarried(producer, "orders.dlq", key);
+  });
+}
