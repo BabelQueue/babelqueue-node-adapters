@@ -51,7 +51,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.4.0"
+    "@babelqueue/core": "^1.9.0"
   },
   "peerDependencies": {
     "kafkajs": "^2.0.0"

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
-import { EnvelopeCodec, UnknownUrnStrategy } from "@babelqueue/core";
+import { EnvelopeCodec, UnknownUrnStrategy, redrive } from "@babelqueue/core";
 import type { Envelope } from "@babelqueue/core";
 
 import {
@@ -800,4 +800,28 @@ test("redrive pop delegates to the caller-supplied reserve", async () => {
   const io = new KafkaRedriveIO({ producer, pop: async (q) => (q === "orders.dlq" ? msg : null) });
   assert.equal(await io.pop("orders.dlq"), msg);
   assert.equal(await io.pop("other"), null);
+});
+
+test("core redrive() over KafkaRedriveIO keeps the DLQ record key end to end", async () => {
+  for (const key of [Buffer.from("order-42"), Buffer.alloc(0), null]) {
+    const producer = new FakeProducer();
+    let pending: KafkaRedriveMessage | null = dlqMessage(key);
+    const io = new KafkaRedriveIO({
+      producer,
+      pop: async () => {
+        const m = pending;
+        pending = null;
+        return m;
+      },
+    });
+    const result = await redrive(io, "orders.dlq", { toQueue: "orders" });
+    assert.equal(result.redriven, 1);
+    const sent = producer.sent[0]!;
+    assert.equal(sent.topic, "orders");
+    if (key === null) {
+      assert.ok(!("key" in sent.messages[0]!), "null key must stay null");
+    } else {
+      assert.deepEqual(sent.messages[0]!.key, key);
+    }
+  }
 });
