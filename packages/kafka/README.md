@@ -67,6 +67,14 @@ normal decode path; any other value is compared as-is (never trimmed) to `"1"`. 
 not match is rejected undecoded as poison: reported to `onError`, forwarded raw to `<topic>.dlq`
 (when configured) and its offset committed.
 
+**Poison records (§6.5).** A body that is not a decodable BabelQueue envelope - the bodies the Go
+SDK's typed `Decode` rejects, except that member names are matched case-sensitively as the contract spells them (invalid JSON, a non-object root other than `null`, a wrongly typed member such as
+`meta.created_at: "2026"`, `meta.id: 5`, a fractional or string `attempts`, or `meta.schema_version: "1"`) - is reported to `onError`, written to
+`<topic>.dlq` wrapped like the Go SDK does - a body that is one JSON object keeps its keys, anything else
+becomes `{"raw": "<body>"}`, plus a `dead_letter` block with `reason: "poison"` - with the record key
+preserved byte for byte, and its offset committed. A well-typed envelope that is merely non-conformant (for
+example an empty `trace_id`, or a non-string `urn` alias) is not poison: like Go, it is routed by its URN.
+
 ## Contract mapping (§6)
 
 | Envelope | Apache Kafka |

@@ -29,11 +29,18 @@
  * any other value is compared, untrimmed, to the supported `"1"`, and a record that does not match is
  * rejected undecoded down the poison path — reported to `onError`, the raw record (value, key and
  * headers) forwarded to the DLQ (when configured) and the offset committed.
+ *
+ * **Poison bodies (§6.5).** A body that is not exactly one JSON object, whose typed members have the wrong
+ * JSON type, or that fails the conformance check is dead-lettered **wrapped**, as the Go reference does: a
+ * body that is one JSON object keeps its keys (anything else becomes `{"raw": "<body>"}`) and gains a
+ * `dead_letter` block with `reason: "poison"`; the record key is carried over unchanged. Only the
+ * version-gate rejection above still forwards the record raw.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
+import { envelopeViolation, isLossyNumberToken } from "./envelope-shape.js";
 import { mergeInto } from "./headers.js";
 
 // --- Minimal Kafka shapes (a structural subset of kafkajs) ---------------------
@@ -46,8 +53,8 @@ export interface KafkaProducerMessage {
   key?: Buffer | string | null;
   value: Buffer | string;
   /**
-   * Header values are strings for records the adapter builds. Raw DLQ forwarding (gate rejection,
-   * decode error, non-conformant envelope) instead passes the inbound values through as
+   * Header values are strings for records the adapter builds. Raw DLQ forwarding (the version-gate
+   * rejection only; poison records are wrapped and carry string headers) instead passes the inbound values through as
    * `Buffer | Buffer[]` (KafkaJS `IHeaders`); a custom producer wrapper must tolerate both.
    */
   headers?: { [key: string]: string };
@@ -529,6 +536,97 @@ export interface KafkaConsumerOptions {
   onError?: (error: unknown, envelope: IncomingEnvelope | null, payload: EachMessagePayload) => void;
 }
 
+// --- Poison handling (contract §6.5) --------------------------------------------
+
+/**
+ * Why `raw` is not a decodable BabelQueue body, or `null` when it is: exactly the bodies the Go reference's typed
+ * `Decode` rejects (see `envelope-shape.ts`). The core decoder is lenient (it returns `{}` for anything it cannot
+ * parse), so the poison condition is explicit here. A well-typed object that merely fails the conformance check
+ * is not "undecodable".
+ */
+function decodeFailure(raw: string): BabelQueueError | null {
+  const reason = envelopeViolation(raw);
+  return reason === null ? null : new BabelQueueError(`Undecodable BabelQueue body: ${reason}`);
+}
+
+/**
+ * True when `raw` (already known to be valid JSON) holds a number token a JS double cannot carry without changing
+ * its value (see `isLossyNumberToken`). String contents are skipped, so digits inside strings never count.
+ */
+function hasLossyNumber(raw: string): boolean {
+  let i = 0;
+  while (i < raw.length) {
+    const c = raw[i]!;
+    if (c === '"') {
+      i++;
+      while (i < raw.length && raw[i] !== '"') i += raw[i] === "\\" ? 2 : 1;
+      i++;
+    } else if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i + 1;
+      while (j < raw.length && /[0-9.eE+-]/.test(raw[j]!)) j++;
+      if (isLossyNumberToken(raw.slice(i, j))) return true;
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return false;
+}
+
+/**
+ * The poison DLQ record (Go parity): a body that is exactly one JSON object keeps its keys and values, anything
+ * else is carried as the string value of `raw`; a `dead_letter` block with reason `poison` replaces any existing
+ * one. JSON numbers go through a JS double, so a body holding a number that would not survive the round trip (an
+ * integer beyond 2^53, or a literal such as `1e400` that overflows) is carried verbatim as `raw` instead; a `1.0`
+ * or `1e2` literal is still re-formatted (`1`, `100`) — the value is preserved, the spelling is not.
+ */
+function poisonRecord(
+  raw: string,
+  cause: unknown,
+  originalQueue: string,
+  attempts: number,
+  keepMembers = true,
+): Record<string, unknown> {
+  let record: Record<string, unknown> = { raw };
+  try {
+    if (!keepMembers) throw new Error("carry the body verbatim");
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && !hasLossyNumber(raw)) {
+      record = parsed as Record<string, unknown>;
+    }
+  } catch {
+    // not JSON: wrapped as {"raw": body}
+  }
+  delete record.dead_letter;
+  record.dead_letter = annotate({ attempts } as unknown as Envelope, "poison", originalQueue, {
+    attempts,
+    error: cause instanceof Error ? cause.message : null,
+    exception: cause instanceof Error ? cause.name : null,
+  }).dead_letter;
+  return record;
+}
+
+/** Contract `bq-*` headers for a poison DLQ record, projected from whatever the body carries, plus the origin. */
+function poisonHeaders(record: Record<string, unknown>, originalQueue: string, attempts: number): { [key: string]: string } {
+  const headers: { [key: string]: string } = {};
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v : undefined);
+  const meta = record.meta !== null && typeof record.meta === "object" ? (record.meta as Record<string, unknown>) : {};
+  const job = str(record.job) ?? str(record.urn);
+  if (job) headers["bq-job"] = job;
+  const trace = str(record.trace_id);
+  if (trace) headers["bq-trace-id"] = trace;
+  const id = str(meta.id);
+  if (id) headers["bq-message-id"] = id;
+  if (meta.schema_version != null && typeof meta.schema_version !== "object") {
+    headers["bq-schema-version"] = String(meta.schema_version);
+  }
+  const lang = str(meta.lang);
+  if (lang) headers["bq-source-lang"] = lang;
+  headers["bq-attempts"] = String(attempts);
+  headers["bq-original-topic"] = originalQueue;
+  return headers;
+}
+
 /**
  * Consumes a Kafka work topic in process-then-commit mode: each record is decoded, validated,
  * routed to the handler for its URN (read from `bq-job`), and its offset committed only after
@@ -575,29 +673,18 @@ export class KafkaConsumer {
 
     const raw = message.value ? message.value.toString("utf8") : "";
 
+    // Undecodable body (§6.5): dead-lettered wrapped (reason "poison"), key preserved.
+    const undecodable = decodeFailure(raw);
+    if (undecodable) {
+      await this.settlePoison(payload, raw, undecodable, null);
+      return;
+    }
+
     let envelope: IncomingEnvelope;
     try {
       envelope = this.reconcile(EnvelopeCodec.decode(raw), message);
     } catch (decodeError) {
-      try {
-        await this.deadLetterRaw(payload);
-        await this.commit(payload);
-      } finally {
-        this.report(decodeError, null, payload);
-      }
-      return;
-    }
-
-    if (!EnvelopeCodec.accepts(envelope)) {
-      // A non-conformant / poison envelope may be missing the fields needed to annotate, so
-      // forward the raw record to the DLQ rather than building a dead_letter block.
-      const rejected = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Kafka.");
-      try {
-        await this.deadLetterRaw(payload);
-        await this.commit(payload);
-      } finally {
-        this.report(rejected, envelope, payload);
-      }
+      await this.settlePoison(payload, raw, decodeError, null);
       return;
     }
 
@@ -609,7 +696,7 @@ export class KafkaConsumer {
     }
 
     try {
-      await handler(envelope, message, headersOf(message));
+      await handler(envelope as Envelope, message, headersOf(message));
       await this.commit(payload);
     } catch (error) {
       try {
@@ -689,6 +776,41 @@ export class KafkaConsumer {
     await this.produce(dlq, annotated, headers, payload.message.key);
   }
 
+  /** Dead-letter a poison record (wrapped), commit it, then report: settle first so `onError` cannot bypass it. */
+  private async settlePoison(
+    payload: EachMessagePayload,
+    raw: string,
+    cause: unknown,
+    envelope: IncomingEnvelope | null,
+  ): Promise<void> {
+    try {
+      await this.deadLetterPoison(payload, raw, cause);
+      await this.commit(payload);
+    } finally {
+      this.report(cause, envelope, payload);
+    }
+  }
+
+  private async deadLetterPoison(payload: EachMessagePayload, raw: string, cause: unknown): Promise<void> {
+    const dlq = this.options.retryTopics?.dlqTopic ?? null;
+    if (!dlq) return; // dead-lettering disabled → degrade to commit-and-drop
+    this.requireProducer();
+    const original = this.originalTopic(payload);
+    const attempts = Math.max(headerInt(payload.message.headers, "bq-attempts", 0), 0);
+    let record = poisonRecord(raw, cause, original, attempts);
+    let json: string;
+    try {
+      json = JSON.stringify(record);
+    } catch {
+      // A body nested deeper than JSON.stringify's recursion can carry (RangeError): wrap it verbatim under `raw`
+      // instead, so the poison record is still parked and never left to wedge the partition.
+      record = poisonRecord(raw, cause, original, attempts, false);
+      json = JSON.stringify(record);
+    }
+    const headers = poisonHeaders(record, original, attempts);
+    await this.produceRaw(dlq, json, headers, payload.message.key);
+  }
+
   private async deadLetterRaw(payload: EachMessagePayload): Promise<void> {
     const dlq = this.options.retryTopics?.dlqTopic ?? null;
     if (!dlq) return;
@@ -717,8 +839,17 @@ export class KafkaConsumer {
     headers: { [key: string]: string },
     key?: Buffer | null,
   ): Promise<void> {
+    await this.produceRaw(topic, EnvelopeCodec.encode(envelope), headers, key);
+  }
+
+  private async produceRaw(
+    topic: string,
+    value: string,
+    headers: { [key: string]: string },
+    key?: Buffer | null,
+  ): Promise<void> {
     this.requireProducer();
-    const record: KafkaProducerMessage = { value: EnvelopeCodec.encode(envelope), headers, timestamp: String(Date.now()) };
+    const record: KafkaProducerMessage = { value, headers, timestamp: String(Date.now()) };
     if (key !== undefined && key !== null) record.key = Buffer.from(key);
     await this.options.producer!.send({ topic, messages: [record] });
   }

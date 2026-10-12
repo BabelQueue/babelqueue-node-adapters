@@ -9,6 +9,21 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- **Poison records are wrapped, not forwarded raw** (Go/PHP parity, contract §6.5). A body the consumer
+  cannot decode (invalid JSON, non-object root, wrong member types, decode error, non-conformant envelope)
+  is now written to `<topic>.dlq` as a JSON body: a single JSON object keeps its keys, anything else becomes
+  `{"raw": "<body>"}`, and a `dead_letter` block (`reason: "poison"`, `original_queue`, `attempts` from
+  `bq-attempts`, `lang: "node"`) replaces any existing one. The record key is preserved; the DLQ record
+  carries `bq-attempts` and `bq-original-topic` plus the `bq-*` headers projected from the body when present
+  (inbound custom headers are no longer copied). The schema-version gate rejection (§6.7) still forwards the
+  record raw.
+- **Poison trigger set aligned to Go** (behaviour change). A body is now poison exactly when the Go reference's typed `Decode` (`Envelope` / `Meta` / `DeadLetter`) rejects it, checked by a dedicated scanner (`JSON.parse` would lose duplicate keys): invalid JSON, a BOM, trailing data, an empty body, a non-object root other than `null`; `job`, `trace_id`, `meta.id|queue|lang` and the `dead_letter` string members that are not string-or-null; `meta.schema_version`, `meta.created_at`, `attempts` and `dead_letter.failed_at|attempts` that are not an int64 integer literal (so `"2026"`, `1.5`, `1e2` and `true` are poison); `data` / `meta` / `dead_letter` that are not objects; a non-finite number inside `data`. Member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read them; `JOB` or `Meta` is an unknown member) and duplicate keys are each checked. Previously a wrongly typed `meta.created_at` / `meta.schema_version` or a fractional `attempts` was dispatched and a non-string `urn` alias was dead-lettered; now it is the reverse. A bare `null` body is an empty envelope (routed to the unknown-URN path), not poison.
+- **The `EnvelopeCodec.accepts` consume gate is gone** (behaviour change, Go parity). A well-typed envelope that is merely non-conformant (empty `trace_id`, missing `data`, `meta.schema_version: 2`) is no longer dead-lettered as poison: Go's consume path never calls `Accepts`, so it is routed by URN like any other record.
+- Poison DLQ records: a body holding a number a JS double cannot carry (an integer beyond 2^53, `1e400`, `9007199254740993.0`, `9007199254740993e0`, `1.2345678901234567890123`) is carried verbatim as `{"raw": ...}` instead of being silently altered; the check compares the normalised decimal value of the token with that of the double. Remaining intentional differences from the Go reference for a poison record: `dead_letter.attempts` is the `bq-attempts` header (Go writes 0) and `original_queue` is the `bq-original-topic` header when present (Go writes the consumed topic); the DLQ record also carries `bq-original-topic` plus the `bq-*` headers projected from the body (Go adds no headers); and a float literal such as `1.0` / `1e2` is re-formatted where the body is re-encoded. The wire envelope and the `dead_letter` shape are unchanged.
+- **Any decode failure is poison; the partition is never left to wedge.** Member names are matched case-sensitively, exactly as the core decoder reads them (no `encoding/json`-style folding; the Go reference's case-insensitive read contradicts the contract schema and is tightened separately), and the scanner's nesting limit is counted over the whole document like Go's 10000 (so `[`-depth 9998 under `data.x` / `meta.zz`, 9999 at top level, is the deepest accepted). A poison body too deeply nested for `JSON.stringify` (a `RangeError`) is carried verbatim under `raw` instead of escaping the DLQ write. The wire envelope and the `dead_letter` shape are unchanged.
+
 ### Fixed
 
 - **`KafkaRedriveIO` restore writes the consumed DLQ record back verbatim** (Go/Java/.NET parity). A restore

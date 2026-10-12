@@ -236,21 +236,181 @@ test("unknown URN release republishes to retry", async () => {
   assert.equal(producer.sent[0]!.topic, "orders.retry.1");
 });
 
-test("poison body is forwarded raw to the DLQ", async () => {
+/** The single DLQ record's value parsed as JSON, with the poison `dead_letter` block checked and returned. */
+function poisonDlq(
+  producer: FakeProducer,
+  originalQueue = "orders",
+  attempts = 0,
+  exception = "BabelQueueError",
+): Record<string, unknown> {
+  assert.equal(producer.sent.length, 1);
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  const value = producer.sent[0]!.messages[0]!.value;
+  const body = JSON.parse(Buffer.isBuffer(value) ? value.toString("utf8") : value) as Record<string, unknown>;
+  const dl = body.dead_letter as Record<string, unknown>;
+  assert.deepEqual(Object.keys(dl), ["reason", "error", "exception", "failed_at", "original_queue", "attempts", "lang"]);
+  assert.equal(dl.reason, "poison");
+  assert.equal(typeof dl.error, "string");
+  assert.equal(dl.exception, exception);
+  assert.equal(typeof dl.failed_at, "number");
+  assert.equal(dl.original_queue, originalQueue);
+  assert.equal(dl.attempts, attempts);
+  assert.equal(dl.lang, "node");
+  return body;
+}
+
+test("poison body is wrapped as {raw} with a dead_letter reason=poison and the key is preserved", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
   let reported: unknown = null;
   const payload: EachMessagePayload = {
     topic: "orders",
     partition: 0,
-    message: { value: Buffer.from("not-json", "utf8"), headers: {}, offset: "4" },
+    message: { value: Buffer.from("not-json", "utf8"), key: Buffer.from("k-1", "utf8"), headers: {}, offset: "4" },
   };
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: (e) => void (reported = e) }).handle(
     payload,
   );
-  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  const body = poisonDlq(producer);
+  assert.deepEqual(Object.keys(body), ["raw", "dead_letter"]);
+  assert.equal(body.raw, "not-json");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.key, Buffer.from("k-1", "utf8"));
+  assert.deepEqual(producer.sent[0]!.messages[0]!.headers, { "bq-attempts": "0", "bq-original-topic": "orders" });
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
   assert.ok(reported);
+});
+
+test("poison: a JSON object body keeps its keys, an existing dead_letter is replaced, bq-attempts feeds attempts", async () => {
+  const producer = new FakeProducer();
+  const consumer = new FakeConsumer();
+  const payload = rawPayload('{"foo":"bar","n":[1,2],"dead_letter":{"reason":"failed"},"data":"not-an-object"}', {
+    "bq-attempts": Buffer.from("2", "utf8"),
+  });
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  const body = poisonDlq(producer, "orders", 2);
+  assert.equal(body.foo, "bar");
+  assert.deepEqual(body.n, [1, 2]);
+  assert.equal(body.data, "not-an-object");
+  assert.equal("raw" in body, false);
+  assert.equal(producer.sent[0]!.messages[0]!.headers!["bq-attempts"], "2");
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("poison: a non-object JSON root, trailing tokens and an empty or absent value are wrapped under raw", async () => {
+  for (const value of ["[1,2]", "42", '"str"', '{"a":1} {"b":2}', "", null]) {
+    const producer = new FakeProducer();
+    const payload: EachMessagePayload = {
+      topic: "orders",
+      partition: 0,
+      message: { value: value === null ? null : Buffer.from(value, "utf8"), headers: {}, offset: "4" },
+    };
+    await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(payload);
+    const body = poisonDlq(producer);
+    assert.equal(body.raw, value ?? "", JSON.stringify(value));
+  }
+});
+
+test("poison: wrong member types are undecodable (data/meta not objects, job/trace_id not strings, attempts not a number)", async () => {
+  for (const value of ['{"job":5}', '{"trace_id":1}', '{"data":[]}', '{"meta":"x"}', '{"attempts":"1"}', '{"dead_letter":3}',
+    '{"meta":{"created_at":"2026"}}', '{"meta":{"id":5}}', '{"attempts":1.5}', '{"dead_letter":{"attempts":"3"}}',
+    '{"meta":{"schema_version":"1"}}']) {
+    const producer = new FakeProducer();
+    await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
+    const body = poisonDlq(producer);
+    assert.match(String((body.dead_letter as Record<string, unknown>).error), /Undecodable BabelQueue body/, value);
+  }
+});
+
+test("poison: a body with a number a double cannot carry (beyond 2^53, 1e400) is kept verbatim under raw", async () => {
+  for (const value of [
+    '{"job":"x","data":[1],"id":12345678901234567890}',
+    '{"job":"x","data":[1],"ids":[1,-9007199254740993]}',
+    '{"job":"x","data":[1],"big":1e400}',
+    '{"job":"x","data":[1],"n":9007199254740993.0}',
+    '{"job":"x","data":[1],"n":1.2345678901234567890123}',
+    '{"job":"x","data":[1],"n":9007199254740993e0}',
+    '{"job":"x","data":[1],"n":-9007199254740993.0}',
+  ]) {
+    const producer = new FakeProducer();
+    await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
+    const body = poisonDlq(producer);
+    assert.equal(body.raw, value);
+    assert.equal(body.job, undefined);
+  }
+});
+
+test("poison: a value-preserving respelling (1.0, 1e2, 10e-1, 9007199254740992.0) does not trigger the raw fallback", async () => {
+  const value = '{"job":"x","data":[1],"a":1.0,"b":1e2,"c":10e-1,"d":9007199254740992.0,"e":0.1}';
+  const producer = new FakeProducer();
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
+  const body = poisonDlq(producer);
+  assert.equal(body.raw, undefined);
+  assert.deepEqual([body.a, body.b, body.c, body.d, body.e], [1, 100, 1, 9007199254740992, 0.1]);
+});
+
+test("poison: digits inside strings and safe numbers do not trigger the raw fallback", async () => {
+  const value = '{"job":"x","data":[1],"s":"99999999999999999999","n":9007199254740991,"f":1.5e3}';
+  const producer = new FakeProducer();
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
+  const body = poisonDlq(producer);
+  assert.equal(body.raw, undefined);
+  assert.equal(body.s, "99999999999999999999");
+  assert.equal(body.n, 9007199254740991);
+  assert.equal(body.f, 1500);
+});
+
+test("poison: an empty key stays empty and a missing key stays missing", async () => {
+  const withEmpty = new FakeProducer();
+  const emptyKey = rawPayload("not-json");
+  emptyKey.message.key = Buffer.alloc(0);
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer: withEmpty, retryTopics: topology() }).handle(emptyKey);
+  assert.deepEqual(withEmpty.sent[0]!.messages[0]!.key, Buffer.alloc(0));
+
+  const noKey = new FakeProducer();
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer: noKey, retryTopics: topology() }).handle(rawPayload("not-json"));
+  assert.equal("key" in noKey.sent[0]!.messages[0]!, false);
+});
+
+test("poison: the original topic of a retried record is kept and the contract headers are projected from the body", async () => {
+  const producer = new FakeProducer();
+  const payload = rawPayload(
+    '{"job":"urn:babel:orders:created","trace_id":"t-9","meta":{"id":"m-1","schema_version":1,"lang":"php"},"data":5}',
+    { "bq-original-topic": Buffer.from("billing", "utf8") },
+  );
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(payload);
+  const body = poisonDlq(producer, "billing");
+  assert.equal(body.job, "urn:babel:orders:created");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.headers, {
+    "bq-job": "urn:babel:orders:created",
+    "bq-trace-id": "t-9",
+    "bq-message-id": "m-1",
+    "bq-schema-version": "1",
+    "bq-source-lang": "php",
+    "bq-attempts": "0",
+    "bq-original-topic": "billing",
+  });
+});
+
+test("poison: a failing DLQ write leaves the record uncommitted", async () => {
+  const consumer = new FakeConsumer();
+  const producer: KafkaProducerClient = {
+    send: async () => {
+      throw new Error("broker down");
+    },
+  };
+  await assert.rejects(
+    new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(rawPayload("not-json")),
+    /broker down/,
+  );
+  assert.deepEqual(consumer.committed, []);
+});
+
+test("poison: with no DLQ configured the record is just committed", async () => {
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  await new KafkaConsumer(consumer, {}, { producer, retryTopics: new RetryTopics("orders", [], null) }).handle(rawPayload("not-json"));
+  assert.equal(producer.sent.length, 0);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
 });
 
 test("run wires a manual-commit eachMessage loop", async () => {
@@ -281,38 +441,29 @@ function richPayload(value: Buffer | null): EachMessagePayload {
   };
 }
 
-function assertForwardedWithMetadata(producer: FakeProducer, payload: EachMessagePayload): void {
-  assert.equal(producer.sent.length, 1);
-  assert.equal(producer.sent[0]!.topic, "orders.dlq");
-  const sent = producer.sent[0]!.messages[0]!;
-  assert.deepEqual(sent.value, payload.message.value ?? Buffer.alloc(0));
-  assert.deepEqual(sent.key, Buffer.from("order-7", "utf8"));
-  assert.deepEqual(sent.headers, {
-    "x-tenant": Buffer.from("acme", "utf8"),
-    "x-str": Buffer.from("plain", "utf8"),
-    "x-multi": [Buffer.from("a", "utf8"), Buffer.from("b", "utf8")],
-    "bq-original-topic": Buffer.from("orders", "utf8"),
-  });
-  // Buffers are copies, not the inbound instances.
-  assert.notEqual(sent.headers!["x-tenant"], payload.message.headers!["x-tenant"]);
-  assert.notEqual(sent.key, payload.message.key);
-}
-
-test("raw DLQ (decode error): the original key and headers are forwarded, headers as Buffer copies", async () => {
+test("poison DLQ (decode error): wrapped body, the original key is carried, inbound custom headers are not copied", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
   const payload = richPayload(Buffer.from("not-json", "utf8"));
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
-  assertForwardedWithMetadata(producer, payload);
+  const body = poisonDlq(producer);
+  assert.equal(body.raw, "not-json");
+  const sent = producer.sent[0]!.messages[0]!;
+  assert.deepEqual(sent.key, Buffer.from("order-7", "utf8"));
+  assert.notEqual(sent.key, payload.message.key);
+  assert.deepEqual(sent.headers, { "bq-attempts": "0", "bq-original-topic": "orders" });
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 2, offset: "21" }]);
 });
 
-test("raw DLQ (non-conformant envelope): the original key and headers are forwarded", async () => {
+test("poison DLQ (typed-invalid envelope): wrapped with its keys kept, the original key is carried", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
-  const payload = richPayload(Buffer.from('{"foo":"bar"}', "utf8"));
+  const payload = richPayload(Buffer.from('{"foo":"bar","meta":{"created_at":"2026"}}', "utf8"));
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
-  assertForwardedWithMetadata(producer, payload);
+  const body = poisonDlq(producer);
+  assert.equal(body.foo, "bar");
+  assert.equal((body.dead_letter as Record<string, unknown>).error, "Undecodable BabelQueue body: 'meta.created_at' must be an integer.");
+  assert.deepEqual(producer.sent[0]!.messages[0]!.key, Buffer.from("order-7", "utf8"));
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 2, offset: "21" }]);
 });
 
@@ -329,21 +480,22 @@ test("raw DLQ (version gate): the original key and headers are forwarded", async
   assert.deepEqual(sent.value, payload.message.value);
 });
 
-test("raw DLQ: a record without a key or headers forwards no key and an empty header set", async () => {
+test("raw DLQ (version gate): a record without a key or headers forwards no key and an empty header set", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
   const payload: EachMessagePayload = {
     topic: "orders",
     partition: 0,
-    message: { value: Buffer.from("not-json", "utf8"), offset: "1", key: null },
+    message: { value: Buffer.from("not-json", "utf8"), offset: "1", key: null, headers: { "bq-schema-version": "2" } },
   };
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
   const sent = producer.sent[0]!.messages[0]!;
   assert.equal("key" in sent, false);
-  assert.deepEqual(sent.headers, {});
+  assert.deepEqual(sent.headers, { "bq-schema-version": Buffer.from("2", "utf8") });
+  assert.deepEqual(sent.value, payload.message.value);
 });
 
-test("raw DLQ: a null-valued header is dropped, the forward succeeds and the offset is committed", async () => {
+test("raw DLQ (version gate): a null-valued header is dropped, the forward succeeds and the offset is committed", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
   const payload: EachMessagePayload = {
@@ -354,6 +506,7 @@ test("raw DLQ: a null-valued header is dropped, the forward succeeds and the off
       offset: "9",
       // A null array element is not in the declared header type; the cast keeps the runtime case covered.
       headers: {
+        "bq-schema-version": Buffer.from("2", "utf8"),
         foo: null,
         "x-keep": Buffer.from("v", "utf8"),
         "x-arr": [null, Buffer.from("a", "utf8")] as unknown as Buffer[],
@@ -585,8 +738,7 @@ test("onError isolation: a throwing onError on a non-JSON body (rejected by the 
   const payload = rawPayload("not-json");
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: throwingOnError }).handle(payload);
   assert.equal(producer.sent.length, 1);
-  assert.equal(producer.sent[0]!.topic, "orders.dlq");
-  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  poisonDlq(producer);
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
 });
 
@@ -603,8 +755,7 @@ test("onError isolation: a throwing onError when decode itself throws still dead
     decode.mock.restore();
   }
   assert.equal(producer.sent.length, 1);
-  assert.equal(producer.sent[0]!.topic, "orders.dlq");
-  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  poisonDlq(producer, "orders", 0, "Error");
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
 });
 
@@ -621,7 +772,7 @@ test("onError isolation: an async onError that rejects neither crashes the proce
       onError: async () => {
         throw new Error("async onError exploded");
       },
-    }).handle(rawPayload('{"foo":"bar"}'));
+    }).handle(rawPayload('{"foo":"bar","meta":{"id":5}}'));
     // Let any unhandled rejection surface before asserting.
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
@@ -633,14 +784,13 @@ test("onError isolation: an async onError that rejects neither crashes the proce
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
 });
 
-test("onError isolation: a throwing onError on a non-conformant envelope still dead-letters and commits", async () => {
+test("onError isolation: a throwing onError on a typed-invalid envelope still dead-letters and commits", async () => {
   const consumer = new FakeConsumer();
   const producer = new FakeProducer();
-  const payload = rawPayload('{"foo":"bar"}');
+  const payload = rawPayload('{"foo":"bar","meta":{"id":5}}');
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), onError: throwingOnError }).handle(payload);
   assert.equal(producer.sent.length, 1);
-  assert.equal(producer.sent[0]!.topic, "orders.dlq");
-  assert.deepEqual(producer.sent[0]!.messages[0]!.value, payload.message.value);
+  poisonDlq(producer);
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
 });
 
@@ -1241,4 +1391,101 @@ test("core redrive(): a failed work write with a successful restore rewinds the 
   assert.equal(second.acked, false);
   // Only the unprocessed record comes back; seeking partition 0 would redeliver the restored copy.
   assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 1, offset: "9" }]);
+});
+
+// --- Poison trigger set: the same 78 bodies, with the verdict of the Go reference's typed `Decode` -----------------
+
+import { readFileSync } from "node:fs";
+import { envelopeViolation } from "../src/envelope-shape.js";
+
+const triggerSet = JSON.parse(
+  readFileSync(new URL("./poison-trigger-set.json", import.meta.url), "utf8"),
+) as { name: string; body: string; poison: boolean }[];
+
+test("poison trigger set: envelopeViolation agrees with Go's typed decode for every body", () => {
+  assert.ok(triggerSet.length >= 78);
+  for (const entry of triggerSet) {
+    assert.equal(envelopeViolation(entry.body) !== null, entry.poison, `${entry.name}: ${entry.body.slice(0, 80)}`);
+  }
+});
+
+test("poison trigger set: the consumer dead-letters exactly the poison bodies (wrapped) and routes the rest by URN", async () => {
+  for (const entry of triggerSet) {
+    const producer = new FakeProducer();
+    const consumer = new FakeConsumer();
+    const seen: unknown[] = [];
+    const handlers = { "": () => void seen.push(1) };
+    const payload = rawPayload(entry.body);
+    try {
+      await new KafkaConsumer(consumer, handlers, { producer, retryTopics: topology() }).handle(payload);
+    } catch {
+      // an unknown-URN or handler failure on a typed-valid body is not a poison verdict
+    }
+    const poisoned = producer.sent.some((batch) => {
+      const value = batch.messages[0]?.value;
+      const text = value === null || value === undefined ? "" : value.toString();
+      return text.includes('"reason":"poison"');
+    });
+    assert.equal(poisoned, entry.poison, entry.name);
+  }
+});
+
+test("poison: a typed-valid but non-conformant envelope is routed by URN, not dead-lettered", async () => {
+  const producer = new FakeProducer();
+  const consumer = new FakeConsumer();
+  const calls: string[] = [];
+  const value = '{"job":"urn:acme:orders:created","data":{},"trace_id":"","meta":{"schema_version":1}}';
+  await new KafkaConsumer(consumer, { "urn:acme:orders:created": () => void calls.push("ran") }, {
+    producer,
+    retryTopics: topology(),
+  }).handle(rawPayload(value));
+  assert.deepEqual(calls, ["ran"]);
+  assert.equal(producer.sent.length, 0);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("poison: a body the core cannot carry never escapes handle() - lone surrogates settle, the partition is not wedged", async () => {
+  const bodies = [
+    '{"job":"urn:acme:orders:created","data":{"x":"\\ud800"},"meta":{"schema_version":1}}',
+    '{"job":"urn:acme:orders:created","data":{"\\udc00":1},"meta":{"schema_version":1}}',
+    '{"\\ud800":1,"job":"urn:acme:orders:created","data":{}}',
+    '{"job":"\\ud800","data":{},"meta":{"schema_version":1}}',
+  ];
+  for (const body of bodies) {
+    const producer = new FakeProducer();
+    const consumer = new FakeConsumer();
+    await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology(), unknownUrn: UnknownUrnStrategy.DELETE }).handle(
+      rawPayload(body),
+    );
+    assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }], body);
+  }
+});
+
+test("poison: nesting is counted over the whole document like Go (max 10000), and a poison body that deep is still parked", async () => {
+  const nested = (n: number): string => `{"data":{"x":${"[".repeat(n)}${"]".repeat(n)}}}`;
+  assert.equal(envelopeViolation(nested(9998)), null);
+  assert.notEqual(envelopeViolation(nested(9999)), null);
+  assert.equal(envelopeViolation(`{"zz":${"[".repeat(9999)}${"]".repeat(9999)}}`), null);
+  assert.notEqual(envelopeViolation(`{"zz":${"[".repeat(10000)}${"]".repeat(10000)}}`), null);
+  for (const n of [9999, 12000, 200000]) {
+    const producer = new FakeProducer();
+    const consumer = new FakeConsumer();
+    await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(rawPayload(nested(n)));
+    assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }], String(n));
+    assert.equal(producer.sent.length, 1, String(n));
+  }
+});
+
+test("poison: member names are case-sensitive like the core decoder - a folded or re-cased name is an unknown member", () => {
+  assert.equal(envelopeViolation('{"attemptſ":"x"}'), null);
+  assert.equal(envelopeViolation('{"meta":{"ſchema_version":"x"}}'), null);
+  assert.equal(envelopeViolation('{"ATTEMPTS":"x"}'), null);
+  assert.equal(envelopeViolation('{"JOB":5}'), null);
+  assert.equal(envelopeViolation('{"meta":{"ıd":5}}'), null);
+  assert.equal(envelopeViolation('{"meta":{"İd":5}}'), null);
+  assert.equal(envelopeViolation('{"META":{"ID":"x"}}'), null);
+  // The exact spelling is still type-checked.
+  assert.notEqual(envelopeViolation('{"attempts":"x"}'), null);
+  assert.notEqual(envelopeViolation('{"meta":{"schema_version":"x"}}'), null);
+  assert.notEqual(envelopeViolation('{"meta":{"id":5}}'), null);
 });
