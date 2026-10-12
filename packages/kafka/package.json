@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/kafka",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Apache Kafka adapter for BabelQueue — canonical-envelope publisher and a URN-routed, process-then-commit consumer (SDK-owned retry topics + DLQ).",
   "keywords": [
     "babelqueue",
@@ -51,7 +51,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.9.0"
+    "@babelqueue/core": "^1.10.0"
   },
   "peerDependencies": {
     "kafkajs": "^2.0.0"

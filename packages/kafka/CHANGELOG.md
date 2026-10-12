@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-12
+
 ### Changed
 
 - **Poison records are wrapped, not forwarded raw** (Go/PHP parity, contract §6.5). A body the consumer
