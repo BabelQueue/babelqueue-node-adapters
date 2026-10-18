@@ -68,21 +68,24 @@ jobs:
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
+    env:
+      BQ_CONFORMANCE_VERSION: 1.5.0
     steps:
       - uses: actions/checkout@v7
-      - name: Verify vendored conformance matches the canonical suite
+      - name: Verify vendored conformance matches the pinned release asset
         # @babelqueue/sqs, @babelqueue/azure-service-bus, @babelqueue/pulsar, @babelqueue/kafka,
         # @babelqueue/artemis, @babelqueue/redis and @babelqueue/rabbitmq each vendor the conformance
         # suite (for their binding tests); guard every copy against drift.
         run: |
-          git clone --depth 1 --branch v1.4.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          curl --fail --silent --show-error --location --output "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          # Download + verify the release asset once, then compare every vendored copy with it
+          # (what `fetch.sh --check` does per copy, minus the repeated download). LICENSE is not vendored.
+          bash "$RUNNER_TEMP/fetch.sh" "$BQ_CONFORMANCE_VERSION" "$RUNNER_TEMP/conformance"
           for pkg in sqs azure-service-bus pulsar kafka artemis redis rabbitmq; do
-            diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "packages/$pkg/test/conformance/CONFORMANCE_VERSION"
-            diff -ru "$RUNNER_TEMP/conformance/manifest.json" "packages/$pkg/test/conformance/manifest.json"
-            diff -ru "$RUNNER_TEMP/conformance/fixtures"      "packages/$pkg/test/conformance/fixtures"
-            diff -ru "$RUNNER_TEMP/conformance/schema"        "packages/$pkg/test/conformance/schema"
+            diff -r -x LICENSE "$RUNNER_TEMP/conformance" "packages/$pkg/test/conformance"
+            echo "in sync: packages/$pkg/test/conformance (conformance $BQ_CONFORMANCE_VERSION)"
           done
-          echo "Vendored conformance is in sync with the canonical suite."
 
   integration:
     name: Integration (live Kafka + Artemis)
