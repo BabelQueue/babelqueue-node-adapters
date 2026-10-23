@@ -69,7 +69,10 @@ jobs:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     env:
-      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_CONFORMANCE_VERSION: 1.6.0
+      # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather than
+      # trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
       - uses: actions/checkout@v7
       - name: Verify vendored conformance matches the pinned release asset
@@ -79,6 +82,7 @@ jobs:
         run: |
           curl --fail --silent --show-error --location --output "$RUNNER_TEMP/fetch.sh" \
             "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
           # Download + verify the release asset once, then compare every vendored copy with it
           # (what `fetch.sh --check` does per copy, minus the repeated download). LICENSE is not vendored.
           bash "$RUNNER_TEMP/fetch.sh" "$BQ_CONFORMANCE_VERSION" "$RUNNER_TEMP/conformance"
@@ -86,6 +90,53 @@ jobs:
             diff -r -x LICENSE "$RUNNER_TEMP/conformance" "packages/$pkg/test/conformance"
             echo "in sync: packages/$pkg/test/conformance (conformance $BQ_CONFORMANCE_VERSION)"
           done
+
+  redis:
+    name: Redis live (redis_layout + Lua integration)
+    # Required check: the live Redis tests (conformance `redis_layout`, the Lua scripts, kill-9 /
+    # late-ack recovery) must run for real here. BQ_REQUIRE_REDIS turns an unreachable Redis into a
+    # failure instead of the local-dev skip, so this job can never go green by skipping.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BQ_REQUIRE_REDIS: "1"
+      BABELQUEUE_REDIS_URL: redis://localhost:6379
+      BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Redis tests (live Redis, no skips)
+        run: npm run test -w @babelqueue/redis
+
+      - name: Assert no conformance failures
+        run: |
+          node -e '
+            const fs = require("fs");
+            const f = process.env.BQ_CONFORMANCE_RESULTS.replace(".json", ".redis.json");
+            const d = JSON.parse(fs.readFileSync(f, "utf8"));
+            const c = { pass: 0, fail: 0, skip: 0 };
+            for (const cases of Object.values(d.sections)) for (const r of Object.values(cases)) c[r.status] += 1;
+            console.log(JSON.stringify(c));
+            if (c.fail > 0 || c.skip > 0) process.exit(1);
+          '
 
   integration:
     name: Integration (live Kafka + Artemis)
@@ -160,7 +211,7 @@ jobs:
   ci-green:
     name: CI green
     runs-on: ubuntu-latest
-    needs: [test, lint, coverage, conformance]
+    needs: [test, lint, coverage, conformance, redis]
     if: ${{ always() }}
     steps:
       - name: Fail if any required job did not pass

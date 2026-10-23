@@ -61,6 +61,25 @@ tier (requires `KafkaPublisher.withRetryTopics`); on a plain publisher a delay t
 throwing handler republishes to the next `<topic>.retry.<n>` tier with `bq-attempts + 1`, then
 commits; once `maxTries` is reached it goes to `<topic>.dlq` with a `dead_letter` block.
 
+**Re-inject consumer (§6.4).** A failed record is parked on `<topic>.retry.<n>`; something must
+move it back to the work topic once its tier has elapsed. `RetryReinjector` does that: subscribe a
+consumer (its own group, `autoCommit: false`) to `reinjector.topics` and `run()` it. The due time is
+`record.timestamp + tier_ms` (the tier comes from the topic, never from `bq-delay`), clamped to
+`[now, now + tier_ms]`; a record that is not yet due is `seek`ed back and its partition `pause`d
+until it is, so the poll loop keeps heartbeating. A due record is written to `bq-original-topic`
+byte for byte (value and key; no decode, no `attempts` change) minus `bq-delay` /
+`bq-original-topic`, `traceparent` kept, and its offset is committed only after the broker
+acknowledged the write. `DEFAULT_RETRY_TIERS_MS` is `[5s, 30s, 5m, 30m]`. Create the retry topics
+with `message.timestamp.type=LogAppendTime` (SHOULD) and a retention longer than the largest tier.
+
+```ts
+import { RetryReinjector, RetryTopics } from "@babelqueue/kafka";
+
+const reinjector = new RetryReinjector(consumer, { producer, retryTopics: retry });
+await consumer.subscribe({ topics: reinjector.topics });
+await reinjector.run();
+```
+
 **Version gate (§6.7).** Before the record value is decoded the consumer reads the
 `bq-schema-version` header. A missing or blank value (empty or only ASCII whitespace) follows the
 normal decode path; any other value is compared as-is (never trimmed) to `"1"`. A record that does

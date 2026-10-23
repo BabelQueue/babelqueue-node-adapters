@@ -1393,42 +1393,10 @@ test("core redrive(): a failed work write with a successful restore rewinds the 
   assert.deepEqual(seeker.seeks, [{ topic: "orders.dlq", partition: 1, offset: "9" }]);
 });
 
-// --- Poison trigger set: the same 78 bodies, with the verdict of the Go reference's typed `Decode` -----------------
+// The poison trigger set (formerly poison-trigger-set.json) is the `kafka_poison` conformance section now: see
+// kafka-conformance.test.ts.
 
-import { readFileSync } from "node:fs";
 import { envelopeViolation } from "../src/envelope-shape.js";
-
-const triggerSet = JSON.parse(
-  readFileSync(new URL("./poison-trigger-set.json", import.meta.url), "utf8"),
-) as { name: string; body: string; poison: boolean }[];
-
-test("poison trigger set: envelopeViolation agrees with Go's typed decode for every body", () => {
-  assert.ok(triggerSet.length >= 78);
-  for (const entry of triggerSet) {
-    assert.equal(envelopeViolation(entry.body) !== null, entry.poison, `${entry.name}: ${entry.body.slice(0, 80)}`);
-  }
-});
-
-test("poison trigger set: the consumer dead-letters exactly the poison bodies (wrapped) and routes the rest by URN", async () => {
-  for (const entry of triggerSet) {
-    const producer = new FakeProducer();
-    const consumer = new FakeConsumer();
-    const seen: unknown[] = [];
-    const handlers = { "": () => void seen.push(1) };
-    const payload = rawPayload(entry.body);
-    try {
-      await new KafkaConsumer(consumer, handlers, { producer, retryTopics: topology() }).handle(payload);
-    } catch {
-      // an unknown-URN or handler failure on a typed-valid body is not a poison verdict
-    }
-    const poisoned = producer.sent.some((batch) => {
-      const value = batch.messages[0]?.value;
-      const text = value === null || value === undefined ? "" : value.toString();
-      return text.includes('"reason":"poison"');
-    });
-    assert.equal(poisoned, entry.poison, entry.name);
-  }
-});
 
 test("poison: a typed-valid but non-conformant envelope is routed by URN, not dead-lettered", async () => {
   const producer = new FakeProducer();

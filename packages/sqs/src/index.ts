@@ -50,8 +50,10 @@ import {
   UnknownUrnError,
   UnknownUrnStrategy,
   annotate,
+  retryBackoffBound,
+  retryBackoffDelay,
 } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { Envelope, HeaderCarrier, IncomingEnvelope, RetryBackoffOptions } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
@@ -281,7 +283,7 @@ export type BabelHandler = (envelope: Envelope, message: SqsMessage, headers: He
 export type BabelHandlers = Record<string, BabelHandler>;
 
 /** Options for {@link SqsConsumer}. */
-export interface SqsConsumerOptions {
+export interface SqsConsumerOptions extends RetryBackoffOptions {
   /**
    * Called when a message's URN has no handler. Without `unknownUrn` the message is then deleted
    * (the original behaviour); with `unknownUrn` set it is a notification hook and the strategy
@@ -305,6 +307,11 @@ export interface SqsConsumerOptions {
    * returning seconds (e.g. an exponential backoff). Clamped to `0…43200`. Default `0`: the message
    * is visible again immediately. A permanently failing handler therefore retries without pause
    * until the queue's `RedrivePolicy` (`maxReceiveCount`) moves it to the DLQ — configure one.
+   *
+   * This is the SQS spelling of the cross-SDK A9 backoff and stays supported as an alias: when it is
+   * set it wins over `retryBackoff` / `retryBackoffMultiplier` / `retryBackoffMax` / `retryJitter`
+   * (inherited from {@link RetryBackoffOptions}), which compute `d(n) = min(max, base * multiplier^(n-1))`
+   * seconds for the 1-based attempt `n = attempts + 1` (the SQS 12 h ceiling still applies on top).
    */
   releaseDelay?: number | ((attempts: number) => number);
   /**
@@ -344,6 +351,15 @@ export class SqsDeleteError extends BabelQueueError {
   }
 }
 
+function hasRetryBackoff(options: RetryBackoffOptions): boolean {
+  return (
+    options.retryBackoff !== undefined ||
+    options.retryBackoffMultiplier !== undefined ||
+    options.retryBackoffMax !== undefined ||
+    options.retryJitter !== undefined
+  );
+}
+
 /**
  * Polls an SQS queue, decodes + validates each message, routes it to the handler
  * registered for its URN, and deletes it on success. A throwing handler's message is released via
@@ -363,7 +379,13 @@ export class SqsConsumer {
     if (strategy !== undefined && !(Object.values(UnknownUrnStrategy) as string[]).includes(strategy)) {
       throw new BabelQueueError(`Unknown unknownUrn strategy "${strategy}".`);
     }
-    const needsRelease = options.releaseDelay != null || strategy === UnknownUrnStrategy.RELEASE;
+    // Fail fast on an invalid A9 parameter instead of at the first failed message.
+    retryBackoffBound(options, 1);
+    if (options.retryJitter !== undefined && options.retryJitter !== "none" && options.retryJitter !== "full") {
+      throw new BabelQueueError(`retryJitter must be "none" or "full", got ${String(options.retryJitter)}.`);
+    }
+    const needsRelease =
+      options.releaseDelay != null || hasRetryBackoff(options) || strategy === UnknownUrnStrategy.RELEASE;
     if (needsRelease && typeof client.changeMessageVisibility !== "function") {
       throw new BabelQueueError(
         "SqsConsumer release requires a client with changeMessageVisibility (contract §3.5).",
@@ -445,9 +467,8 @@ export class SqsConsumer {
     } catch (error) {
       this.options.onError?.(error, envelope, message);
       await this.guard(envelope, message, async () => {
-        const delay = this.options.releaseDelay ?? 0;
         const attempts = typeof envelope.attempts === "number" ? envelope.attempts : 0;
-        await this.release(message, typeof delay === "function" ? delay(attempts) : delay);
+        await this.release(message, this.failureDelay(attempts));
       });
       return;
     }
@@ -455,6 +476,14 @@ export class SqsConsumer {
     // SqsDeleteError and the message is NOT released — releasing at the (default 0 s) backoff would
     // redeliver an already-processed message immediately; it returns on visibility expiry instead.
     await this.guard(envelope, message, () => this.deleteHandled(message));
+  }
+
+  /** The release delay (seconds) for a failed handler: `releaseDelay` (alias) wins, else the A9 backoff, else 0. */
+  private failureDelay(attempts: number): number {
+    const delay = this.options.releaseDelay;
+    if (delay != null) return typeof delay === "function" ? delay(attempts) : delay;
+    if (!hasRetryBackoff(this.options)) return 0;
+    return retryBackoffDelay(this.options, Math.max(0, Math.floor(attempts)) + 1);
   }
 
   /**

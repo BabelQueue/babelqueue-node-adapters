@@ -590,3 +590,59 @@ test("gate: the version is decided before decode - an undecodable body with vers
   await new SqsConsumer(api, URL, {}, { onError: (e) => { captured = e; } }).poll();
   assert.match((captured as Error).message, /unsupported bq-schema-version "2"/);
 });
+
+// --- A9 retry backoff (retryBackoff* options; releaseDelay stays as an alias) ---------------
+
+const failingHandlers = { "urn:babel:orders:created": () => { throw new Error("boom"); } };
+
+async function failedVisibility(receiveCount: number, options: ConstructorParameters<typeof SqsConsumer>[3]): Promise<number> {
+  const sqs = fakeSqs();
+  sqs.seed(URL, EnvelopeCodec.encode(unknownEnv()), receiveCount);
+  await new SqsConsumer(sqs, URL, failingHandlers, options).poll();
+  assert.equal(sqs.visibility.length, 1);
+  assert.equal(sqs.deleted.length, 0);
+  return sqs.visibility[0]!.VisibilityTimeout;
+}
+
+test("retryBackoff* computes d(n) = min(max, base * multiplier^(n-1)) with n = attempts + 1", async () => {
+  const opts = { retryBackoff: 5, retryBackoffMultiplier: 2, retryBackoffMax: 30 };
+  // receive counts 1, 2, 3, 4 reconcile to attempts 0, 1, 2, 3 -> n 1, 2, 3, 4 -> 5, 10, 20, 30 (capped)
+  assert.equal(await failedVisibility(1, opts), 5);
+  assert.equal(await failedVisibility(2, opts), 10);
+  assert.equal(await failedVisibility(3, opts), 20);
+  assert.equal(await failedVisibility(4, opts), 30);
+});
+
+test("retryBackoff* with a base only is a constant delay; retryBackoffMax 0 means uncapped", async () => {
+  assert.equal(await failedVisibility(5, { retryBackoff: 7 }), 7);
+  assert.equal(await failedVisibility(4, { retryBackoff: 1, retryBackoffMultiplier: 10, retryBackoffMax: 0 }), 1000);
+});
+
+test("retryBackoff* is still clamped to the SQS 12 h visibility ceiling", async () => {
+  assert.equal(await failedVisibility(3, { retryBackoff: 40_000, retryBackoffMultiplier: 2 }), 43_200);
+});
+
+test("retryJitter full stays within [0, d(n)]", async () => {
+  for (let i = 0; i < 20; i += 1) {
+    const seconds = await failedVisibility(3, { retryBackoff: 10, retryBackoffMultiplier: 2, retryJitter: "full" });
+    assert.ok(seconds >= 0 && seconds <= 40, `jittered delay ${seconds} outside [0, 40]`);
+  }
+});
+
+test("releaseDelay stays an alias and wins over retryBackoff*", async () => {
+  assert.equal(await failedVisibility(2, { releaseDelay: 9, retryBackoff: 100 }), 9);
+  assert.equal(await failedVisibility(2, { releaseDelay: (attempts) => attempts + 40, retryBackoff: 100 }), 41);
+});
+
+test("an invalid A9 parameter is rejected at construction", () => {
+  const sqs = fakeSqs();
+  assert.throws(() => new SqsConsumer(sqs, URL, {}, { retryBackoff: -1 }), /retryBackoff/);
+  assert.throws(() => new SqsConsumer(sqs, URL, {}, { retryBackoffMultiplier: Number.NaN }), /retryBackoffMultiplier/);
+  assert.throws(() => new SqsConsumer(sqs, URL, {}, { retryJitter: "half" as never }), /retryJitter/);
+});
+
+test("retryBackoff* needs a client with changeMessageVisibility, like releaseDelay", () => {
+  const { changeMessageVisibility: _drop, ...legacy } = fakeSqs();
+  void _drop;
+  assert.throws(() => new SqsConsumer(legacy as SqsApi, URL, {}, { retryBackoff: 5 }), /changeMessageVisibility/);
+});

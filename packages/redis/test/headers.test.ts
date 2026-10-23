@@ -13,36 +13,14 @@ import {
   redisValue,
   unframe,
   type BabelHandlers,
-  type RedisClient,
 } from "../src/index.js";
+import { FakeRedis } from "./fake-redis.js";
 
 const URN = "urn:babel:orders:created";
 const TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
 function envelope(attempts = 0): Envelope {
   return { ...EnvelopeCodec.make(URN, { order_id: 7 }, { queue: "orders", traceId: "trace-1" }), attempts };
-}
-
-class FakeRedis implements RedisClient {
-  pushed: { key: string; value: string }[] = [];
-  removed: { key: string; value: string }[] = [];
-  private reserve: (string | null)[];
-
-  constructor(reserve: (string | null)[] = []) {
-    this.reserve = [...reserve];
-  }
-  async rpush(key: string, value: string): Promise<number> {
-    this.pushed.push({ key, value });
-    return this.pushed.length;
-  }
-  async brpoplpush(): Promise<string | null> {
-    return this.reserve.length ? this.reserve.shift()! : null;
-  }
-  async lrem(key: string, count: number, value: string): Promise<number> {
-    void count;
-    this.removed.push({ key, value });
-    return 1;
-  }
 }
 
 // --- frameValue / unframe round-trip (no broker) ------------------------------
@@ -75,12 +53,12 @@ test("a bare value (envelope / non-JSON / no sentinel) unframes verbatim with em
   }
 });
 
-test("the stored frame IS the LREM ack handle (handle === stored value)", () => {
+test("the stored frame IS the ack handle (handle === stored value)", () => {
   const stored = frameValue(BARE, { traceparent: TRACEPARENT });
   const [body, headers] = unframe(stored);
   assert.equal(body, BARE); // decoded from the verbatim envelope
   assert.deepEqual(headers, { traceparent: TRACEPARENT });
-  // BRPOPLPUSH returns `stored`; Pop/Ack must LREM on that exact value.
+  // The reserve returns `stored`; ack / release must gate on that exact value.
   assert.equal(stored, stored);
 });
 
@@ -126,8 +104,8 @@ test("consume surfaces the carried traceparent to the handler beside the unframe
   assert.ok(handled);
   assert.equal(seen!.env.job, URN);
   assert.deepEqual(seen!.headers, { traceparent: TRACEPARENT });
-  // Acked on the *stored* frame value (LREM must match what was reserved).
-  assert.equal(client.removed[0]!.value, stored);
+  // Acked on the *stored* frame value (the gate must match what was reserved).
+  assert.equal(client.called("legacyAck")[0]!.args[1], stored);
 });
 
 test("consume of a bare (pre-ADR-0028) value yields empty headers and still routes", async () => {
@@ -140,32 +118,5 @@ test("consume of a bare (pre-ADR-0028) value yields empty headers and still rout
   await new RedisConsumer(client, "orders", handlers).poll();
 
   assert.deepEqual(seen, {});
-  assert.equal(client.removed[0]!.value, bare);
-});
-
-// --- broker-gated integration (skips cleanly without a real Redis) ------------
-
-const REDIS_URL = process.env.BABELQUEUE_REDIS_URL;
-
-test("integration: a published traceparent arrives on consume", { skip: !REDIS_URL }, async () => {
-  // Wired only when BABELQUEUE_REDIS_URL points at a real Redis. Imports ioredis lazily so the
-  // suite never requires the optional peer when the test is skipped. Constructed via an untyped
-  // module handle so the optional peer's types are not needed to typecheck the suite.
-  const mod = (await import("ioredis")) as unknown as { default: new (url: string) => RedisClient & { quit(): Promise<unknown> } };
-  const client = new mod.default(REDIS_URL!);
-  const queue = `bq-otel-it-${Date.now()}`;
-  try {
-    await RedisPublisher.create(client, queue).publish(
-      URN,
-      { order_id: 7 },
-      { headers: { traceparent: TRACEPARENT } },
-    );
-    let received: HeaderCarrier | null = null;
-    await new RedisConsumer(client, queue, {
-      [URN]: (_e, _raw, headers) => { received = headers; },
-    }, { blockTimeout: 2 }).poll();
-    assert.deepEqual(received, { traceparent: TRACEPARENT });
-  } finally {
-    await client.quit();
-  }
+  assert.equal(client.called("legacyAck")[0]!.args[1], bare);
 });

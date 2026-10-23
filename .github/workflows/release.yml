@@ -11,6 +11,16 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    services:
+      # The Redis package's live tests (conformance `redis_layout`, Lua scripts, crash recovery)
+      # must run for real before anything is published: never publish from an untested tag.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v7
 
@@ -23,7 +33,11 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run typecheck
-      - run: npm test
+      - name: Test (live Redis required)
+        run: npm test
+        env:
+          BQ_REQUIRE_REDIS: "1"
+          BABELQUEUE_REDIS_URL: redis://localhost:6379
 
       # Each publish is idempotent: a monorepo `v*` tag runs all three steps, but
       # only packages whose version is not already on npm are published — so

@@ -9,6 +9,33 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- `RetryReinjector` (contract §6.4, ADR-0034 §5-7): the consumer that moves a record from `<topic>.retry.<n>` back to
+  its work topic once `record.timestamp + tier_ms` has elapsed (A6 clamp, `seek` + `pause` while waiting). The
+  re-inject is byte-identical (value and key), drops `bq-delay` / `bq-original-topic`, keeps `traceparent`, and
+  commits the offset only after the broker acknowledged the write.
+- `DEFAULT_RETRY_TIERS_MS` (`5s, 30s, 5m, 30m`).
+- Tests: the cross-SDK conformance `backoff` (topic names, tier selection, republish, default tiers) and
+  `kafka_poison` (92 cases) sections run against the consumer, and results are written through
+  `BQ_CONFORMANCE_RESULTS`.
+
+### Fixed
+
+- `RetryReinjector` pins the due time per `(topic, partition, offset)` on first sight and reuses it on every
+  redelivery until the offset is committed, so a future-dated record is held for one tier in total instead of one
+  tier per delivery (the A6 clamp was recomputed against a fresh `now` after each `resume`). One pin is kept per
+  partition, so a pin stranded by a rebalance is replaced by the next record on that partition instead of
+  accumulating.
+- A tombstone (`null` value) is forwarded as `null` by the re-inject and the raw dead-letter path instead of an
+  empty byte string.
+
+### Changed
+
+- The poison decision is read from the vendored conformance `kafka_poison` section; the hand-kept
+  `test/poison-trigger-set.json` is removed.
+- Retry delay stays the tier's (A9 `retryBackoff*` does not apply on Kafka).
+
 ### Changed
 
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.

@@ -4,15 +4,17 @@
  *
  *  - the body must be exactly one JSON value (no BOM, trailing tokens or malformed numbers); a bare `null`
  *    decodes to an empty envelope, any other non-object is rejected;
- *  - `job`, `trace_id`, `meta.id|queue|lang` and `dead_letter.reason|error|exception|original_queue|lang` are
+ *  - `trace_id`, `meta.id|queue|lang` and `dead_letter.reason|error|exception|original_queue|lang` are
  *    string-or-null;
  *  - `meta.schema_version|created_at`, `attempts` and `dead_letter.failed_at|attempts` are integer-or-null: an
  *    integer literal (no fraction or exponent) that fits int64;
  *  - `data`, `meta` and `dead_letter` are object-or-null; numbers inside `data` must be finite doubles;
  *  - member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read
  *    them) and every occurrence of a duplicated key is checked (`JSON.parse` would keep only the last, so this is a
- *    dedicated scanner); any other member, including a differently-cased name or a non-string `urn` alias, is only
- *    checked for syntax.
+ *    dedicated scanner); any other member, including a differently-cased name, a `job` or `urn` of any JSON type, is
+ *    only checked for syntax. `job` and `urn` are identity, not typed fields: a non-string, blank or missing one
+ *    is resolved by {@link resolveIdentity} (ADR-0032 section 6), and a body with no identity is dead-lettered as
+ *    poison by the consumer instead of being rejected here.
  *
  * A well-typed but non-conformant envelope is not poison (Go's consume path never calls `Accepts`).
  */
@@ -40,7 +42,6 @@ const DEAD_LETTER: Record<string, Kind> = {
   attempts: "integer",
 };
 const TOP: Record<string, Kind> = {
-  job: "string",
   trace_id: "string",
   attempts: "integer",
   data: "data",
@@ -299,4 +300,28 @@ export function isLossyNumberToken(token: string): boolean {
   if (!Number.isFinite(n)) return true;
   if (/^-?[0-9]+$/.test(token) && Number.isSafeInteger(n)) return false;
   return normalizedDecimal(token) !== normalizedDecimal(String(n));
+}
+
+const ASCII_BLANK = /^[ \t\n\v\f\r]*$/;
+const ASCII_EDGE = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
+
+const validIdentity = (value: unknown): value is string => typeof value === "string" && !ASCII_BLANK.test(value);
+
+/**
+ * The routing identity of a (syntactically valid) body, per ADR-0032 section 6, or `""` when it has none: a
+ * non-string `job` is ignored; a blank (empty or ASCII-whitespace-only) `job` falls back to `urn`; a `urn` that is
+ * not a non-blank string is ignored. Surrounding ASCII whitespace (space, tab, LF, VT, FF, CR - never Unicode
+ * spaces) is trimmed. When a member is duplicated the last occurrence wins, as `JSON.parse` does.
+ */
+export function resolveIdentity(raw: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "";
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return "";
+  const record = parsed as Record<string, unknown>;
+  const identity = validIdentity(record["job"]) ? record["job"] : validIdentity(record["urn"]) ? record["urn"] : "";
+  return identity.replace(ASCII_EDGE, "");
 }

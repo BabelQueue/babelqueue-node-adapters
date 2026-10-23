@@ -40,7 +40,7 @@
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
-import { envelopeViolation, isLossyNumberToken } from "./envelope-shape.js";
+import { envelopeViolation, isLossyNumberToken, resolveIdentity } from "./envelope-shape.js";
 import { mergeInto } from "./headers.js";
 
 // --- Minimal Kafka shapes (a structural subset of kafkajs) ---------------------
@@ -182,6 +182,13 @@ export function headersOf(message: KafkaIncomingMessage): HeaderCarrier {
 
 // --- Retry / delay topology (contract §6.4–§6.5) -------------------------------
 
+/**
+ * The recommended retry-tier delays in milliseconds (5 s, 30 s, 5 min, 30 min; broker-bindings.md §6.4, ADR-0034
+ * §3). Opt-in only: pass it to {@link RetryTopics} to get these tiers. Nothing applies it implicitly, so a
+ * {@link RetryTopics} built with no delays still has no tiers (a delay or retry then raises).
+ */
+export const DEFAULT_RETRY_TIERS_MS: readonly number[] = Object.freeze([5_000, 30_000, 300_000, 1_800_000]);
+
 /** A single delay tier: the `<topic>.retry.<n>` topic and the delay (ms) it holds for. */
 export interface Tier {
   topic: string;
@@ -199,7 +206,7 @@ export class RetryTopics {
 
   constructor(
     readonly workTopic: string,
-    delaysMs: number[] = [],
+    delaysMs: readonly number[] = [],
     dlqTopic: string | null | undefined = undefined,
   ) {
     this.tiers = [...delaysMs]
@@ -210,6 +217,11 @@ export class RetryTopics {
 
   hasTiers(): boolean {
     return this.tiers.length > 0;
+  }
+
+  /** The tier whose topic is `topic`, or `undefined` when it is not one of this topology's retry topics. */
+  tierForTopic(topic: string): Tier | undefined {
+    return this.tiers.find((tier) => tier.topic === topic);
   }
 
   /** The smallest tier whose delay ≥ `delayMs`; raises if none configured or the delay is too large. */
@@ -688,7 +700,17 @@ export class KafkaConsumer {
       return;
     }
 
-    const urn = headerString(message.headers, "bq-job") ?? EnvelopeCodec.urn(envelope);
+    // Identity (ADR-0032 section 6, resolved from the body: the installed core may predate that rule). A body with
+    // no valid `job`/`urn` shares the poison fate (broker-bindings.md section 6.5): DLQ, handler never called.
+    const bodyIdentity = resolveIdentity(raw);
+    const urn = headerString(message.headers, "bq-job") ?? bodyIdentity;
+    // The handler and any republish see the resolved identity as `job` (the body may carry it only as `urn`, or
+    // with surrounding whitespace), so a re-encoded retry or DLQ copy stays a well-formed envelope.
+    if (bodyIdentity !== "" && envelope.job !== bodyIdentity) envelope = { ...envelope, job: bodyIdentity };
+    if (urn === "") {
+      await this.settlePoison(payload, raw, new BabelQueueError("Undecodable BabelQueue body: no valid job or urn identity."), envelope);
+      return;
+    }
     const handler = this.handlers[urn];
     if (!handler) {
       await this.onUnknownUrn(payload, envelope, urn);
@@ -759,6 +781,12 @@ export class KafkaConsumer {
     const headers = kafkaHeaders(bumped);
     headers["bq-delay"] = String(tier.delayMs);
     headers["bq-original-topic"] = this.originalTopic(payload);
+    // W3C trace context travels out of band (ADR-0028): keep the inbound one so the re-injected attempt stays on
+    // the same trace.
+    for (const name of ["traceparent", "tracestate"]) {
+      const value = headerString(payload.message.headers, name);
+      if (value !== undefined) headers[name] = value;
+    }
     await this.produce(tier.topic, bumped, headers, payload.message.key);
   }
 
@@ -819,7 +847,7 @@ export class KafkaConsumer {
     // Forward the original record verbatim (value, key, headers) so the DLQ copy keeps its provenance
     // (Java reference). Only the timestamp is re-stamped.
     const forwarded: KafkaProducerMessage = {
-      value: message.value ?? Buffer.alloc(0),
+      value: tombstoneSafe(message.value),
       // KafkaJS accepts Buffer / array header values; the published structural type stays string-only.
       headers: copyHeaders(message.headers) as unknown as KafkaProducerMessage["headers"],
       timestamp: String(Date.now()),
@@ -886,5 +914,168 @@ export class KafkaConsumer {
     } catch {
       // user callback failure must not escape the consume loop
     }
+  }
+}
+
+/** The partition-flow control of a kafkajs consumer: `pause` / `resume` hold fetching for the given partitions. */
+export interface KafkaPauseClient {
+  pause(topics: { topic: string; partitions?: number[] }[]): void;
+  resume(topics: { topic: string; partitions?: number[] }[]): void;
+}
+
+/** What {@link RetryReinjector} needs from a kafkajs consumer: manual commit, `seek`, `pause` and `resume`. */
+export type KafkaReinjectClient = KafkaConsumerClient & KafkaSeekClient & KafkaPauseClient;
+
+export interface RetryReinjectorOptions {
+  /** Writes the record back to its work topic. */
+  producer: KafkaProducerClient;
+  /** The topology whose `<topic>.retry.<n>` tiers this process re-injects from. */
+  retryTopics: RetryTopics;
+  /** Called with a re-inject failure (a broker write that was not acknowledged); the offset stays uncommitted. */
+  onError?: (error: unknown, payload: EachMessagePayload) => void;
+  /** Current time in epoch milliseconds. Injectable for tests. */
+  clock?: () => number;
+  /** Runs `fn` after `ms` and returns a cancel function. Injectable for tests; defaults to `setTimeout`. */
+  schedule?: (fn: () => void, ms: number) => () => void;
+}
+
+/**
+ * A forwarded record's value, byte-for-byte. A null value (a tombstone) stays null: kafkajs accepts it,
+ * while the published `KafkaProducerMessage.value` type (`Buffer | string`) predates tombstone forwarding and is
+ * deliberately not widened (that would break custom producer wrappers at compile time).
+ */
+function tombstoneSafe(value: Buffer | null | undefined): Buffer {
+  return (value ?? null) as unknown as Buffer;
+}
+
+const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
+  const timer = setTimeout(fn, ms);
+  return () => clearTimeout(timer);
+};
+
+/**
+ * Re-inject consumer for the retry tiers (broker-bindings.md section 6.4, ADR-0034 sections 5-7).
+ *
+ * A failed record is republished by {@link KafkaConsumer} to `<topic>.retry.<n>` with `bq-delay` and
+ * `bq-original-topic`; nothing delivers it back to the work topic by itself. This consumer does: subscribe it to
+ * {@link RetryReinjector.topics} (its own consumer group) and `run()` it. For every record it
+ *
+ *  1. computes the due time `record.timestamp + tier_ms` (the tier comes from the topic, never from `bq-delay`),
+ *     clamped to `[now, now + tier_ms]` as of the FIRST time the record is seen, and pins that due time per
+ *     (topic, partition, offset) until the record is committed (one pinned record per partition; a record at another
+ *     offset replaces a stale pin left behind by a rebalance). A future-dated timestamp therefore holds the
+ *     partition for at most one tier in total: re-delivery after the resume does not re-clamp against a fresh `now`;
+ *  2. when the record is not yet due, `seek`s back to it and `pause`s that partition until it is, so the poll loop
+ *     keeps running (heartbeats, other partitions) instead of being blocked;
+ *  3. when due, writes the value and key to `bq-original-topic` byte-for-byte - no decode, no re-encode, no
+ *     `attempts` change (an undecodable record is carried as-is) - minus the `bq-delay` / `bq-original-topic`
+ *     headers (the others, `traceparent` included, are kept) and commits the offset only after the broker
+ *     acknowledged the write. A failed write is not committed (at-least-once).
+ *
+ * Operational notes (ADR-0034 A6): create the retry topics with `message.timestamp.type=LogAppendTime`
+ * (SHOULD), so the due time is the broker's append time and not a producer clock; and give them a retention longer
+ * than the largest tier.
+ */
+export class RetryReinjector {
+  private readonly clock: () => number;
+  private readonly schedule: (fn: () => void, ms: number) => () => void;
+  private readonly timers = new Map<string, () => void>();
+  /**
+   * First-seen due time (epoch ms) of the record held on each partition, keyed `topic\0partition`;
+   * dropped on commit. One entry per partition: a record with a different offset replaces it, so an
+   * entry stranded by a rebalance (the partition moved away before the commit) cannot accumulate.
+   */
+  private readonly dueAt = new Map<string, { offset: string; due: number }>();
+
+  constructor(
+    private readonly consumer: KafkaReinjectClient,
+    private readonly options: RetryReinjectorOptions,
+  ) {
+    this.clock = options.clock ?? Date.now;
+    this.schedule = options.schedule ?? defaultSchedule;
+  }
+
+  /** The retry topics to subscribe this consumer to (`<topic>.retry.1` ... `<topic>.retry.<N>`). */
+  get topics(): string[] {
+    return this.options.retryTopics.tiers.map((tier) => tier.topic);
+  }
+
+  /** Start the manual-commit loop (`autoCommit: false`); resolves when the consumer stops. */
+  async run(): Promise<void> {
+    await this.consumer.run({ autoCommit: false, eachMessage: (payload) => this.handle(payload) });
+  }
+
+  /** Cancel the pending resume timers (partitions stay paused; stop the consumer itself afterwards). */
+  stop(): void {
+    for (const cancel of this.timers.values()) cancel();
+    this.timers.clear();
+    this.dueAt.clear();
+  }
+
+  /** Hold, or re-inject and commit, one retry-topic record. Exposed for testing. */
+  async handle(payload: EachMessagePayload): Promise<void> {
+    const tier = this.options.retryTopics.tierForTopic(payload.topic);
+    if (!tier) {
+      throw new BabelQueueError(`Record from "${payload.topic}", which is not one of this topology's retry topics.`);
+    }
+    const { message } = payload;
+    const now = this.clock();
+    const stamped = Number(message.timestamp);
+    const timestamp = message.timestamp !== undefined && Number.isFinite(stamped) ? stamped : now;
+    const partitionKey = `${payload.topic}\u0000${payload.partition}`;
+    const pinned = this.dueAt.get(partitionKey);
+    let due: number;
+    if (pinned !== undefined && pinned.offset === message.offset) {
+      due = pinned.due;
+    } else {
+      due = Math.min(Math.max(timestamp + tier.delayMs, now), now + tier.delayMs);
+      this.dueAt.set(partitionKey, { offset: message.offset, due });
+    }
+    if (due > now) {
+      this.hold(payload, due - now);
+      return;
+    }
+
+    const headers = copyHeaders(message.headers);
+    delete headers["bq-delay"];
+    delete headers["bq-original-topic"];
+    const target = headerString(message.headers, "bq-original-topic") ?? this.options.retryTopics.workTopic;
+    const record: KafkaProducerMessage = {
+      value: tombstoneSafe(message.value),
+      // kafkajs accepts Buffer / array header values; the published structural type stays string-only.
+      headers: headers as unknown as KafkaProducerMessage["headers"],
+      timestamp: String(this.clock()),
+    };
+    if (message.key !== undefined && message.key !== null) record.key = Buffer.from(message.key);
+    try {
+      await this.options.producer.send({ topic: target, messages: [record] });
+    } catch (error) {
+      try {
+        this.options.onError?.(error, payload);
+      } catch {
+        // a throwing callback must not replace the write failure
+      }
+      throw error;
+    }
+    await this.consumer.commitOffsets([
+      { topic: payload.topic, partition: payload.partition, offset: (Number(message.offset) + 1).toString() },
+    ]);
+    if (this.dueAt.get(partitionKey)?.offset === message.offset) this.dueAt.delete(partitionKey);
+  }
+
+  /** Rewind to the held record and pause its partition for `waitMs`, then resume (one timer per partition). */
+  private hold(payload: EachMessagePayload, waitMs: number): void {
+    const { topic, partition, message } = payload;
+    const key = `${topic}\u0000${partition}`;
+    this.consumer.seek({ topic, partition, offset: message.offset });
+    this.consumer.pause([{ topic, partitions: [partition] }]);
+    this.timers.get(key)?.();
+    this.timers.set(
+      key,
+      this.schedule(() => {
+        this.timers.delete(key);
+        this.consumer.resume([{ topic, partitions: [partition] }]);
+      }, waitMs),
+    );
   }
 }

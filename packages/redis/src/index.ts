@@ -1,38 +1,45 @@
 /**
  * Redis adapter for BabelQueue.
  *
- * A canonical-envelope **publisher** and a URN-routed **consumer** over the §1 reliable-queue
- * pattern (`RPUSH` to produce, `BRPOPLPUSH` the head to a `<queue>:processing` list to reserve so
- * an in-flight message survives a crash, `LREM` to acknowledge), so a Redis-based Node service
- * speaks the same wire contract as the PHP, Python and Go SDKs.
+ * A canonical-envelope **publisher** and a URN-routed **consumer** over two Redis layouts
+ * (broker-bindings §1, ADR-0033):
+ *
+ * - **`legacy`** (default) — the reliable-queue pattern: `RPUSH` to produce, `LMOVE` the head of
+ *   `<queue>` to `<queue>:processing` to reserve (a Lua script that also writes a recovery deadline
+ *   to `<queue>:processing:deadlines`), and a deadline-gated `LREM` to acknowledge, so an in-flight
+ *   message survives a crash. A **recovery sweep** runs before every reserve and moves a reservation
+ *   whose deadline (`retryAfter`) passed back onto `<queue>`, body untouched. The pop end changed
+ *   from the tail (`BRPOPLPUSH`) to the head (`LMOVE LEFT RIGHT`) so the queue is FIFO, like the Go,
+ *   Python, Java and .NET SDKs.
+ * - **`zset`** — the Laravel-compatible layout (`queues:<q>`, `:delayed`, `:reserved`, `:notify`):
+ *   delayed publish, `retryAfter` recovery through the reserved sorted set, a Lua reserve that
+ *   increments `attempts`, and blocking pop on the `:notify` list. Opt-in via `layout: "zset"`.
  *
  * Redis lists carry **no native metadata** — the list element **is** the canonical envelope JSON,
  * byte-for-byte, with **no wrapping** (unlike `@babelqueue/bullmq`, which uses BullMQ's own job
- * layout). Routing and tracing read the body's `job` / `trace_id`. This is a Node-owned reliable
- * queue; full parity with Laravel's reserved-sorted-set reservation on a *shared* Redis queue is a
- * separate task — for a mixed PHP+Node fleet on one queue, prefer a queue this consumer owns
- * end-to-end.
+ * layout). Routing and tracing read the body's `job` / `trace_id`.
  *
- * This implements §1 of the broker-bindings contract. `ioredis` is an optional peer — you provide
- * the client (an `ioredis` instance satisfies the adapter structurally).
+ * `ioredis` is an optional peer — you provide the client (an `ioredis` instance satisfies the
+ * adapter structurally).
  *
- * **Out-of-band headers (ADR-0028).** A Redis list element *is* the canonical envelope JSON (the
- * `LREM` ack handle is that exact value), so — unlike AMQP headers or SQS `MessageAttributes` —
- * there is no native per-message metadata channel. To carry a {@link HeaderCarrier} (e.g. a W3C
- * `traceparent` for cross-hop span linkage) the adapter owns a tiny JSON *frame* distinct from the
- * wire envelope:
+ * **Out-of-band headers (ADR-0028) — legacy layout only.** A Redis list element *is* the canonical
+ * envelope JSON, so there is no native per-message metadata channel. To carry a
+ * {@link HeaderCarrier} (e.g. a W3C `traceparent`) the legacy layout owns a tiny JSON *frame*
+ * distinct from the wire envelope:
  *
  *     {"__bq_frame":1,"headers":{"traceparent":"00-…"},"body":"<raw wire envelope>"}
  *
- * `RPUSH` stores the frame, so the `LREM` ack handle stays byte-for-byte what was pushed and the
- * reliable-queue semantics (`RPUSH`/`BRPOPLPUSH`/`LREM`) are untouched. Framing is **opt-in and
- * backward compatible**: only `publish` with a non-empty `headers` carrier writes a frame; a plain
- * publish stores the **bare** envelope byte-for-byte, exactly as before. The consumer detects
- * frame-vs-bare by the reserved `__bq_frame` sentinel (a frozen envelope can never carry it), so a
- * bare value consumes with empty headers and cross-version queues interoperate. This mirrors the
- * Go `/redis` and PHP `RedisTransport` framing byte-for-byte. GR-1: the wire envelope is never
- * touched.
+ * Framing is **opt-in and backward compatible**: only `publish` with a non-empty `headers` carrier
+ * writes a frame; a plain publish stores the **bare** envelope byte-for-byte. The consumer detects
+ * frame-vs-bare by the reserved `__bq_frame` sentinel (a frozen envelope can never carry it).
+ *
+ * **The zset layout never writes a frame (ADR-0033 A3).** A Laravel worker on the same queue would
+ * read the frame as a job, so a header-carrying publish drops the headers and stores the bare
+ * envelope; a `traceparent` is therefore not propagated in this layout (`trace_id` stays in the
+ * envelope, GR-4). GR-1: the wire envelope is never touched.
  */
+
+import { randomBytes } from "node:crypto";
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
@@ -45,11 +52,13 @@ import { sanitizeHeaders } from "./headers.js";
 export interface RedisClient {
   /** Append a value to the tail of a list; returns the new length. */
   rpush(key: string, value: string): Promise<number>;
-  /** Atomically pop the head of `source` and push it to the tail of `destination`, blocking up
-   *  to `timeout` seconds; resolves to the value, or `null` on timeout. */
-  brpoplpush(source: string, destination: string, timeout: number): Promise<string | null>;
-  /** Remove `count` occurrences of `value` from a list; returns how many were removed. */
-  lrem(key: string, count: number, value: string): Promise<number>;
+  /** Add `member` to a sorted set with `score`. */
+  zadd(key: string, score: number | string, member: string): Promise<number | string>;
+  /** Blocking pop from the head of a list for up to `timeout` seconds (fractions need Redis 6+);
+   *  resolves to `[key, value]`, or `null` on timeout. */
+  blpop(key: string, timeout: number): Promise<[string, string] | null>;
+  /** Run a Lua script with `numKeys` keys followed by the arguments. */
+  eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>;
 }
 
 // --- Payload (contract §1) -----------------------------------------------------
@@ -58,6 +67,7 @@ export interface RedisClient {
 export function redisValue(envelope: Envelope): string {
   return EnvelopeCodec.encode(envelope);
 }
+
 
 // --- Header frame (ADR-0028) ---------------------------------------------------
 
@@ -123,6 +133,567 @@ export function headersOf(value: string): HeaderCarrier {
   return unframe(value)[1];
 }
 
+
+// --- Layouts, keys and Lua (ADR-0033) -------------------------------------------
+
+/** The Redis layout a queue uses. `legacy` is the default `:processing` reliable queue. */
+export type RedisLayout = "legacy" | "zset";
+
+/** The four keys of the Laravel-compatible zset layout. */
+export interface ZsetKeys {
+  ready: string;
+  delayed: string;
+  reserved: string;
+  notify: string;
+}
+
+/** The default key prefix of the zset layout (Laravel's `queues:`). */
+export const ZSET_KEY_PREFIX = "queues:";
+
+/**
+ * The zset-layout keys for `queue`: `queues:<q>`, `:delayed`, `:reserved`, `:notify`. In a Redis
+ * Cluster, hash tags (`{orders}`) are the caller's responsibility (put them in `queue`).
+ */
+export function zsetKeys(queue: string, prefix: string = ZSET_KEY_PREFIX): ZsetKeys {
+  const ready = `${prefix}${queue}`;
+  return { ready, delayed: `${ready}:delayed`, reserved: `${ready}:reserved`, notify: `${ready}:notify` };
+}
+
+/**
+ * The Lua scripts, exported so a test double can dispatch `eval` on script identity. Every script
+ * is atomic; none of them rewrites a body except the zset reserve (Laravel's `cjson` increment).
+ */
+export const LUA = {
+  /** KEYS=[q, q:processing, q:processing:deadlines] ARGV=[deadline, token]. Returns the raw body or nil. */
+  legacyReserve: `
+local raw = redis.call('LMOVE', KEYS[1], KEYS[2], 'LEFT', 'RIGHT')
+if not raw then return false end
+redis.call('ZADD', KEYS[3], ARGV[1], ARGV[2] .. ':' .. raw)
+return raw
+`,
+  /** KEYS=[q, q:processing, q:processing:deadlines] ARGV=[floor(now), batch]. Returns the count moved. */
+  legacySweep: `
+local batch = tonumber(ARGV[2])
+local members
+if batch > 0 then
+  members = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[1], 'LIMIT', 0, batch)
+else
+  members = redis.call('ZRANGEBYSCORE', KEYS[3], '-inf', ARGV[1])
+end
+local moved = 0
+for _, m in ipairs(members) do
+  if #m >= 34 and string.sub(m, 33, 33) == ':' then
+    local raw = string.sub(m, 34)
+    if redis.call('LREM', KEYS[2], 1, raw) == 1 then
+      redis.call('RPUSH', KEYS[1], raw)
+      moved = moved + 1
+    end
+  end
+  redis.call('ZREM', KEYS[3], m)
+end
+return moved
+`,
+  /** KEYS=[q:processing, q:processing:deadlines] ARGV=[token, raw]. 1 if the reservation was live. */
+  legacyAck: `
+if redis.call('ZREM', KEYS[2], ARGV[1] .. ':' .. ARGV[2]) == 1 then
+  redis.call('LREM', KEYS[1], 1, ARGV[2])
+  return 1
+end
+return 0
+`,
+  /** KEYS=[q, q:processing, q:processing:deadlines] ARGV=[token, raw, body]. */
+  legacyRelease: `
+if redis.call('ZREM', KEYS[3], ARGV[1] .. ':' .. ARGV[2]) == 1 then
+  redis.call('LREM', KEYS[2], 1, ARGV[2])
+  redis.call('RPUSH', KEYS[1], ARGV[3])
+  return 1
+end
+return 0
+`,
+  /** KEYS=[q:processing, q:processing:deadlines, dlq] ARGV=[token, raw, body]. */
+  legacyDeadLetter: `
+if redis.call('ZREM', KEYS[2], ARGV[1] .. ':' .. ARGV[2]) == 1 then
+  redis.call('LREM', KEYS[1], 1, ARGV[2])
+  redis.call('RPUSH', KEYS[3], ARGV[3])
+  return 1
+end
+return 0
+`,
+  /**
+   * KEYS=[q, q:reserved, q:notify] ARGV=[expiry]. Returns `{job, reserved, flag}` or nil; flag `'1'`
+   * is poison (`reserved == job`), `'0'` a delivered body. Nothing after the LPOP may raise, so the
+   * re-encode is guarded too: lua-cjson decodes `1e999` / `NaN` / `Infinity` but refuses to encode
+   * them, and a bare `cjson.encode` here would lose the already-popped message (broker-bindings
+   * section 1.1, ADR-0033 A1). An unencodable body takes the poison path.
+   */
+  zsetReserve: `
+local job = redis.call('LPOP', KEYS[1])
+if not job then return false end
+local ok, decoded = pcall(cjson.decode, job)
+if ok and type(decoded) == 'table' and type(decoded['attempts']) == 'number' then
+  decoded['attempts'] = decoded['attempts'] + 1
+  local eok, reserved = pcall(cjson.encode, decoded)
+  if eok and type(reserved) == 'string' then
+    redis.call('ZADD', KEYS[2], ARGV[1], reserved)
+    redis.call('LPOP', KEYS[3])
+    return {job, reserved, '0'}
+  end
+end
+redis.call('ZADD', KEYS[2], ARGV[1], job)
+return {job, job, '1'}
+`,
+  /** KEYS=[source zset, q, q:notify] ARGV=[floor(now), batch]. Returns the count moved. */
+  zsetMigrate: `
+local batch = tonumber(ARGV[2])
+local val
+if batch > 0 then
+  val = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, batch)
+else
+  val = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+end
+if #val > 0 then
+  redis.call('ZREMRANGEBYRANK', KEYS[1], 0, #val - 1)
+  for i = 1, #val, 100 do
+    redis.call('RPUSH', KEYS[2], unpack(val, i, math.min(i + 99, #val)))
+  end
+  for _ = 1, #val do
+    redis.call('RPUSH', KEYS[3], '1')
+  end
+end
+return #val
+`,
+  /** KEYS=[q, q:notify] ARGV=[body]. */
+  zsetPush: `
+redis.call('RPUSH', KEYS[1], ARGV[1])
+redis.call('RPUSH', KEYS[2], '1')
+return 1
+`,
+  /** KEYS=[q:reserved] ARGV=[member]. */
+  zsetAck: `
+return redis.call('ZREM', KEYS[1], ARGV[1])
+`,
+  /** KEYS=[q:delayed, q:reserved] ARGV=[member, score, body]. The ZADD is unconditional. */
+  zsetRelease: `
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[3])
+return 1
+`,
+  /**
+   * KEYS=[q:reserved, dlq] ARGV=[member, body]. Terminal-failure dead-letter, gated on the ZREM like
+   * the legacy scripts: a late dead-letter whose reservation was already recovered (back on `<q>`)
+   * writes nothing, so the body is never both ready and dead-lettered. A poison reservation uses
+   * `zsetDeadLetterPoison` instead (unconditional, as the contract requires).
+   */
+  zsetDeadLetter: `
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+  redis.call('RPUSH', KEYS[2], ARGV[2])
+  return 1
+end
+return 0
+`,
+  /**
+   * KEYS=[q:reserved, dlq] ARGV=[member, body]. The poison dead-letter (broker-bindings section 1.1):
+   * the SDK MUST write the message to the DLQ and `ZREM` it, unconditionally. Two byte-equal poison
+   * bodies reserved together share one `:reserved` member, so a `ZREM` gate would drop the second
+   * copy without ever writing it.
+   */
+  zsetDeadLetterPoison: `
+redis.call('RPUSH', KEYS[2], ARGV[2])
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1
+`,
+} as const;
+
+// --- Transport -----------------------------------------------------------------
+
+/** Options for {@link RedisQueue} (and, through it, {@link RedisPublisher} / {@link RedisConsumer}). */
+export interface RedisQueueOptions {
+  /** `"legacy"` (default, the `:processing` reliable queue) or `"zset"` (Laravel-compatible). */
+  layout?: RedisLayout;
+  /**
+   * Seconds before an unacknowledged reservation is recovered (default 90). `null` disables
+   * recovery (the legacy deadline member is written with score `+inf`; the zset `:reserved`
+   * migrate is skipped). A negative or non-finite value is a configuration error. In the zset
+   * layout a recovery counts as an attempt. The handler timeout SHOULD be shorter than this.
+   */
+  retryAfter?: number | null;
+  /** Max items one migrate/sweep moves; `-1` (default) or `0` means no limit. */
+  migrationBatchSize?: number;
+  /** Epoch-seconds clock (fractions allowed); injectable for tests. Default `Date.now() / 1000`. */
+  clock?: () => number;
+  /** Zset key prefix (default `"queues:"`). Ignored by the legacy layout. */
+  keyPrefix?: string;
+  /** Suffix for the legacy reservation list (default `":processing"`). */
+  processingSuffix?: string;
+  /** The dead-letter list (default `<queue>.dlq`); `null` drops on terminal failure. */
+  deadLetterQueue?: string | null;
+  /** Receives the "reservation expired" warning (default `console.warn`). */
+  onWarn?: (message: string) => void;
+}
+
+/** A legacy reservation: the raw body plus the 32-hex token of its deadline member. */
+export interface LegacyReservation {
+  layout: "legacy";
+  raw: string;
+  token: string;
+}
+
+/** A zset reservation: the raw body (what the handler sees) and the exact `:reserved` member. */
+export interface ZsetReservation {
+  layout: "zset";
+  raw: string;
+  reserved: string;
+  /**
+   * Set when the reserve script flagged the body as poison (undecodable, or `attempts` not a
+   * number): its dead-letter is then unconditional, not gated on the `ZREM`.
+   */
+  poison?: boolean;
+}
+
+/** Whatever a reserve handed out; pass it back to ack / release / deadLetter. */
+export type Reservation = LegacyReservation | ZsetReservation;
+
+/** The outcome of one non-blocking {@link RedisQueue.reserve}. */
+export interface ReserveResult {
+  outcome: "delivered" | "empty" | "poison";
+  /** The raw body the handler sees (absent on `empty`). */
+  raw?: string;
+  /** The reservation handle (absent on `empty`). */
+  reservation?: Reservation;
+  /** Zset only: the delivery count the handler is told (`job.attempts + 1`); absent on poison. */
+  attempts?: number;
+}
+
+/** A fresh 128-bit reservation token: 32 lowercase hex characters from the OS CSPRNG. */
+export function newReservationToken(): string {
+  return randomBytes(16).toString("hex");
+}
+
+function validateRetryAfter(value: number | null | undefined): number | null {
+  if (value === undefined) return 90;
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new BabelQueueError(`Invalid retryAfter ${String(value)}: must be a non-negative number of seconds, or null.`);
+  }
+  return value;
+}
+
+/**
+ * The Redis operations behind the publisher and the consumer, one set per layout. The methods are
+ * non-blocking and take their time from the injectable clock, so they can be driven step by step
+ * (the conformance suite does exactly that).
+ */
+export class RedisQueue {
+  readonly layout: RedisLayout;
+  readonly retryAfter: number | null;
+  readonly migrationBatchSize: number;
+  readonly deadLetterKey: string | null;
+  /** The zset keys (zset layout) — also usable to inspect the legacy ready list via `ready`. */
+  readonly keys: ZsetKeys;
+  readonly processingKey: string;
+  readonly deadlinesKey: string;
+
+  private readonly clock: () => number;
+  private readonly warn: (message: string) => void;
+
+  constructor(
+    private readonly client: RedisClient,
+    readonly queue: string,
+    options: RedisQueueOptions = {},
+  ) {
+    this.layout = options.layout ?? "legacy";
+    if (this.layout !== "legacy" && this.layout !== "zset") {
+      throw new BabelQueueError(`Unknown Redis layout ${String(this.layout)}: expected "legacy" or "zset".`);
+    }
+    this.retryAfter = validateRetryAfter(options.retryAfter);
+    const batch = options.migrationBatchSize ?? -1;
+    this.migrationBatchSize = Number.isFinite(batch) && batch > 0 ? Math.floor(batch) : -1;
+    this.clock = options.clock ?? (() => Date.now() / 1000);
+    this.warn = options.onWarn ?? ((message) => console.warn(message));
+    this.deadLetterKey = options.deadLetterQueue === undefined ? `${queue}.dlq` : options.deadLetterQueue;
+    this.keys = this.layout === "zset" ? zsetKeys(queue, options.keyPrefix) : { ready: queue, delayed: "", reserved: "", notify: "" };
+    this.processingKey = queue + (options.processingSuffix ?? ":processing");
+    this.deadlinesKey = `${this.processingKey}:deadlines`;
+  }
+
+  private run(script: string, keys: string[], args: Array<string | number>): Promise<unknown> {
+    return this.client.eval(script, keys.length, ...keys, ...args);
+  }
+
+  private nowSeconds(): number {
+    return Math.floor(this.clock());
+  }
+
+  private deadlineScore(): string {
+    return this.retryAfter === null ? "+inf" : String(this.nowSeconds() + this.retryAfter);
+  }
+
+  /** Append a body to the ready list (zset: also one `:notify` token). */
+  async push(body: string): Promise<void> {
+    if (this.layout === "zset") {
+      await this.run(LUA.zsetPush, [this.keys.ready, this.keys.notify], [body]);
+    } else {
+      await this.client.rpush(this.queue, body);
+    }
+  }
+
+  /**
+   * Schedule a body for `delay` seconds from now: `ZADD <q>:delayed floor(now)+ceil(delay)` with
+   * the body byte-for-byte and no `:notify` token. Zset layout only.
+   */
+  async pushDelayed(body: string, delay: number): Promise<void> {
+    if (this.layout !== "zset") {
+      throw new BabelQueueError("A delayed publish requires layout \"zset\"; the legacy layout has no delayed set.");
+    }
+    if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
+      throw new BabelQueueError(`Invalid delay ${String(delay)}: must be a non-negative number of seconds.`);
+    }
+    await this.client.zadd(this.keys.delayed, this.nowSeconds() + Math.ceil(delay), body);
+  }
+
+  /** Zset: move due `:delayed` items, then due `:reserved` ones (skipped if `retryAfter` is null). */
+  async migrate(): Promise<number> {
+    if (this.layout !== "zset") return 0;
+    let moved = await this.migrateFrom(this.keys.delayed);
+    if (this.retryAfter !== null) moved += await this.migrateFrom(this.keys.reserved);
+    return moved;
+  }
+
+  private async migrateFrom(source: string): Promise<number> {
+    const moved = await this.run(
+      LUA.zsetMigrate,
+      [source, this.keys.ready, this.keys.notify],
+      [this.nowSeconds(), this.migrationBatchSize],
+    );
+    return Number(moved);
+  }
+
+  /** Legacy: move expired reservations back onto the ready list (body untouched). */
+  async sweep(): Promise<number> {
+    if (this.layout !== "legacy") return 0;
+    const moved = await this.run(
+      LUA.legacySweep,
+      [this.queue, this.processingKey, this.deadlinesKey],
+      [this.nowSeconds(), this.migrationBatchSize],
+    );
+    return Number(moved);
+  }
+
+  /** Recovery and migration for the layout; runs before every reserve. */
+  async maintain(): Promise<number> {
+    return this.layout === "zset" ? this.migrate() : this.sweep();
+  }
+
+  /** One non-blocking reserve, preceded by the layout's migrate / sweep. */
+  async reserve(): Promise<ReserveResult> {
+    await this.maintain();
+    return this.layout === "zset" ? this.reserveZset() : this.reserveLegacy();
+  }
+
+  private async reserveLegacy(): Promise<ReserveResult> {
+    const token = newReservationToken();
+    const raw = await this.run(
+      LUA.legacyReserve,
+      [this.queue, this.processingKey, this.deadlinesKey],
+      [this.deadlineScore(), token],
+    );
+    if (typeof raw !== "string") return { outcome: "empty" };
+    return { outcome: "delivered", raw, reservation: { layout: "legacy", raw, token } };
+  }
+
+  private async reserveZset(): Promise<ReserveResult> {
+    const reply = await this.run(
+      LUA.zsetReserve,
+      [this.keys.ready, this.keys.reserved, this.keys.notify],
+      [this.deadlineScore()],
+    );
+    if (!Array.isArray(reply) || reply.length < 2) return { outcome: "empty" };
+    const raw = String(reply[0]);
+    const reserved = String(reply[1]);
+    const reservation: ZsetReservation = { layout: "zset", raw, reserved };
+    // The script's third element is the authoritative poison flag; a two-element reply (a test
+    // double) falls back to the `reserved == job` signal.
+    const poison = reply.length >= 3 ? String(reply[2]) === "1" : raw === reserved;
+    if (poison) return { outcome: "poison", raw, reservation: { ...reservation, poison: true } };
+    return { outcome: "delivered", raw, reservation, attempts: attemptsOf(raw) + 1 };
+  }
+
+  /** Acknowledge. Legacy: false (plus a warning) if the reservation had already expired. */
+  async ack(reservation: Reservation): Promise<boolean> {
+    if (reservation.layout === "zset") {
+      return Number(await this.run(LUA.zsetAck, [this.keys.reserved], [reservation.reserved])) === 1;
+    }
+    const live = await this.run(LUA.legacyAck, [this.processingKey, this.deadlinesKey], [reservation.token, reservation.raw]);
+    return this.liveOrWarn(live, reservation);
+  }
+
+  /**
+   * Give a reservation back. Legacy: the body (default: `raw`) goes to the ready list, gated on the
+   * deadline member; `delay` is ignored. Zset: one script `ZREM`s the `:reserved` member and `ZADD`s
+   * `<q>:delayed` at `floor(now)+ceil(delay)` with the body (default: `raw` re-encoded with
+   * `attempts + 1`, every other key preserved).
+   */
+  async release(reservation: Reservation, delay = 0, body?: string): Promise<boolean> {
+    if (reservation.layout === "zset") {
+      if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
+        throw new BabelQueueError(`Invalid delay ${String(delay)}: must be a non-negative number of seconds.`);
+      }
+      const bumped = body ?? bumpAttempts(reservation.raw);
+      await this.run(
+        LUA.zsetRelease,
+        [this.keys.delayed, this.keys.reserved],
+        [reservation.reserved, this.nowSeconds() + Math.ceil(delay), bumped],
+      );
+      return true;
+    }
+    const live = await this.run(
+      LUA.legacyRelease,
+      [this.queue, this.processingKey, this.deadlinesKey],
+      [reservation.token, reservation.raw, body ?? reservation.raw],
+    );
+    return this.liveOrWarn(live, reservation);
+  }
+
+  /** Write `body` (default: `raw`) to the dead-letter list and settle the reservation. */
+  async deadLetter(reservation: Reservation, body?: string): Promise<boolean> {
+    const payload = body ?? reservation.raw;
+    if (this.deadLetterKey === null) return this.ack(reservation);
+    if (reservation.layout === "zset" && reservation.poison === true) {
+      // Poison (section 1.1): always write to the DLQ and ZREM, even when a byte-equal twin already
+      // removed the shared `:reserved` member.
+      await this.run(
+        LUA.zsetDeadLetterPoison,
+        [this.keys.reserved, this.deadLetterKey],
+        [reservation.reserved, payload],
+      );
+      return true;
+    }
+    if (reservation.layout === "zset") {
+      const settled = await this.run(
+        LUA.zsetDeadLetter,
+        [this.keys.reserved, this.deadLetterKey],
+        [reservation.reserved, payload],
+      );
+      if (Number(settled) === 1) return true;
+      this.warn(
+        `reservation expired: queue "${this.queue}" reservation was already recovered or settled; nothing dead-lettered`,
+      );
+      return false;
+    }
+    const live = await this.run(
+      LUA.legacyDeadLetter,
+      [this.processingKey, this.deadlinesKey, this.deadLetterKey],
+      [reservation.token, reservation.raw, payload],
+    );
+    return this.liveOrWarn(live, reservation);
+  }
+
+  private liveOrWarn(reply: unknown, reservation: LegacyReservation): boolean {
+    if (Number(reply) === 1) return true;
+    this.warn(
+      `reservation expired: queue "${this.queue}" token ${reservation.token} was already swept or settled; left the queue untouched`,
+    );
+    return false;
+  }
+}
+
+/** `job.attempts` of a raw body, 0 when absent or unreadable. */
+function attemptsOf(raw: string): number {
+  try {
+    const decoded: unknown = JSON.parse(raw);
+    const attempts = (decoded as { attempts?: unknown } | null)?.attempts;
+    return typeof attempts === "number" ? attempts : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The raw body with `attempts` raised by one and every other byte untouched (ADR-0031): the zset
+ * release / recovery body. Only the `attempts` value is spliced, so unknown keys keep their exact
+ * text, including integers above 2^53 that a `JSON.parse` / `JSON.stringify` round trip would round.
+ * Falls back to the raw value when it is not a JSON object.
+ */
+function bumpAttempts(raw: string): string {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  if (decoded === null || typeof decoded !== "object" || Array.isArray(decoded)) return raw;
+
+  const scan = scanTopLevel(raw);
+  const spans = scan.members.filter((member) => member.key === "attempts");
+  const last = spans[spans.length - 1];
+  const current = last === undefined ? null : raw.slice(last.start, last.end);
+  const next = current !== null && NUMBER_LITERAL.test(current) ? incrementNumberLiteral(current) : "1";
+  if (last === undefined) {
+    const member = `"attempts":${next}`;
+    return `${raw.slice(0, scan.close)}${scan.members.length > 0 ? "," : ""}${member}${raw.slice(scan.close)}`;
+  }
+  let result = raw;
+  for (const span of [...spans].reverse()) result = `${result.slice(0, span.start)}${next}${result.slice(span.end)}`;
+  return result;
+}
+
+const NUMBER_LITERAL = /^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+/** `literal + 1`, exact for an integer literal of any size and a plain `Number` sum otherwise. */
+function incrementNumberLiteral(literal: string): string {
+  if (/^-?\d+$/.test(literal)) return (BigInt(literal) + 1n).toString();
+  return String(Number(literal) + 1);
+}
+
+interface TopLevelScan {
+  /** The key and the `[start, end)` span of the value text of each top-level member, in order. */
+  members: Array<{ key: string; start: number; end: number }>;
+  /** Index of the closing `}` of the top-level object. */
+  close: number;
+}
+
+/** Locate the top-level members of an already-validated JSON object text (no re-serialisation). */
+function scanTopLevel(text: string): TopLevelScan {
+  const members: TopLevelScan["members"] = [];
+  const skipSpace = (from: number): number => {
+    let i = from;
+    while (i < text.length && " \t\n\r".includes(text.charAt(i))) i++;
+    return i;
+  };
+  const stringEnd = (from: number): number => {
+    let i = from + 1;
+    while (text.charAt(i) !== '"') i += text.charAt(i) === "\\" ? 2 : 1;
+    return i + 1;
+  };
+  let i = skipSpace(text.indexOf("{") + 1);
+  while (text.charAt(i) !== "}") {
+    if (text.charAt(i) === ",") i = skipSpace(i + 1);
+    const keyEnd = stringEnd(i);
+    const key = JSON.parse(text.slice(i, keyEnd)) as string;
+    i = skipSpace(skipSpace(keyEnd) + 1);
+    const start = i;
+    let depth = 0;
+    while (i < text.length) {
+      const c = text.charAt(i);
+      if (c === '"') {
+        i = stringEnd(i);
+        continue;
+      }
+      if (c === "{" || c === "[") depth++;
+      else if (c === "}" || c === "]") {
+        if (depth === 0) break;
+        depth--;
+      } else if (c === "," && depth === 0) break;
+      i++;
+    }
+    let end = i;
+    while (end > start && " \t\n\r".includes(text.charAt(end - 1))) end--;
+    members.push({ key, start, end });
+    i = skipSpace(i);
+  }
+  return { members, close: i };
+}
+
 // --- Publisher -----------------------------------------------------------------
 
 /** Options for {@link RedisPublisher.publish}. */
@@ -130,33 +701,57 @@ export interface PublishOptions {
   traceId?: string;
   /**
    * Out-of-band transport headers to carry beside the frozen envelope (ADR-0028) — e.g. a W3C
-   * `traceparent` written by `@babelqueue/core/otel`'s `publish`. A non-empty carrier RPUSHes a
-   * transport-owned frame; an empty/omitted carrier stays a byte-identical bare publish.
+   * `traceparent`. Legacy layout: a non-empty carrier RPUSHes a transport-owned frame; an
+   * empty/omitted carrier stays a byte-identical bare publish. **Zset layout: dropped** (ADR-0033
+   * A3) — the bare envelope is written and the `traceparent` is not propagated.
    */
   headers?: HeaderCarrier;
+  /**
+   * Deliver after `delay` seconds (`ZADD <q>:delayed floor(now)+ceil(delay)`, no `:notify` token).
+   * Requires `layout: "zset"`; the legacy layout throws {@link BabelQueueError}.
+   */
+  delay?: number;
 }
 
-/** Sends canonical-envelope messages to one Redis list (§1 reliable-queue). */
+/** Sends canonical-envelope messages to one Redis queue. */
 export class RedisPublisher {
-  private constructor(
-    private readonly client: RedisClient,
-    private readonly queue: string,
-  ) {}
+  private readonly transport: RedisQueue;
 
-  /** A publisher over `client`, producing to the list named `queue`. */
-  static create(client: RedisClient, queue: string): RedisPublisher {
-    return new RedisPublisher(client, queue);
+  private constructor(
+    client: RedisClient,
+    private readonly queue: string,
+    options: RedisQueueOptions,
+  ) {
+    this.transport = new RedisQueue(client, queue, options);
+  }
+
+  /** A publisher over `client`, producing to the queue named `queue`. */
+  static create(client: RedisClient, queue: string, options: RedisQueueOptions = {}): RedisPublisher {
+    return new RedisPublisher(client, queue, options);
   }
 
   /**
-   * Build + `RPUSH` the canonical envelope; returns the message id (`meta.id`). When
-   * `options.headers` carries any out-of-band header (e.g. a `traceparent`, ADR-0028) the value
-   * pushed is a transport-owned frame that wraps the envelope; otherwise the bare envelope is
-   * pushed byte-for-byte (GR-1, no regression).
+   * Build + push the canonical envelope; returns the message id (`meta.id`). Legacy layout: a
+   * non-empty `options.headers` pushes a transport-owned frame (ADR-0028), otherwise the bare
+   * envelope byte-for-byte. Zset layout: always the bare envelope (A3); with `options.delay > 0`
+   * it goes to `<q>:delayed` instead of the ready list.
    */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
+    const delay = options.delay ?? 0;
+    if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
+      throw new BabelQueueError(`Invalid delay ${String(delay)}: must be a non-negative number of seconds.`);
+    }
+    if (delay > 0 && this.transport.layout !== "zset") {
+      throw new BabelQueueError("A delayed publish requires layout \"zset\"; the legacy layout has no delayed set.");
+    }
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
-    await this.client.rpush(this.queue, frameValue(redisValue(envelope), options.headers));
+    const body = redisValue(envelope);
+    if (this.transport.layout === "zset") {
+      if (delay > 0) await this.transport.pushDelayed(body, delay);
+      else await this.transport.push(body);
+    } else {
+      await this.transport.push(frameValue(body, options.headers));
+    }
     return envelope.meta.id;
   }
 }
@@ -165,9 +760,9 @@ export class RedisPublisher {
 
 /**
  * A URN handler. Receives the validated envelope, the raw stored list element, and the out-of-band
- * {@link HeaderCarrier} carried beside it (empty for a bare value). Pass `headers` to
- * `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of the producer
- * span (ADR-0028).
+ * {@link HeaderCarrier} carried beside it (empty for a bare value and always empty in the zset
+ * layout). Pass `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a
+ * child of the producer span (ADR-0028).
  */
 export type BabelHandler = (envelope: Envelope, raw: string, headers: HeaderCarrier) => unknown | Promise<unknown>;
 
@@ -175,33 +770,39 @@ export type BabelHandler = (envelope: Envelope, raw: string, headers: HeaderCarr
 export type BabelHandlers = Record<string, BabelHandler>;
 
 /** Options for {@link RedisConsumer}. */
-export interface RedisConsumerOptions {
-  /** Suffix for the per-queue reservation list (default `":processing"`). */
-  processingSuffix?: string;
-  /** Block timeout (seconds) for a single reserve (default 5). */
+export interface RedisConsumerOptions extends RedisQueueOptions {
+  /**
+   * How long one {@link RedisConsumer.poll} waits for a message, in seconds (default 5). Legacy:
+   * a sleep-poll (100 ms, doubling, capped at 1 s). Zset: `BLPOP` on `:notify` in slices of at most
+   * 1 s, migrating between slices. `0` or less means one non-blocking attempt.
+   */
   blockTimeout?: number;
   /** Attempts before terminal dead-lettering (default 3). */
   maxTries?: number;
-  /** The dead-letter list (default `<queue>.dlq`); set to `null` to drop on terminal failure. */
-  deadLetterQueue?: string | null;
   /** Strategy for a URN with no handler (default `fail`). */
   unknownUrn?: string;
   /** Called for a non-conformant message, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, raw: string) => void;
 }
 
+const SLEEP_START_MS = 100;
+const SLEEP_CAP_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * Consumes a Redis list: reserve the head into `<queue>:processing` (`BRPOPLPUSH`), decode +
- * validate, route to the handler for its URN, then `LREM` it from the reservation list on success.
- * A throwing handler requeues the envelope with `attempts + 1` (at-least-once) up to `maxTries`,
- * then dead-letters to `<queue>.dlq`. Redis has no native delivery count, so `attempts` lives in
- * the body and the runtime owns retry.
+ * Consumes a Redis queue: reserve one message (legacy: `LMOVE` into `<queue>:processing` with a
+ * deadline; zset: the Laravel pop), decode + validate, route to the handler for its URN, then
+ * acknowledge. A throwing handler gives the message back with `attempts + 1` (at-least-once) up to
+ * `maxTries`, then dead-letters to `<queue>.dlq`. Redis has no native delivery count, so `attempts`
+ * lives in the body and the runtime owns retry.
  */
 export class RedisConsumer {
-  private readonly processing: string;
+  private readonly transport: RedisQueue;
   private readonly blockTimeout: number;
   private readonly maxTries: number;
-  private readonly dlq: string | null;
   private readonly unknownUrn: string;
 
   constructor(
@@ -210,19 +811,37 @@ export class RedisConsumer {
     private readonly handlers: BabelHandlers,
     private readonly options: RedisConsumerOptions = {},
   ) {
-    this.processing = queue + (options.processingSuffix ?? ":processing");
+    this.transport = new RedisQueue(client, queue, options);
     this.blockTimeout = options.blockTimeout ?? 5;
     this.maxTries = options.maxTries ?? 3;
-    this.dlq = options.deadLetterQueue === undefined ? `${queue}.dlq` : options.deadLetterQueue;
     this.unknownUrn = options.unknownUrn ?? UnknownUrnStrategy.FAIL;
+  }
+
+  /** The underlying transport (for diagnostics and tests). */
+  get redisQueue(): RedisQueue {
+    return this.transport;
   }
 
   /** Reserve + route + settle one message. Returns true if one was handled, false on timeout. */
   async poll(): Promise<boolean> {
-    const raw = await this.client.brpoplpush(this.queue, this.processing, this.blockTimeout);
-    if (raw == null) return false;
-    await this.handle(raw);
-    return true;
+    const startedAt = Date.now();
+    let wait = SLEEP_START_MS;
+    for (;;) {
+      const result = await this.transport.reserve();
+      if (result.outcome !== "empty") {
+        await this.dispatch(result);
+        return true;
+      }
+      const remainingMs = this.blockTimeout * 1000 - (Date.now() - startedAt);
+      if (remainingMs <= 0) return false;
+      if (this.transport.layout === "zset") {
+        // Wake on a :notify token; migrate again after at most one second (ADR-0033).
+        await this.client.blpop(this.transport.keys.notify, Math.min(1, remainingMs / 1000));
+      } else {
+        await sleep(Math.min(wait, remainingMs));
+        wait = Math.min(wait * 2, SLEEP_CAP_MS);
+      }
+    }
   }
 
   /** Poll while `shouldContinue` returns true. */
@@ -232,22 +851,32 @@ export class RedisConsumer {
     }
   }
 
+  private async dispatch(result: ReserveResult): Promise<void> {
+    const reservation = result.reservation as Reservation;
+    if (result.outcome === "poison") {
+      // Undecodable body or non-numeric attempts (A1): dead-letter the raw value, leave no residue.
+      this.report(new BabelQueueError("Rejected an undecodable BabelQueue message from Redis."), null, reservation.raw);
+      await this.transport.deadLetter(reservation);
+      return;
+    }
+    await this.handle(reservation);
+  }
+
   /**
-   * Route + settle one reserved element. Exposed for testing.
+   * Route + settle one reserved message. Exposed for testing.
    *
-   * `raw` is the **stored** list value (the `LREM` ack handle); it may be a transport-owned header
-   * frame or a bare envelope. It is unframed first so the envelope is decoded from the verbatim
-   * wire body while the carried out-of-band headers (e.g. a `traceparent`, ADR-0028) are surfaced
-   * to the handler. Settling/dead-lettering still operate on the original stored value.
+   * Legacy layout: `reservation.raw` may be a transport-owned header frame or a bare envelope; it is
+   * unframed first so the envelope is decoded from the verbatim wire body while the carried headers
+   * (e.g. a `traceparent`, ADR-0028) reach the handler. The zset layout is never framed (A3).
    */
-  async handle(raw: string): Promise<void> {
-    const [body, headers] = unframe(raw);
+  async handle(reservation: Reservation): Promise<void> {
+    const raw = reservation.raw;
+    const [body, headers] = reservation.layout === "legacy" ? unframe(raw) : [raw, {} as HeaderCarrier];
     const decoded = EnvelopeCodec.decode(body);
 
     if (!EnvelopeCodec.accepts(decoded)) {
       this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis."), decoded, raw);
-      await this.deadLetterRaw(raw);
-      await this.settle(raw);
+      await this.transport.deadLetter(reservation);
       return;
     }
 
@@ -255,74 +884,66 @@ export class RedisConsumer {
     const urn = EnvelopeCodec.urn(envelope);
     const handler = this.handlers[urn];
     if (!handler) {
-      await this.onUnknownUrn(envelope, urn, raw);
+      await this.onUnknownUrn(envelope, urn, reservation);
       return;
     }
 
     try {
       await handler(envelope, raw, headers);
-      await this.settle(raw);
     } catch (error) {
       this.report(error, envelope, raw);
-      await this.retryOrDeadLetter(envelope, raw, error);
+      await this.retryOrDeadLetter(envelope, reservation, error);
+      return;
     }
+    await this.transport.ack(reservation);
   }
 
-  private async onUnknownUrn(envelope: Envelope, urn: string, raw: string): Promise<void> {
+  private async onUnknownUrn(envelope: Envelope, urn: string, reservation: Reservation): Promise<void> {
     switch (this.unknownUrn) {
       case UnknownUrnStrategy.DELETE:
-        await this.settle(raw);
+        await this.transport.ack(reservation);
         return;
       case UnknownUrnStrategy.DEAD_LETTER:
-        await this.deadLetter(envelope, "unknown_urn");
-        await this.settle(raw);
+        await this.deadLetter(envelope, reservation, "unknown_urn");
         return;
       case UnknownUrnStrategy.RELEASE:
-        await this.requeue(envelope);
-        await this.settle(raw);
+        await this.requeue(envelope, reservation);
         return;
       default: {
-        // FAIL: surface and leave the element in the reservation list (recoverable).
+        // FAIL: surface and leave the reservation in place (recoverable after retryAfter).
         const error = new UnknownUrnError(urn);
-        this.report(error, envelope, raw);
+        this.report(error, envelope, reservation.raw);
         throw error;
       }
     }
   }
 
-  private async retryOrDeadLetter(envelope: Envelope, raw: string, error: unknown): Promise<void> {
+  private async retryOrDeadLetter(envelope: Envelope, reservation: Reservation, error: unknown): Promise<void> {
     if ((envelope.attempts ?? 0) + 1 < this.maxTries) {
-      await this.requeue(envelope);
+      await this.requeue(envelope, reservation);
     } else {
-      await this.deadLetter(envelope, "failed", error);
+      await this.deadLetter(envelope, reservation, "failed", error);
     }
-    await this.settle(raw);
   }
 
-  /** Republish with `attempts + 1` onto the work list (at-least-once retry). */
-  private async requeue(envelope: Envelope): Promise<void> {
+  /** Give the message back with `attempts + 1` (at-least-once retry). */
+  private async requeue(envelope: Envelope, reservation: Reservation): Promise<void> {
+    if (reservation.layout === "zset") {
+      // Default body: the raw message with only `attempts` raised, unknown keys preserved.
+      await this.transport.release(reservation, 0);
+      return;
+    }
     const bumped: Envelope = { ...envelope, attempts: (envelope.attempts ?? 0) + 1 };
-    await this.client.rpush(this.queue, redisValue(bumped));
+    await this.transport.release(reservation, 0, redisValue(bumped));
   }
 
-  private async deadLetter(envelope: Envelope, reason: string, error?: unknown): Promise<void> {
-    if (!this.dlq) return; // dead-lettering disabled → drop
+  private async deadLetter(envelope: Envelope, reservation: Reservation, reason: string, error?: unknown): Promise<void> {
     const annotated = annotate(envelope, reason, envelope.meta?.queue ?? this.queue, {
       attempts: envelope.attempts ?? 0,
       error: error instanceof Error ? error.message : null,
       exception: error instanceof Error ? error.name : null,
     });
-    await this.client.rpush(this.dlq, redisValue(annotated));
-  }
-
-  private async deadLetterRaw(raw: string): Promise<void> {
-    if (!this.dlq) return;
-    await this.client.rpush(this.dlq, raw);
-  }
-
-  /** Remove the element from the reservation list (acknowledge). */
-  private async settle(raw: string): Promise<void> {
-    await this.client.lrem(this.processing, 1, raw);
+    await this.transport.deadLetter(reservation, redisValue(annotated));
   }
 
   private report(error: unknown, envelope: IncomingEnvelope | null, raw: string): void {

@@ -82,9 +82,17 @@ redelivered and the `RedrivePolicy` below moves it to the DLQ.
 >
 > ```ts
 > new SqsConsumer(sqs, url, handlers, {
->   releaseDelay: (attempts) => Math.min(2 ** attempts * 5, 900),
+>   retryBackoff: 5, // seconds
+>   retryBackoffMultiplier: 2,
+>   retryBackoffMax: 900,
+>   retryJitter: 'full', // optional: uniform(0, d(n))
 > });
 > ```
+>
+> The shared A9 options compute `d(n) = min(max, base * multiplier^(n-1))` with
+> `n = ApproximateReceiveCount`. `releaseDelay` (a number or a function of `attempts`) is the
+> SQS-specific alias and wins when both are set. Either way the visibility timeout is clamped to
+> `0…43200`. Needs `@babelqueue/core` ≥ 1.13.0.
 
 An unmapped URN follows `unknownUrn`: `fail` (report, leave), `delete`, `release`
 (`ChangeMessageVisibility` after `unknownUrnReleaseDelay`, default `0`) or
