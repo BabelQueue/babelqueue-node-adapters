@@ -14,7 +14,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 > resolve the core range.
 
 ### Added
-- **A9 retry backoff options** (ADR-0034 §9): `retryBackoff`, `retryBackoffMultiplier`,
+- **Retry backoff options** (ADR-0034 §9): `retryBackoff`, `retryBackoffMultiplier`,
   `retryBackoffMax` and `retryJitter` (`none` | `full`) on `SqsConsumerOptions`. A failed handler
   is released with `ChangeMessageVisibility` after `d(n) = min(max, base * multiplier^(n-1))`
   seconds, `n = ApproximateReceiveCount`; the result is still clamped to `0...43200`. Invalid

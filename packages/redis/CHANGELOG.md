@@ -11,8 +11,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Added
 - **Laravel-compatible `zset` layout (ADR-0033, opt-in via `layout: "zset"`).** Keys
-  `queues:<q>`, `:delayed`, `:reserved`, `:notify`; Laravel's reserve Lua (poison-safe, A1),
-  atomic release (A2), `retry_after` recovery, and native delayed publish (`publish({ delay })`).
+  `queues:<q>`, `:delayed`, `:reserved`, `:notify`; Laravel's reserve Lua (poison-safe, ADR-0033 §3),
+  atomic release (ADR-0033 §4), `retry_after` recovery, and native delayed publish (`publish({ delay })`).
   Migrate runs before every pop (`migrationBatchSize`), blocking pop is `BLPOP :notify`.
 - **`retryAfter` for the legacy layout.** Reservations carry a deadline in
   `<queue>:processing:deadlines` (`<32 hex token>:<raw>`, `crypto.randomBytes`); a sweep before every
@@ -28,14 +28,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `blpop` and `eval`; `RedisConsumer.handle` takes a `Reservation` instead of a raw string. An
   `ioredis` instance still satisfies the interface.
 - `blockTimeout` of 0 or less is a single non-blocking attempt.
-- Zset layout drops headers: no `__bq_frame`, `traceparent` is not carried (A3). The legacy layout
+- Zset layout drops headers: no `__bq_frame`, `traceparent` is not carried (ADR-0033 §5). The legacy layout
   is unchanged and remains the default.
 
 ### Fixed
 - **Zset reserve no longer loses a message whose body cannot be re-encoded.** `lua-cjson` decodes
   `1e999` / `NaN` / `Infinity` but refuses to encode them; the unguarded `cjson.encode` raised after
   the `LPOP` and dropped the already-popped message. The encode is now `pcall`-guarded and such a body
-  takes the A1 poison path (forwarded byte-identical to the dead-letter list, no `:reserved` residue).
+  takes the poison path (forwarded byte-identical to the dead-letter list, no `:reserved` residue).
 - The reserve script returns an explicit poison flag as a third element; the client no longer infers
   poison from `reserved === job` (a two-element reply from a test double still falls back to that).
 - **Zset release keeps every other byte of the body.** The released body is built by splicing only
