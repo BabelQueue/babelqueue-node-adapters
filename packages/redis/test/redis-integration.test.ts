@@ -22,6 +22,7 @@ import {
   type BabelHandlers,
   type RedisQueueOptions,
 } from "../src/index.js";
+import { assertPoisonRecord } from "./poison-assert.js";
 import { asClient, cleanup, sleep, tryConnect, uniqueQueue } from "./redis-live.js";
 
 const URN = "urn:babel:orders:created";
@@ -103,7 +104,9 @@ live("zset: undecodable bodies and non-numeric attempts are dead-lettered with n
   for (let i = 0; i < poison.length; i++) assert.equal(await consumer.poll(), true);
 
   assert.equal(errors.length, poison.length);
-  assert.deepEqual(await client.lrange(`${name}.dlq`, 0, -1), poison);
+  const dlq = await client.lrange(`${name}.dlq`, 0, -1);
+  assert.equal(dlq.length, poison.length);
+  poison.forEach((body, i) => assertPoisonRecord(dlq[i]!, body, name));
   assert.equal(await client.zcard(keys.reserved), 0, "no residue in :reserved");
   assert.equal(await client.llen(keys.ready), 0);
 });
@@ -124,7 +127,9 @@ live("zset: bodies that cjson decodes but cannot re-encode are dead-lettered, ne
   for (let i = 0; i < poison.length; i++) assert.equal(await consumer.poll(), true);
 
   assert.equal(errors.length, poison.length);
-  assert.deepEqual(await client.lrange(`${name}.dlq`, 0, -1), poison, "forwarded byte-identical, none lost");
+  const dlq = await client.lrange(`${name}.dlq`, 0, -1);
+  assert.equal(dlq.length, poison.length, "none lost");
+  poison.forEach((body, i) => assertPoisonRecord(dlq[i]!, body, name)); // spliced: every original byte kept
   assert.equal(await client.zcard(keys.reserved), 0, "no residue in :reserved");
   assert.equal(await client.llen(keys.ready), 0);
 });

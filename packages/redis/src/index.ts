@@ -45,6 +45,7 @@ import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnSt
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
+import { buildPoisonRecord } from "./poison-record.js";
 
 // --- Minimal Redis shape (a structural subset of ioredis) ----------------------
 
@@ -59,6 +60,15 @@ export interface RedisClient {
   blpop(key: string, timeout: number): Promise<[string, string] | null>;
   /** Run a Lua script with `numKeys` keys followed by the arguments. */
   eval(script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>;
+  /**
+   * The binary-safe twin of {@link RedisClient.eval} (ioredis `evalBuffer`): string replies come back as
+   * `Buffer`s and `Buffer` arguments are sent byte for byte. Optional for publishing, but required to consume
+   * ({@link RedisQueue.reserve} / {@link RedisConsumer} throw without it): the reserve scripts and the settle
+   * scripts of a body that is not valid UTF-8 use it so the exact stored bytes survive. Invalid UTF-8 is poison
+   * and a poison record never carries a U+FFFD substitution (broker-bindings.md section 1.1, ADR-0035 section 1),
+   * which a string-only `eval` cannot honour.
+   */
+  evalBuffer?(script: string, numKeys: number, ...args: Array<string | number | Buffer>): Promise<unknown>;
 }
 
 // --- Payload (contract §1) -----------------------------------------------------
@@ -336,6 +346,11 @@ export interface LegacyReservation {
   layout: "legacy";
   raw: string;
   token: string;
+  /**
+   * The exact stored bytes, set only when they are not valid UTF-8 (so `raw` carries U+FFFD substitutions).
+   * The settle scripts and the poison record use these, never the lossy `raw`.
+   */
+  rawBytes?: Buffer;
 }
 
 /** A zset reservation: the raw body (what the handler sees) and the exact `:reserved` member. */
@@ -343,6 +358,9 @@ export interface ZsetReservation {
   layout: "zset";
   raw: string;
   reserved: string;
+  /** The exact stored bytes of the job / `:reserved` member, set only when they are not valid UTF-8. */
+  rawBytes?: Buffer;
+  reservedBytes?: Buffer;
   /**
    * Set when the reserve script flagged the body as poison (undecodable, or `attempts` not a
    * number): its dead-letter is then unconditional, not gated on the `ZREM`.
@@ -362,6 +380,26 @@ export interface ReserveResult {
   reservation?: Reservation;
   /** Zset only: the delivery count the handler is told (`job.attempts + 1`); absent on poison. */
   attempts?: number;
+}
+
+/**
+ * A reply value as `[text, bytes]`. `bytes` is set only when the value is a `Buffer` that is not valid UTF-8,
+ * i.e. when `text` would carry U+FFFD substitutions; valid UTF-8 needs no side copy.
+ */
+function readValue(value: unknown): [string, Buffer | undefined] {
+  if (!Buffer.isBuffer(value)) return [String(value), undefined];
+  const text = value.toString("utf8");
+  return [text, Buffer.from(text, "utf8").equals(value) ? undefined : value];
+}
+
+/** The exact stored bytes of a reservation's value, as the settle scripts must compare them. */
+function storedValue(reservation: Reservation): string | Buffer {
+  return reservation.rawBytes ?? reservation.raw;
+}
+
+/** The exact `:reserved` member of a zset reservation. */
+function zsetMember(reservation: ZsetReservation): string | Buffer {
+  return reservation.reservedBytes ?? reservation.reserved;
 }
 
 /** A fresh 128-bit reservation token: 32 lowercase hex characters from the OS CSPRNG. */
@@ -416,8 +454,14 @@ export class RedisQueue {
     this.deadlinesKey = `${this.processingKey}:deadlines`;
   }
 
-  private run(script: string, keys: string[], args: Array<string | number>): Promise<unknown> {
-    return this.client.eval(script, keys.length, ...keys, ...args);
+  /**
+   * Run a script. `binary` (or any `Buffer` argument) selects the client's `evalBuffer`, when it has one,
+   * so replies and arguments are exact bytes.
+   */
+  private run(script: string, keys: string[], args: Array<string | number | Buffer>, binary = false): Promise<unknown> {
+    const useBuffer = (binary || args.some((a) => Buffer.isBuffer(a))) && this.client.evalBuffer !== undefined;
+    if (useBuffer) return this.client.evalBuffer!(script, keys.length, ...keys, ...args);
+    return this.client.eval(script, keys.length, ...keys, ...(args as Array<string | number>));
   }
 
   private nowSeconds(): number {
@@ -486,19 +530,30 @@ export class RedisQueue {
 
   /** One non-blocking reserve, preceded by the layout's migrate / sweep. */
   async reserve(): Promise<ReserveResult> {
+    // Checked before anything is popped, so nothing is lost: a string-only client would turn invalid UTF-8
+    // into U+FFFD and hand a lossy body to a handler, which broker-bindings.md section 1.1 forbids.
+    if (this.client.evalBuffer === undefined) {
+      throw new BabelQueueError(
+        "The Redis client must provide evalBuffer (ioredis does) to consume: invalid UTF-8 is poison and its exact bytes must be read (broker-bindings.md section 1.1).",
+      );
+    }
     await this.maintain();
     return this.layout === "zset" ? this.reserveZset() : this.reserveLegacy();
   }
 
   private async reserveLegacy(): Promise<ReserveResult> {
     const token = newReservationToken();
-    const raw = await this.run(
+    const reply = await this.run(
       LUA.legacyReserve,
       [this.queue, this.processingKey, this.deadlinesKey],
       [this.deadlineScore(), token],
+      true,
     );
-    if (typeof raw !== "string") return { outcome: "empty" };
-    return { outcome: "delivered", raw, reservation: { layout: "legacy", raw, token } };
+    if (typeof reply !== "string" && !Buffer.isBuffer(reply)) return { outcome: "empty" };
+    const [raw, rawBytes] = readValue(reply);
+    const reservation: LegacyReservation = { layout: "legacy", raw, token };
+    if (rawBytes) reservation.rawBytes = rawBytes;
+    return { outcome: "delivered", raw, reservation };
   }
 
   private async reserveZset(): Promise<ReserveResult> {
@@ -506,14 +561,17 @@ export class RedisQueue {
       LUA.zsetReserve,
       [this.keys.ready, this.keys.reserved, this.keys.notify],
       [this.deadlineScore()],
+      true,
     );
     if (!Array.isArray(reply) || reply.length < 2) return { outcome: "empty" };
-    const raw = String(reply[0]);
-    const reserved = String(reply[1]);
+    const [raw, rawBytes] = readValue(reply[0]);
+    const [reserved, reservedBytes] = readValue(reply[1]);
     const reservation: ZsetReservation = { layout: "zset", raw, reserved };
+    if (rawBytes) reservation.rawBytes = rawBytes;
+    if (reservedBytes) reservation.reservedBytes = reservedBytes;
     // The script's third element is the authoritative poison flag; a two-element reply (a test
     // double) falls back to the `reserved == job` signal.
-    const poison = reply.length >= 3 ? String(reply[2]) === "1" : raw === reserved;
+    const poison = reply.length >= 3 ? readValue(reply[2])[0] === "1" : raw === reserved;
     if (poison) return { outcome: "poison", raw, reservation: { ...reservation, poison: true } };
     return { outcome: "delivered", raw, reservation, attempts: attemptsOf(raw) + 1 };
   }
@@ -521,9 +579,9 @@ export class RedisQueue {
   /** Acknowledge. Legacy: false (plus a warning) if the reservation had already expired. */
   async ack(reservation: Reservation): Promise<boolean> {
     if (reservation.layout === "zset") {
-      return Number(await this.run(LUA.zsetAck, [this.keys.reserved], [reservation.reserved])) === 1;
+      return Number(await this.run(LUA.zsetAck, [this.keys.reserved], [zsetMember(reservation)])) === 1;
     }
-    const live = await this.run(LUA.legacyAck, [this.processingKey, this.deadlinesKey], [reservation.token, reservation.raw]);
+    const live = await this.run(LUA.legacyAck, [this.processingKey, this.deadlinesKey], [reservation.token, storedValue(reservation)]);
     return this.liveOrWarn(live, reservation);
   }
 
@@ -542,14 +600,14 @@ export class RedisQueue {
       await this.run(
         LUA.zsetRelease,
         [this.keys.delayed, this.keys.reserved],
-        [reservation.reserved, this.nowSeconds() + Math.ceil(delay), bumped],
+        [zsetMember(reservation), this.nowSeconds() + Math.ceil(delay), bumped],
       );
       return true;
     }
     const live = await this.run(
       LUA.legacyRelease,
       [this.queue, this.processingKey, this.deadlinesKey],
-      [reservation.token, reservation.raw, body ?? reservation.raw],
+      [reservation.token, storedValue(reservation), body ?? storedValue(reservation)],
     );
     return this.liveOrWarn(live, reservation);
   }
@@ -564,7 +622,7 @@ export class RedisQueue {
       await this.run(
         LUA.zsetDeadLetterPoison,
         [this.keys.reserved, this.deadLetterKey],
-        [reservation.reserved, payload],
+        [zsetMember(reservation), payload],
       );
       return true;
     }
@@ -572,7 +630,7 @@ export class RedisQueue {
       const settled = await this.run(
         LUA.zsetDeadLetter,
         [this.keys.reserved, this.deadLetterKey],
-        [reservation.reserved, payload],
+        [zsetMember(reservation), payload],
       );
       if (Number(settled) === 1) return true;
       this.warn(
@@ -583,7 +641,7 @@ export class RedisQueue {
     const live = await this.run(
       LUA.legacyDeadLetter,
       [this.processingKey, this.deadlinesKey, this.deadLetterKey],
-      [reservation.token, reservation.raw, payload],
+      [reservation.token, storedValue(reservation), payload],
     );
     return this.liveOrWarn(live, reservation);
   }
@@ -853,10 +911,14 @@ export class RedisConsumer {
 
   private async dispatch(result: ReserveResult): Promise<void> {
     const reservation = result.reservation as Reservation;
-    if (result.outcome === "poison") {
-      // Undecodable body or non-numeric attempts (A1): dead-letter the raw value, leave no residue.
-      this.report(new BabelQueueError("Rejected an undecodable BabelQueue message from Redis."), null, reservation.raw);
-      await this.transport.deadLetter(reservation);
+    // `rawBytes` is only set for a stored value that is not valid UTF-8: poison even when cjson could decode it
+    // (broker-bindings section 1.1, "Invalid UTF-8"). It is never delivered, retried or re-published.
+    if (result.outcome === "poison" || reservation.rawBytes !== undefined) {
+      // Undecodable body, non-numeric attempts (A1) or invalid UTF-8: dead-letter it as a poison record
+      // (ADR-0035) and leave no residue.
+      const error = new BabelQueueError("Rejected an undecodable BabelQueue message from Redis.");
+      this.report(error, null, reservation.raw);
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
       return;
     }
     await this.handle(reservation);
@@ -871,12 +933,20 @@ export class RedisConsumer {
    */
   async handle(reservation: Reservation): Promise<void> {
     const raw = reservation.raw;
+    if (reservation.rawBytes !== undefined) {
+      // Invalid UTF-8 is poison (broker-bindings section 1.1): never decoded, handled or re-published.
+      const error = new BabelQueueError("Rejected a non-UTF-8 BabelQueue message from Redis.");
+      this.report(error, null, raw);
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
+      return;
+    }
     const [body, headers] = reservation.layout === "legacy" ? unframe(raw) : [raw, {} as HeaderCarrier];
     const decoded = EnvelopeCodec.decode(body);
 
     if (!EnvelopeCodec.accepts(decoded)) {
-      this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis."), decoded, raw);
-      await this.transport.deadLetter(reservation);
+      const error = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis.");
+      this.report(error, decoded, raw);
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
       return;
     }
 
@@ -944,6 +1014,27 @@ export class RedisConsumer {
       exception: error instanceof Error ? error.name : null,
     });
     await this.transport.deadLetter(reservation, redisValue(annotated));
+  }
+
+  /**
+   * The poison DLQ record of a reservation (ADR-0035, broker-bindings section 1.1): the delivered body (a legacy
+   * header frame is unwrapped first) with a `dead_letter` block of reason `poison`. A strict JSON object is
+   * spliced, anything else is wrapped as `{"raw", "dead_letter"}`.
+   *
+   * A body that is not valid UTF-8 is read as exact bytes (`evalBuffer`, see {@link RedisClient.evalBuffer}) and
+   * kept as stored (no frame is peeled off it), so it lands in the base64 wrapper, never as U+FFFD text.
+   */
+  private poisonRecord(reservation: Reservation, cause: BabelQueueError): string {
+    const exact = reservation.rawBytes;
+    const [body] = exact !== undefined || reservation.layout !== "legacy" ? [reservation.raw] : unframe(reservation.raw);
+    const counted = attemptsOf(body);
+    const attempts = Number.isSafeInteger(counted) && counted >= 0 ? counted : 0;
+    const deadLetter = annotate({ attempts } as unknown as Envelope, "poison", this.queue, {
+      attempts,
+      error: cause.message,
+      exception: cause.name,
+    }).dead_letter;
+    return buildPoisonRecord(exact ?? Buffer.from(body, "utf8"), JSON.stringify(deadLetter));
   }
 
   private report(error: unknown, envelope: IncomingEnvelope | null, raw: string): void {

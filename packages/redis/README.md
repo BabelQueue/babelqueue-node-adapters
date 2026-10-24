@@ -24,7 +24,9 @@ npm install @babelqueue/redis ioredis
 ```
 
 `ioredis` is an optional peer — you provide the client; an `ioredis` instance satisfies the
-adapter structurally.
+adapter structurally. Consuming also needs `evalBuffer` (Lua eval returning raw `Buffer`s, so a
+non-UTF-8 body can be detected as poison); without it `reserve()` throws. A non-`ioredis` client
+must provide it.
 
 ## Produce
 

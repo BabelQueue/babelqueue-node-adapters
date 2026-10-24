@@ -8,6 +8,7 @@ import { BabelQueueError, EnvelopeCodec, UnknownUrnStrategy } from "@babelqueue/
 
 import { ConformanceResults } from "../../../test-support/results.js";
 import { envelopeViolation, resolveIdentity } from "../src/envelope-shape.js";
+import { buildPoisonRecord } from "../src/poison-record.js";
 import {
   DEFAULT_RETRY_TIERS_MS,
   KafkaConsumer,
@@ -31,6 +32,7 @@ const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as
   kafka: KafkaBlock;
   backoff: BackoffBlock;
   kafka_poison: { cases: PoisonCase[] };
+  poison_dlq: { original_queue: string; cases: PoisonDlqCase[] };
 };
 const kafka = manifest.kafka;
 const results = new ConformanceResults(packageRoot, "kafka", ["kafka"]);
@@ -78,6 +80,18 @@ interface PoisonCase {
   name: string;
   body: string;
   expect: "ok" | "no_identity" | "poison";
+}
+
+interface PoisonDlqCase {
+  name: string;
+  body?: string;
+  body_base64?: string;
+  expect: {
+    shape: "splice" | "wrapper" | "splice_or_wrapper";
+    record: Record<string, unknown>;
+    splice_literals?: string[];
+    splice_keys?: string[];
+  };
 }
 
 const URN = "urn:babel:orders:created";
@@ -361,4 +375,80 @@ test("kafka conformance: kafka_poison cases classify and settle with the verdict
 test("kafka conformance: kafka_poison last duplicate top-level key wins", () => {
   assert.equal(verdictOf('{"job":5,"job":"urn:x"}'), "ok");
   assert.equal(verdictOf('{"job":"urn:x","job":5}'), "no_identity");
+});
+
+// --- poison_dlq: the DLQ record shape of a poison body (ADR-0035) ----------------------------------------------
+
+/** Distinct top-level member names of a JSON object text (a repeated name counts once). */
+function topLevelNames(text: string): string[] {
+  const names = new Set<string>();
+  let depth = 0;
+  let expectKey = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "{" || c === "[") {
+      depth++;
+      expectKey = c === "{" && depth === 1;
+    } else if (c === "}" || c === "]") {
+      depth--;
+    } else if (c === ",") {
+      expectKey = depth === 1;
+    } else if (c === '"') {
+      let j = i + 1;
+      while (text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      if (depth === 1 && expectKey) {
+        names.add(JSON.parse(text.slice(i, j + 1)) as string);
+        expectKey = false;
+      }
+      i = j;
+    }
+  }
+  return [...names];
+}
+
+test("kafka conformance: poison_dlq records have the ADR-0035 shape", async () => {
+  const section = manifest.poison_dlq;
+  assert.ok(section.cases.length > 0);
+  for (const [index, c] of section.cases.entries()) {
+    await results.run("poison_dlq", ConformanceResults.caseId("poison_dlq", c, index), () => {
+      const body = c.body_base64 !== undefined ? Buffer.from(c.body_base64, "base64") : Buffer.from(c.body ?? "", "utf8");
+      const deadLetter = { reason: "poison", error: "e", exception: "BabelQueueError", failed_at: 1, original_queue: section.original_queue, attempts: 0, lang: "node" };
+      const record = buildPoisonRecord(body, JSON.stringify(deadLetter));
+
+      const parsed = JSON.parse(record) as Record<string, unknown>;
+      assert.deepEqual(parsed.dead_letter, deadLetter, c.name);
+      const rest = { ...parsed };
+      delete rest.dead_letter;
+      const { shape, record: expected } = c.expect;
+      const wrapperMatches = ((): boolean => {
+        try {
+          assert.deepEqual(rest, expected);
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      if (shape === "wrapper" || (shape === "splice_or_wrapper" && wrapperMatches && "raw" in rest)) {
+        assert.deepEqual(rest, expected, c.name);
+        return;
+      }
+      // splice: the record is the original bytes plus the dead_letter member
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+      assert.equal("raw" in parsed || "raw_encoding" in parsed, false, c.name);
+      if (shape === "splice") assert.deepEqual(rest, expected, c.name);
+      for (const literal of c.expect.splice_literals ?? []) {
+        assert.ok(record.includes(literal), `${c.name}: missing literal ${literal}`);
+      }
+      if (c.expect.splice_keys !== undefined) {
+        assert.deepEqual(topLevelNames(record).filter((k) => k !== "dead_letter").sort(), [...c.expect.splice_keys].sort(), c.name);
+      }
+      assert.ok(record.startsWith(text.trim().slice(0, -1).trimEnd()), c.name);
+    });
+  }
+});
+
+test("kafka conformance: poison_dlq invalid UTF-8 is base64 with raw_encoding", () => {
+  const cases = manifest.poison_dlq.cases.filter((c) => c.body_base64 !== undefined && "raw_encoding" in c.expect.record);
+  assert.ok(cases.length > 0);
+  for (const c of cases) assert.equal(c.expect.record["raw_encoding"], "base64", c.name);
 });

@@ -32,6 +32,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Changed
 
+- Local `poison-record.ts` copy: the `dead_letter` argument is now validated as a single JSON object and rejected otherwise. Removed the unused `isLossyNumberToken`. Kept in sync with `@babelqueue/core` until the dependency is bumped.
+- **Poison DLQ record shape follows ADR-0035:** a strict JSON object body is spliced byte for byte with a
+  `dead_letter` member (nothing re-encoded, so `1e400`, 64-bit integers and repeated names survive); anything else is
+  wrapped as `{"raw", "raw_encoding"?, "dead_letter"}`, with invalid UTF-8 carried as base64 +
+  `raw_encoding: "base64"` instead of U+FFFD. A body that already has a top-level `dead_letter` is now wrapped
+  rather than having it replaced. The conformance `poison_dlq` section runs against the writer.
 - The poison decision is read from the vendored conformance `kafka_poison` section; the hand-kept
   `test/poison-trigger-set.json` is removed.
 - Retry delay stays the tier's (`retryBackoff*` does not apply on Kafka, ADR-0034 §9).

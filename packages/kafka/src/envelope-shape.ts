@@ -272,36 +272,6 @@ export function envelopeViolation(raw: string): string | null {
   return new Scanner(raw).check();
 }
 
-/**
- * Normal form of a decimal number token: sign, significant digits without leading/trailing zeros, and a decimal
- * exponent, so `1.0`, `1e0` and `10e-1` compare equal. Zero is `0`.
- */
-function normalizedDecimal(token: string): string {
-  const m = /^(-?)([0-9]+)(?:\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$/.exec(token);
-  if (!m) return token;
-  const fraction = m[3] ?? "";
-  let digits = (m[2]! + fraction).replace(/^0+/, "");
-  if (digits === "") return "0";
-  let exponent = Number(m[4] ?? "0") - fraction.length;
-  const trimmed = digits.replace(/0+$/, "");
-  exponent += digits.length - trimmed.length;
-  digits = trimmed;
-  return `${m[1]}${digits}e${exponent}`;
-}
-
-/**
- * True when a JSON number token cannot be carried by a JS double without changing its value: it is not finite
- * once parsed, or the decimal value of the token differs from the decimal value of the double it becomes (an
- * integer beyond 2^53, `9007199254740993.0`, `9007199254740993e0`, `1.2345678901234567890123`). A literal that
- * merely changes spelling (`1.0` -> `1`, `1e2` -> `100`) is not lossy.
- */
-export function isLossyNumberToken(token: string): boolean {
-  const n = Number(token);
-  if (!Number.isFinite(n)) return true;
-  if (/^-?[0-9]+$/.test(token) && Number.isSafeInteger(n)) return false;
-  return normalizedDecimal(token) !== normalizedDecimal(String(n));
-}
-
 const ASCII_BLANK = /^[ \t\n\v\f\r]*$/;
 const ASCII_EDGE = /^[ \t\n\v\f\r]+|[ \t\n\v\f\r]+$/g;
 

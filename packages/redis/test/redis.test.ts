@@ -8,11 +8,14 @@ import {
   RedisConsumer,
   RedisPublisher,
   RedisQueue,
+  frameValue,
   redisValue,
   type BabelHandlers,
+  type RedisClient,
   type Reservation,
 } from "../src/index.js";
 import { FakeRedis } from "./fake-redis.js";
+import { assertPoisonRecord } from "./poison-assert.js";
 
 const TOKEN = "0123456789abcdef0123456789abcdef";
 
@@ -101,7 +104,7 @@ test("a terminal failure dead-letters to <queue>.dlq with a dead_letter block", 
   assert.equal((EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope).dead_letter!.reason, "failed");
 });
 
-test("a non-conformant message is forwarded raw to the DLQ and acked", async () => {
+test("a non-conformant message is dead-lettered as an ADR-0035 poison record and acked", async () => {
   const client = new FakeRedis();
   let reported: unknown;
 
@@ -109,8 +112,140 @@ test("a non-conformant message is forwarded raw to the DLQ and acked", async () 
 
   assert.ok(reported);
   const dlq = client.called("legacyDeadLetter");
-  assert.equal(dlq[0]!.args[2], "not-json");
+  assert.equal(dlq.length, 1);
+  assert.equal(dlq[0]!.args[1], "not-json", "the reservation is still released by its exact raw value");
+  assertPoisonRecord(dlq[0]!.args[2]!, "not-json", "orders");
 });
+
+test("a strict JSON object that is not an envelope is spliced, every original byte kept", async () => {
+  const client = new FakeRedis();
+  const body = '{"data":{"n":9007199254740993,"big":1e400},"x":1}';
+
+  await new RedisConsumer(client, "orders", {}).handle(legacy(body));
+
+  const record = client.called("legacyDeadLetter")[0]!.args[2]!;
+  assertPoisonRecord(record, body, "orders");
+  assert.ok(record.startsWith(body.slice(0, -1)), "spliced after the last original byte");
+  assert.ok(record.includes("9007199254740993") && record.includes("1e400"));
+});
+
+test("a poison body wrapped in a legacy header frame is recorded from the unframed body", async () => {
+  const client = new FakeRedis();
+  const framed = frameValue("not-json", { traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01" });
+  assert.notEqual(framed, "not-json", "the value is a header frame");
+
+  await new RedisConsumer(client, "orders", {}).handle(legacy(framed));
+
+  const dlq = client.called("legacyDeadLetter");
+  assert.equal(dlq[0]!.args[1], framed);
+  assertPoisonRecord(dlq[0]!.args[2]!, "not-json", "orders");
+});
+
+test("a zset poison outcome is dead-lettered as a poison record through the consumer", async () => {
+  const client = new FakeRedis();
+  client.zsetReserves.push(["[1,2]", "[1,2]", "1"]);
+  let reported = 0;
+
+  const consumer = new RedisConsumer(client, "orders", {}, { layout: "zset", blockTimeout: 0, onError: () => { reported++; } });
+  await consumer.poll();
+
+  assert.equal(reported, 1);
+  const dlq = client.called("zsetDeadLetterPoison");
+  assert.equal(dlq.length, 1);
+  assertPoisonRecord(dlq[0]!.args[1]!, "[1,2]", "orders");
+});
+
+// --- exact bytes: a body that is not valid UTF-8 (ADR-0035 section 1, no U+FFFD substitution) ----------
+
+const BAD_BYTES = Buffer.from([0x7b, 0xff, 0xfe, 0x20, 0x6e, 0x6f, 0x74, 0x2d, 0x6a, 0x73, 0x6f, 0x6e]); // `{\xff\xfe not-json`
+
+test("legacy: an invalid UTF-8 body is dead-lettered in the base64 wrapper and settled by its exact bytes", async () => {
+  const client = new FakeRedis([BAD_BYTES]);
+  const queue = new RedisQueue(client, "orders");
+  const consumer = new RedisConsumer(client, "orders", {});
+
+  const result = await queue.reserve();
+  assert.equal(result.outcome, "delivered");
+  assert.ok(client.called("legacyReserve")[0]!.binary, "the reserve reads exact bytes");
+  assert.ok(result.reservation!.rawBytes?.equals(BAD_BYTES));
+
+  await consumer.handle(result.reservation!);
+
+  const dlq = client.called("legacyDeadLetter");
+  assert.equal(dlq.length, 1);
+  const [, stored] = dlq[0]!.rawArgs;
+  assert.ok(Buffer.isBuffer(stored) && stored.equals(BAD_BYTES), "the settle script gets the exact stored bytes");
+  const parsed = JSON.parse(dlq[0]!.args[2]!) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(parsed), ["raw", "raw_encoding", "dead_letter"]);
+  assert.equal(parsed.raw_encoding, "base64");
+  assert.ok(Buffer.from(parsed.raw as string, "base64").equals(BAD_BYTES), "the original bytes round-trip");
+  assert.equal(dlq[0]!.args[2]!.includes("\ufffd"), false);
+  assert.equal((parsed.dead_letter as Record<string, unknown>).reason, "poison");
+});
+
+test("zset: an invalid UTF-8 poison body is wrapped in base64 and the ZREM member keeps its exact bytes", async () => {
+  const client = new FakeRedis();
+  client.zsetReserves.push([BAD_BYTES, BAD_BYTES, "1"]);
+
+  await new RedisConsumer(client, "orders", {}, { layout: "zset", blockTimeout: 0 }).poll();
+
+  const dlq = client.called("zsetDeadLetterPoison");
+  assert.equal(dlq.length, 1);
+  const member = dlq[0]!.rawArgs[0];
+  assert.ok(Buffer.isBuffer(member) && member.equals(BAD_BYTES), "the :reserved member is passed as exact bytes");
+  const parsed = JSON.parse(dlq[0]!.args[1]!) as Record<string, unknown>;
+  assert.equal(parsed.raw_encoding, "base64");
+  assert.ok(Buffer.from(parsed.raw as string, "base64").equals(BAD_BYTES));
+});
+
+test("a valid UTF-8 body read as bytes behaves exactly like a string reply (no side copy, string arguments)", async () => {
+  const client = new FakeRedis([Buffer.from("not-json", "utf8")]);
+  const result = await new RedisQueue(client, "orders").reserve();
+
+  assert.equal(result.raw, "not-json");
+  assert.equal(result.reservation!.layout === "legacy" && result.reservation!.rawBytes, undefined);
+
+  await new RedisConsumer(client, "orders", {}).handle(result.reservation!);
+  const dlq = client.called("legacyDeadLetter")[0]!;
+  assert.equal(dlq.rawArgs[1], "not-json");
+  assertPoisonRecord(dlq.args[2]!, "not-json", "orders");
+});
+
+// A decodable envelope that carries invalid UTF-8 inside a string value: poison in both layouts
+// (broker-bindings section 1.1 "Invalid UTF-8"); never handled, retried or re-published.
+const BAD_ENVELOPE = Buffer.concat([
+  Buffer.from(`{"job":"${URN}","attempts":0,"data":{"n":"`),
+  Buffer.from([0xff]),
+  Buffer.from('"},"meta":{"id":"1","queue":"orders"}}'),
+]);
+
+for (const layout of ["legacy", "zset"] as const) {
+  test(`${layout}: an envelope carrying invalid UTF-8 is dead-lettered as a base64 wrapper, never delivered or re-published`, async () => {
+    const client = new FakeRedis(layout === "legacy" ? [BAD_ENVELOPE] : []);
+    if (layout === "zset") client.zsetReserves.push([BAD_ENVELOPE, BAD_ENVELOPE, "0"]);
+    let handled = 0;
+    const handlers: BabelHandlers = { [URN]: () => { handled += 1; } };
+
+    const polled = await new RedisConsumer(client, "orders", handlers, { layout, blockTimeout: 0 }).poll();
+
+    assert.equal(polled, true);
+    assert.equal(handled, 0, "the handler never sees it");
+    const dead = client.called(layout === "legacy" ? "legacyDeadLetter" : "zsetDeadLetter");
+    assert.equal(dead.length, 1);
+    const record = dead[0]!.args[layout === "legacy" ? 2 : 1]!;
+    const parsed = JSON.parse(record) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(parsed), ["raw", "raw_encoding", "dead_letter"]);
+    assert.equal(parsed.raw_encoding, "base64");
+    assert.ok(Buffer.from(parsed.raw as string, "base64").equals(BAD_ENVELOPE));
+    assert.equal(record.includes("\ufffd"), false);
+    const member = dead[0]!.rawArgs[layout === "legacy" ? 1 : 0];
+    assert.ok(Buffer.isBuffer(member) && member.equals(BAD_ENVELOPE), "settled by the exact stored bytes");
+    for (const name of ["legacyRelease", "zsetRelease", "legacyAck", "zsetAck"] as const) {
+      assert.equal(client.called(name).length, 0, `${name} must not run`);
+    }
+    assert.equal(client.pushed.length, 0);
+  });
+}
 
 // --- consumer: unknown URN ----------------------------------------------------
 
@@ -237,4 +372,13 @@ test("a terminal-failure dead-letter of a non-poison reservation keeps the ZREM 
   assert.equal(delivered.outcome, "delivered");
   assert.equal(await queue.deadLetter(delivered.reservation!), false);
   assert.equal(client.called("zsetDeadLetterPoison").length, 0);
+});
+
+test("consuming without evalBuffer throws before anything is popped (invalid UTF-8 would be lossy)", async () => {
+  const client = new FakeRedis();
+  const stringOnly = { ...client, eval: client.eval.bind(client), evalBuffer: undefined } as unknown as RedisClient;
+  const queue = new RedisQueue(stringOnly, "orders");
+
+  await assert.rejects(() => queue.reserve(), /evalBuffer/);
+  assert.equal(client.calls.length, 0, "no script ran, nothing was reserved");
 });

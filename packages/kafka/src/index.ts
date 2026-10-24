@@ -30,18 +30,20 @@
  * rejected undecoded down the poison path — reported to `onError`, the raw record (value, key and
  * headers) forwarded to the DLQ (when configured) and the offset committed.
  *
- * **Poison bodies (§6.5).** A body that is not exactly one JSON object, whose typed members have the wrong
- * JSON type, or that fails the conformance check is dead-lettered **wrapped**, as the Go reference does: a
- * body that is one JSON object keeps its keys (anything else becomes `{"raw": "<body>"}`) and gains a
- * `dead_letter` block with `reason: "poison"`; the record key is carried over unchanged. Only the
- * version-gate rejection above still forwards the record raw.
+ * **Poison bodies (§6.5, ADR-0035).** A body that is not exactly one JSON object, whose typed members have the wrong
+ * JSON type, or that fails the conformance check is dead-lettered with a `dead_letter` block (`reason: "poison"`):
+ * a body that is a strict JSON object is spliced (every original byte kept, nothing re-encoded); anything else is
+ * wrapped as `{"raw": <string>, "raw_encoding"?: "base64", "dead_letter": ...}` — `raw` is the plain text when the
+ * bytes are valid UTF-8, otherwise their base64 with `raw_encoding: "base64"` (never U+FFFD substitution). The
+ * record key is carried over unchanged. Only the version-gate rejection above still forwards the record raw.
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
-import { envelopeViolation, isLossyNumberToken, resolveIdentity } from "./envelope-shape.js";
+import { envelopeViolation, resolveIdentity } from "./envelope-shape.js";
 import { mergeInto } from "./headers.js";
+import { buildPoisonRecord } from "./poison-record.js";
 
 // --- Minimal Kafka shapes (a structural subset of kafkajs) ---------------------
 
@@ -562,65 +564,28 @@ function decodeFailure(raw: string): BabelQueueError | null {
 }
 
 /**
- * True when `raw` (already known to be valid JSON) holds a number token a JS double cannot carry without changing
- * its value (see `isLossyNumberToken`). String contents are skipped, so digits inside strings never count.
+ * The poison DLQ record (ADR-0035): a body that is a strict JSON object is spliced (every original byte kept, a
+ * `dead_letter` block with reason `poison` appended); anything else is wrapped as `{"raw", "raw_encoding"?,
+ * "dead_letter"}` with the exact bytes carried losslessly (see `poison-record.ts`).
  */
-function hasLossyNumber(raw: string): boolean {
-  let i = 0;
-  while (i < raw.length) {
-    const c = raw[i]!;
-    if (c === '"') {
-      i++;
-      while (i < raw.length && raw[i] !== '"') i += raw[i] === "\\" ? 2 : 1;
-      i++;
-    } else if (c === "-" || (c >= "0" && c <= "9")) {
-      let j = i + 1;
-      while (j < raw.length && /[0-9.eE+-]/.test(raw[j]!)) j++;
-      if (isLossyNumberToken(raw.slice(i, j))) return true;
-      i = j;
-    } else {
-      i++;
-    }
-  }
-  return false;
-}
-
-/**
- * The poison DLQ record (Go parity): a body that is exactly one JSON object keeps its keys and values, anything
- * else is carried as the string value of `raw`; a `dead_letter` block with reason `poison` replaces any existing
- * one. JSON numbers go through a JS double, so a body holding a number that would not survive the round trip (an
- * integer beyond 2^53, or a literal such as `1e400` that overflows) is carried verbatim as `raw` instead; a `1.0`
- * or `1e2` literal is still re-formatted (`1`, `100`) — the value is preserved, the spelling is not.
- */
-function poisonRecord(
-  raw: string,
-  cause: unknown,
-  originalQueue: string,
-  attempts: number,
-  keepMembers = true,
-): Record<string, unknown> {
-  let record: Record<string, unknown> = { raw };
-  try {
-    if (!keepMembers) throw new Error("carry the body verbatim");
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) && !hasLossyNumber(raw)) {
-      record = parsed as Record<string, unknown>;
-    }
-  } catch {
-    // not JSON: wrapped as {"raw": body}
-  }
-  delete record.dead_letter;
-  record.dead_letter = annotate({ attempts } as unknown as Envelope, "poison", originalQueue, {
+function poisonRecord(body: Uint8Array, cause: unknown, originalQueue: string, attempts: number): string {
+  const deadLetter = annotate({ attempts } as unknown as Envelope, "poison", originalQueue, {
     attempts,
     error: cause instanceof Error ? cause.message : null,
     exception: cause instanceof Error ? cause.name : null,
   }).dead_letter;
-  return record;
+  return buildPoisonRecord(body, JSON.stringify(deadLetter));
 }
 
 /** Contract `bq-*` headers for a poison DLQ record, projected from whatever the body carries, plus the origin. */
-function poisonHeaders(record: Record<string, unknown>, originalQueue: string, attempts: number): { [key: string]: string } {
+function poisonHeaders(recordJson: string, originalQueue: string, attempts: number): { [key: string]: string } {
   const headers: { [key: string]: string } = {};
+  let record: Record<string, unknown> = {};
+  try {
+    record = JSON.parse(recordJson) as Record<string, unknown>;
+  } catch {
+    // a body nested deeper than JSON.parse can recurse (RangeError): only the origin headers are projected
+  }
   const str = (v: unknown): string | undefined => (typeof v === "string" && v !== "" ? v : undefined);
   const meta = record.meta !== null && typeof record.meta === "object" ? (record.meta as Record<string, unknown>) : {};
   const job = str(record.job) ?? str(record.urn);
@@ -688,7 +653,7 @@ export class KafkaConsumer {
     // Undecodable body (§6.5): dead-lettered wrapped (reason "poison"), key preserved.
     const undecodable = decodeFailure(raw);
     if (undecodable) {
-      await this.settlePoison(payload, raw, undecodable, null);
+      await this.settlePoison(payload, undecodable, null);
       return;
     }
 
@@ -696,7 +661,7 @@ export class KafkaConsumer {
     try {
       envelope = this.reconcile(EnvelopeCodec.decode(raw), message);
     } catch (decodeError) {
-      await this.settlePoison(payload, raw, decodeError, null);
+      await this.settlePoison(payload, decodeError, null);
       return;
     }
 
@@ -708,7 +673,7 @@ export class KafkaConsumer {
     // with surrounding whitespace), so a re-encoded retry or DLQ copy stays a well-formed envelope.
     if (bodyIdentity !== "" && envelope.job !== bodyIdentity) envelope = { ...envelope, job: bodyIdentity };
     if (urn === "") {
-      await this.settlePoison(payload, raw, new BabelQueueError("Undecodable BabelQueue body: no valid job or urn identity."), envelope);
+      await this.settlePoison(payload, new BabelQueueError("Undecodable BabelQueue body: no valid job or urn identity."), envelope);
       return;
     }
     const handler = this.handlers[urn];
@@ -807,36 +772,26 @@ export class KafkaConsumer {
   /** Dead-letter a poison record (wrapped), commit it, then report: settle first so `onError` cannot bypass it. */
   private async settlePoison(
     payload: EachMessagePayload,
-    raw: string,
     cause: unknown,
     envelope: IncomingEnvelope | null,
   ): Promise<void> {
     try {
-      await this.deadLetterPoison(payload, raw, cause);
+      await this.deadLetterPoison(payload, cause);
       await this.commit(payload);
     } finally {
       this.report(cause, envelope, payload);
     }
   }
 
-  private async deadLetterPoison(payload: EachMessagePayload, raw: string, cause: unknown): Promise<void> {
+  private async deadLetterPoison(payload: EachMessagePayload, cause: unknown): Promise<void> {
     const dlq = this.options.retryTopics?.dlqTopic ?? null;
     if (!dlq) return; // dead-lettering disabled → degrade to commit-and-drop
     this.requireProducer();
     const original = this.originalTopic(payload);
     const attempts = Math.max(headerInt(payload.message.headers, "bq-attempts", 0), 0);
-    let record = poisonRecord(raw, cause, original, attempts);
-    let json: string;
-    try {
-      json = JSON.stringify(record);
-    } catch {
-      // A body nested deeper than JSON.stringify's recursion can carry (RangeError): wrap it verbatim under `raw`
-      // instead, so the poison record is still parked and never left to wedge the partition.
-      record = poisonRecord(raw, cause, original, attempts, false);
-      json = JSON.stringify(record);
-    }
+    const record = poisonRecord(payload.message.value ?? Buffer.alloc(0), cause, original, attempts);
     const headers = poisonHeaders(record, original, attempts);
-    await this.produceRaw(dlq, json, headers, payload.message.key);
+    await this.produceRaw(dlq, record, headers, payload.message.key);
   }
 
   private async deadLetterRaw(payload: EachMessagePayload): Promise<void> {

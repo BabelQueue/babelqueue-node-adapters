@@ -280,13 +280,14 @@ test("poison body is wrapped as {raw} with a dead_letter reason=poison and the k
   assert.ok(reported);
 });
 
-test("poison: a JSON object body keeps its keys, an existing dead_letter is replaced, bq-attempts feeds attempts", async () => {
+test("poison: a JSON object body keeps its keys verbatim (splice) and bq-attempts feeds attempts", async () => {
   const producer = new FakeProducer();
   const consumer = new FakeConsumer();
-  const payload = rawPayload('{"foo":"bar","n":[1,2],"dead_letter":{"reason":"failed"},"data":"not-an-object"}', {
-    "bq-attempts": Buffer.from("2", "utf8"),
-  });
+  const value = '{"foo":"bar","n":[1,2],"data":"not-an-object"}';
+  const payload = rawPayload(value, { "bq-attempts": Buffer.from("2", "utf8") });
   await new KafkaConsumer(consumer, {}, { producer, retryTopics: topology() }).handle(payload);
+  const sent = String(producer.sent[0]!.messages[0]!.value);
+  assert.ok(sent.startsWith(value.slice(0, -1) + ',"dead_letter":'), sent);
   const body = poisonDlq(producer, "orders", 2);
   assert.equal(body.foo, "bar");
   assert.deepEqual(body.n, [1, 2]);
@@ -294,6 +295,38 @@ test("poison: a JSON object body keeps its keys, an existing dead_letter is repl
   assert.equal("raw" in body, false);
   assert.equal(producer.sent[0]!.messages[0]!.headers!["bq-attempts"], "2");
   assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+});
+
+test("poison: an object that already has a top-level dead_letter is wrapped, not spliced (ADR-0035)", async () => {
+  const producer = new FakeProducer();
+  const value = '{"foo":"bar","dead_letter":{"reason":"failed"},"data":"not-an-object"}';
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
+  const body = poisonDlq(producer);
+  assert.equal(body.raw, value);
+  assert.equal("raw_encoding" in body, false);
+  assert.equal("foo" in body, false);
+});
+
+test("poison: an invalid UTF-8 body is carried as base64 with raw_encoding, never U+FFFD (ADR-0035)", async () => {
+  const bytes = Buffer.from([0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0xff, 0xfe, 0x22, 0x7d]); // {"a":"<ff><fe>"}
+  for (const value of [bytes, Buffer.from([0xff, 0xfe, 0x00, 0x80])]) {
+    const producer = new FakeProducer();
+    const payload: EachMessagePayload = { topic: "orders", partition: 0, message: { value, headers: {}, offset: "4" } };
+    await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(payload);
+    const body = poisonDlq(producer);
+    assert.deepEqual(Object.keys(body), ["raw", "raw_encoding", "dead_letter"]);
+    assert.equal(body.raw_encoding, "base64");
+    assert.deepEqual(Buffer.from(body.raw as string, "base64"), value);
+    assert.equal(String(producer.sent[0]!.messages[0]!.value).includes("\ufffd"), false);
+  }
+});
+
+test("poison: valid UTF-8 raw omits raw_encoding", async () => {
+  const producer = new FakeProducer();
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload("héllo"));
+  const body = poisonDlq(producer);
+  assert.equal(body.raw, "héllo");
+  assert.equal("raw_encoding" in body, false);
 });
 
 test("poison: a non-object JSON root, trailing tokens and an empty or absent value are wrapped under raw", async () => {
@@ -321,42 +354,21 @@ test("poison: wrong member types are undecodable (data/meta not objects, job/tra
   }
 });
 
-test("poison: a body with a number a double cannot carry (beyond 2^53, 1e400) is kept verbatim under raw", async () => {
+test("poison: numbers a double cannot carry (beyond 2^53, 1e400) and respellings stay verbatim in the spliced record", async () => {
   for (const value of [
     '{"job":"x","data":[1],"id":12345678901234567890}',
     '{"job":"x","data":[1],"ids":[1,-9007199254740993]}',
     '{"job":"x","data":[1],"big":1e400}',
     '{"job":"x","data":[1],"n":9007199254740993.0}',
-    '{"job":"x","data":[1],"n":1.2345678901234567890123}',
-    '{"job":"x","data":[1],"n":9007199254740993e0}',
-    '{"job":"x","data":[1],"n":-9007199254740993.0}',
+    '{"job":"x","data":[1],"a":1.0,"b":1e2,"c":10e-1,"s":"99999999999999999999"}',
+    '{"job":"x","data":[1],"dup":1,"dup":2}',
   ]) {
     const producer = new FakeProducer();
     await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
-    const body = poisonDlq(producer);
-    assert.equal(body.raw, value);
-    assert.equal(body.job, undefined);
+    const sent = String(producer.sent[0]!.messages[0]!.value);
+    assert.ok(sent.startsWith(value.slice(0, -1) + ',"dead_letter":'), sent);
+    assert.equal(sent.includes('"raw"'), false);
   }
-});
-
-test("poison: a value-preserving respelling (1.0, 1e2, 10e-1, 9007199254740992.0) does not trigger the raw fallback", async () => {
-  const value = '{"job":"x","data":[1],"a":1.0,"b":1e2,"c":10e-1,"d":9007199254740992.0,"e":0.1}';
-  const producer = new FakeProducer();
-  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
-  const body = poisonDlq(producer);
-  assert.equal(body.raw, undefined);
-  assert.deepEqual([body.a, body.b, body.c, body.d, body.e], [1, 100, 1, 9007199254740992, 0.1]);
-});
-
-test("poison: digits inside strings and safe numbers do not trigger the raw fallback", async () => {
-  const value = '{"job":"x","data":[1],"s":"99999999999999999999","n":9007199254740991,"f":1.5e3}';
-  const producer = new FakeProducer();
-  await new KafkaConsumer(new FakeConsumer(), {}, { producer, retryTopics: topology() }).handle(rawPayload(value));
-  const body = poisonDlq(producer);
-  assert.equal(body.raw, undefined);
-  assert.equal(body.s, "99999999999999999999");
-  assert.equal(body.n, 9007199254740991);
-  assert.equal(body.f, 1500);
 });
 
 test("poison: an empty key stays empty and a missing key stays missing", async () => {

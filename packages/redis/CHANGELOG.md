@@ -22,6 +22,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
   Exports `RedisQueue`, `zsetKeys`, `ZSET_KEY_PREFIX`, `LUA`, `newReservationToken`.
 
 ### Changed
+- The Redis poison dead-letter element is now the ADR-0035 record (raw splice, or the `raw`/`raw_encoding` wrapper) carrying a `dead_letter` block, instead of the bare element (broker-bindings section 1). Uses a local `poison-record.ts` copy (KEEP IN SYNC with `@babelqueue/core`) until the dependency is bumped.
+- **Poison and non-UTF-8 values are read as bytes.** When the client offers `evalBuffer` (ioredis does), the reserve script reply is read as `Buffer`s, so a stored body that is not valid UTF-8 reaches the ADR-0035 record as the base64 wrapper instead of carrying U+FFFD, and ack / release / dead-letter hand the exact stored bytes back to the settle scripts (the `:processing` LREM and the `:reserved` ZREM match). Valid UTF-8 values keep the previous path. A client without `evalBuffer` can still publish, but `RedisQueue.reserve()` (and so `RedisConsumer`) now throws a `BabelQueueError` before popping anything: a string-only `eval` would turn invalid UTF-8 into U+FFFD and hand a lossy body to a handler, which broker-bindings §1.1 forbids.
 - **Behaviour change:** the legacy reserve pops from the head (`LMOVE <q> <q>:processing LEFT RIGHT`)
   instead of the tail (`BRPOPLPUSH`), so the order is FIFO and matches the other SDKs.
 - **Breaking (TypeScript):** the `RedisClient` interface drops `brpoplpush` and gains `zadd`,
@@ -32,6 +34,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
   is unchanged and remains the default.
 
 ### Fixed
+- **Invalid UTF-8 is poison in both Redis layouts (broker-bindings section 1.1).** A stored value (or zset `:reserved` member) that is not valid UTF-8 is dead-lettered on first delivery as the ADR-0035 `raw`/`raw_encoding: "base64"` wrapper, even when the codec or `cjson` could decode it: it is never handed to a handler and never retried, released or re-published, and the exact stored bytes are used for the settle script, so no byte is rewritten.
 - **Zset reserve no longer loses a message whose body cannot be re-encoded.** `lua-cjson` decodes
   `1e999` / `NaN` / `Infinity` but refuses to encode them; the unguarded `cjson.encode` raised after
   the `LPOP` and dropped the already-popped message. The encode is now `pcall`-guarded and such a body
