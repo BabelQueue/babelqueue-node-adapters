@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
 > **Release order:** this version depends on `@babelqueue/core ^1.13.0`. Publish `babelqueue-node`
 > v1.13.0 first, then release the adapters; until then a registry install of this package cannot
 > resolve the core range.

@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-24
+
 ### Added
 
 - `RetryReinjector` (contract §6.4, ADR-0034 §5-7): the consumer that moves a record from `<topic>.retry.<n>` back to

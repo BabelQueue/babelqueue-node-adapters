@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-24
+
 ### Added
 - **Laravel-compatible `zset` layout (ADR-0033, opt-in via `layout: "zset"`).** Keys
   `queues:<q>`, `:delayed`, `:reserved`, `:notify`; Laravel's reserve Lua (poison-safe, ADR-0033 §3),
