@@ -980,10 +980,13 @@ export class RedisConsumer {
         await this.requeue(envelope, reservation);
         return;
       default: {
-        // FAIL: surface and leave the reservation in place (recoverable after retryAfter).
+        // FAIL: report, then take the bounded retry/dead-letter path (Go routeUnknown / Python
+        // _route_unknown parity). Leaving the reservation in place would let retryAfter recovery
+        // bring it back with an unchanged attempts count: an endless reserve/recover loop.
         const error = new UnknownUrnError(urn);
         this.report(error, envelope, reservation.raw);
-        throw error;
+        await this.retryOrDeadLetter(envelope, reservation, error);
+        return;
       }
     }
   }
@@ -992,7 +995,8 @@ export class RedisConsumer {
     if ((envelope.attempts ?? 0) + 1 < this.maxTries) {
       await this.requeue(envelope, reservation);
     } else {
-      await this.deadLetter(envelope, reservation, "failed", error);
+      // An unknown URN dead-letters with its own reason, like Go and Python.
+      await this.deadLetter(envelope, reservation, error instanceof UnknownUrnError ? "unknown_urn" : "failed", error);
     }
   }
 

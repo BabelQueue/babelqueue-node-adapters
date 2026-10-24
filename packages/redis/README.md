@@ -61,7 +61,7 @@ await consumer.run(() => true); // reserve → process → LREM, until you stop 
 
 A successful handler acknowledges the reservation. A throwing handler gives the envelope back with
 `attempts + 1` (at-least-once) up to `maxTries`, then dead-letters to `<queue>.dlq` with a
-`dead_letter` block. Unknown-URN strategy is one of `fail` / `delete` / `release` / `dead_letter`.
+`dead_letter` block. Unknown-URN strategy is one of `fail` / `delete` / `release` / `dead_letter`; the default `fail` reports the error and retries with `attempts + 1` up to `maxTries`, then dead-letters (`reason: "unknown_urn"`).
 `poll()` and `handle(reservation)` are exposed for testing.
 
 `blockTimeout` (seconds, default 5) is how long one `poll()` waits: a sleep-poll (100 ms, doubling,

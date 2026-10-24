@@ -55,6 +55,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   DLQ and `ZREM` it). A reservation the reserve script flagged as poison carries `poison: true` and is
   dead-lettered by a script with no `ZREM` gate, so two byte-equal poison bodies reserved together
   both reach the DLQ.
+- **Unknown URN with the default `fail` strategy no longer loops forever.** It used to report and throw
+  with the reservation left in place, so `retryAfter` recovery returned the message with an unchanged
+  `attempts` and the next consumer failed it again. It now reports the `UnknownUrnError` and takes the
+  bounded retry path (requeue with `attempts + 1` up to `maxTries`, then `<queue>.dlq` with
+  `dead_letter.reason: "unknown_urn"`), matching the Go and Python SDKs. `handle()` no longer throws
+  for it.
 
 ## [1.1.0] - 2026-06-21
 

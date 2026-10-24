@@ -249,10 +249,31 @@ for (const layout of ["legacy", "zset"] as const) {
 
 // --- consumer: unknown URN ----------------------------------------------------
 
-test("unknown URN with fail throws and leaves the reservation recoverable", async () => {
+test("unknown URN with fail reports, requeues with attempts + 1 and settles the reservation", async () => {
   const client = new FakeRedis();
-  await assert.rejects(new RedisConsumer(client, "orders", {}).handle(legacy(EnvelopeCodec.encode(envelope()))), UnknownUrnError);
-  assert.equal(client.calls.length, 0);
+  let reported: unknown;
+  await new RedisConsumer(client, "orders", {}, { maxTries: 3, onError: (e: unknown) => { reported = e; } }).handle(
+    legacy(EnvelopeCodec.encode(envelope(0))),
+  );
+
+  assert.ok(reported instanceof UnknownUrnError);
+  const release = client.called("legacyRelease");
+  assert.equal(release.length, 1, "the reservation leaves :processing through the gated release");
+  assert.equal(release[0]!.keys[0], "orders");
+  assert.equal((EnvelopeCodec.decode(release[0]!.args[2]!) as Envelope).attempts, 1);
+  assert.equal(client.called("legacyDeadLetter").length, 0);
+});
+
+test("unknown URN with fail dead-letters (reason unknown_urn) once attempts reach maxTries", async () => {
+  const client = new FakeRedis();
+  await new RedisConsumer(client, "orders", {}, { maxTries: 3 }).handle(legacy(EnvelopeCodec.encode(envelope(2))));
+
+  assert.equal(client.called("legacyRelease").length, 0);
+  const dlq = client.called("legacyDeadLetter");
+  assert.equal(dlq.length, 1);
+  assert.equal(dlq[0]!.keys[2], "orders.dlq");
+  const record = EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope;
+  assert.equal(record.dead_letter!.reason, "unknown_urn");
 });
 
 test("unknown URN with delete acks without routing", async () => {
