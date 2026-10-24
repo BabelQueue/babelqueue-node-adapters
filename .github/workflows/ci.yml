@@ -109,9 +109,12 @@ jobs:
     env:
       BQ_REQUIRE_REDIS: "1"
       BABELQUEUE_REDIS_URL: redis://localhost:6379
-      BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
     steps:
       - uses: actions/checkout@v7
+
+      # The `runner` context is not available in job-level `env`, so the results path is exported here.
+      - name: Set conformance results path
+        run: echo "BQ_CONFORMANCE_RESULTS=${RUNNER_TEMP}/results.json" >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v7
         with:
