@@ -86,9 +86,48 @@ It is separate from `onError`, its failures (including a rejected promise) are s
 it never changes the ack flow. The hook runs only for an accepted envelope — after `accepts()` and
 the `attempts` reconcile — so it sees the same envelope the handler gets. A body without a `job` is still rejected by the codec even when
 `bq-job` is set. A throwing handler `negativeAcknowledge`s, so
-the broker redelivers (at-least-once). The poll loop never stops on a bad message — observe
-via `onError` / `onUnknownUrn`. The envelope is unchanged (`schema_version` stays `1`);
-Pulsar is purely additive.
+the broker redelivers (at-least-once) — up to `maxAttempts` deliveries (see below). The poll loop
+never stops on a bad message — observe via `onError` / `onUnknownUrn`. The envelope is unchanged
+(`schema_version` stays `1`); Pulsar is purely additive.
+
+### Max attempts, dead-letter and poison (ADR-0036)
+
+Redelivery is bounded, so every message terminates. `maxAttempts` (default **3**, an integer of at
+least 1) is the total number of deliveries a message gets, the first included; `1` means no retry.
+The SDK counts `counted = reconciled attempts + 1` (the reconciled value above plus the current
+delivery) and decides for a retryable outcome — a handler that throws, an unmapped URN without an
+`onUnknownUrn` hook, or a poison body with dead-lettering off:
+
+- `counted < maxAttempts` → **retry**: `negativeAcknowledge` (the native redelivery count advances).
+- otherwise → **dead-letter** when a `deadLetterProducer` is given, else **drop** (acknowledge, and
+  a warning through `onWarn`, default `console.warn`).
+
+```ts
+const dlq = await client.createProducer({ topic: "orders.dlq" });
+const consumer = new PulsarConsumer(sub, handlers, {
+  maxAttempts: 3,          // default
+  deadLetterProducer: dlq, // dead-lettering is on exactly when this is set
+  queue: "orders",         // dead_letter.original_queue of a poison record (default: the DLQ topic without ".dlq")
+});
+```
+
+The dead-letter record is the canonical envelope with the `dead_letter` block (`reason` `failed` or
+`unknown_urn`; `dead_letter.attempts` and the record's `attempts` are the counted value, `3` with the
+default). The original is acknowledged **only after** the record was sent; a failed send leaves it
+negatively acknowledged, so it is redelivered and the write is tried again. The SDK does not use
+Pulsar's native `DeadLetterPolicy`; adding one yourself creates a second, uncoordinated limit.
+
+**Poison.** A body that does not decode into an envelope — not JSON, not an object, or an object with
+neither a valid `job` nor a valid `urn`, or any other body the codec does not accept as a conformant envelope (for example a missing `trace_id` or a non-integer `attempts`) — never reaches a handler or `onUnknownUrn`. With
+`deadLetterProducer` it is written to the dead-letter topic at once, without retry, in the ADR-0035
+shape (a strict JSON object keeps every original byte and gains a `dead_letter` block with
+`reason: "poison"`; anything else is wrapped as `{"raw", "raw_encoding"?, "dead_letter"}`). Without
+one it takes the bounded retry above and is then dropped.
+
+**Behaviour change (MINOR).** Redelivery used to be unbounded; with the defaults a message that keeps
+failing is now dropped (or dead-lettered) at its third delivery. Set `maxAttempts` higher to keep
+more retries. A message with an unsupported `bq-schema-version` still takes the version gate above
+(`onError` and a `negativeAcknowledge`).
 
 The producer/consumer are injected, so the unit tests use fakes — no Pulsar, no broker. Dual
 ESM + CJS.

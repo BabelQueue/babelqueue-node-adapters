@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: `dead_letter.attempts` is the counted attempt (ADR-0036 decision 8).** When retries
+  are exhausted (`reason: "failed"`, or `"unknown_urn"` through the bounded `fail` path) the consumer used to
+  write the delivered `attempts`; it now writes the delivered value plus one for the current delivery, the
+  value already compared against `maxTries`, like Go and Python (with `maxTries` 3 it is `3`; it was `2`).
+  The dead-letter record's top-level `attempts` carries the same value. A direct dead-letter that makes
+  no retry decision (`unknownUrn: "dead_letter"`) keeps the delivered value, which is informational.
+- Conformance v1.7.0 vendored (no Redis section changed).
+
 ## [1.2.0] - 2026-10-24
 
 ### Added

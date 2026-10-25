@@ -992,11 +992,19 @@ export class RedisConsumer {
   }
 
   private async retryOrDeadLetter(envelope: Envelope, reservation: Reservation, error: unknown): Promise<void> {
-    if ((envelope.attempts ?? 0) + 1 < this.maxTries) {
+    // The counted attempt: the delivered attempts plus one for this delivery (ADR-0036 decision 8).
+    const counted = (envelope.attempts ?? 0) + 1;
+    if (counted < this.maxTries) {
       await this.requeue(envelope, reservation);
     } else {
       // An unknown URN dead-letters with its own reason, like Go and Python.
-      await this.deadLetter(envelope, reservation, error instanceof UnknownUrnError ? "unknown_urn" : "failed", error);
+      await this.deadLetter(
+        envelope,
+        reservation,
+        error instanceof UnknownUrnError ? "unknown_urn" : "failed",
+        error,
+        counted,
+      );
     }
   }
 
@@ -1011,9 +1019,22 @@ export class RedisConsumer {
     await this.transport.release(reservation, 0, redisValue(bumped));
   }
 
-  private async deadLetter(envelope: Envelope, reservation: Reservation, reason: string, error?: unknown): Promise<void> {
-    const annotated = annotate(envelope, reason, envelope.meta?.queue ?? this.queue, {
-      attempts: envelope.attempts ?? 0,
+  /**
+   * Write the annotated envelope to the DLQ. `counted` is given on the exhaustion path (retries used up): the
+   * delivered attempts plus one for the current delivery, written to both `dead_letter.attempts` and the
+   * record's top-level `attempts`, like Go and Python. A direct dead-letter that makes no retry decision
+   * (`unknownUrn: dead_letter`) omits it and records the delivered value, which is informational.
+   */
+  private async deadLetter(
+    envelope: Envelope,
+    reservation: Reservation,
+    reason: string,
+    error?: unknown,
+    counted?: number,
+  ): Promise<void> {
+    const attempts = counted ?? envelope.attempts ?? 0;
+    const annotated = annotate({ ...envelope, attempts }, reason, envelope.meta?.queue ?? this.queue, {
+      attempts,
       error: error instanceof Error ? error.message : null,
       exception: error instanceof Error ? error.name : null,
     });

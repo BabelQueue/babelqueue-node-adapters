@@ -26,7 +26,12 @@
  * `bq-trace-id` = trace_id, `bq-message-id` = meta.id, plus `bq-schema-version` /
  * `bq-source-lang` / `bq-attempts`. The envelope is unchanged (`schema_version` stays 1);
  * Pulsar is purely additive. A failed handler `negativeAcknowledge`s the message, so it is
- * redelivered (at-least-once) and `getRedeliveryCount()` is incremented. Per §5.2 / §5.7 the
+ * redelivered (at-least-once) and `getRedeliveryCount()` is incremented — up to `maxAttempts`
+ * deliveries (default 3, ADR-0036): the message that exhausts them is written to `<queue>.dlq`
+ * (when a `deadLetterProducer` is given) or acknowledged and dropped. A body that does not decode
+ * into an envelope (including an object with no valid identity) is poison: it never reaches a
+ * handler, and with dead-lettering on it is recorded in `<queue>.dlq` in the ADR-0035 shape without
+ * retry. Per §5.2 / §5.7 the
  * consumer routes on the `bq-job` property (the body's URN is used only when the property is
  * absent or blank) and takes `attempts` from the authoritative `bq-attempts` property (the
  * body's value is used only when the property is absent or not a plain ASCII-decimal integer
@@ -47,7 +52,7 @@
  * header-less publish is byte-identical. GR-1: the wire envelope (the payload) is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError } from "@babelqueue/core";
+import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, annotate, buildPoisonRecord } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { mergeInto } from "./headers.js";
@@ -218,7 +223,36 @@ export interface PulsarConsumerOptions {
    * rejects with) is swallowed — it never changes how the message is handled or acknowledged.
    */
   onRoutingMismatch?: (propertyUrn: string, bodyUrn: string, envelope: IncomingEnvelope) => unknown;
+  /**
+   * The total number of deliveries a message gets, the first included (default 3; `1` = no retry;
+   * ADR-0036 decision 1). A failing handler, an unmapped URN without {@link onUnknownUrn} and a poison
+   * body with dead-lettering off are retried (`negativeAcknowledge`) while `reconciled attempts + 1`
+   * is below it; the delivery that reaches it is dead-lettered (when {@link deadLetterProducer} is
+   * set) or acknowledged and dropped. Must be an integer of at least 1.
+   */
+  maxAttempts?: number;
+  /**
+   * A producer on the dead-letter topic (by convention `<queue>.dlq`). Dead-lettering is on exactly
+   * when it is set; the SDK does not use Pulsar's native `DeadLetterPolicy`. The original message is
+   * acknowledged only after the record was sent; a failed send leaves it negatively acknowledged so
+   * it is redelivered and the write is tried again.
+   */
+  deadLetterProducer?: PulsarProducer;
+  /**
+   * The queue name written to `dead_letter.original_queue` of a poison record (a decodable envelope
+   * uses its own `meta.queue`). Defaults to the {@link deadLetterProducer} topic without its `.dlq`
+   * suffix.
+   */
+  queue?: string;
+  /** Receives the "message dropped" and "dead-letter write failed" warnings (default `console.warn`). */
+  onWarn?: (message: string) => void;
 }
+
+/** What a retryable outcome is about: the reason written to `dead_letter.reason`. */
+type SettleKind = "failed" | "unknown_urn" | "poison";
+
+/** Default total number of deliveries (ADR-0036 decision 1). */
+export const DEFAULT_MAX_ATTEMPTS = 3;
 
 /** `bq-attempts` is valid only as ASCII digits that fit a signed 32-bit int (matches Java/.NET, GR-5). */
 const MAX_ATTEMPTS = 2 ** 31 - 1;
@@ -227,6 +261,21 @@ function parseAttempts(raw: string | undefined): number | undefined {
   if (typeof raw !== "string" || !/^[0-9]+$/.test(raw)) return undefined;
   const value = Number(raw);
   return value <= MAX_ATTEMPTS ? value : undefined;
+}
+
+/**
+ * The reconciled attempt count of a delivery (broker-bindings §5.5): the `bq-attempts` property when
+ * valid, else `bodyAttempts` (0 when the body has none), floored by the 0-based native redelivery count.
+ */
+function reconcileAttempts(
+  properties: { [key: string]: string },
+  bodyAttempts: number,
+  redeliveryCount: number,
+): number {
+  let attempts = bodyAttempts;
+  const fromProperty = parseAttempts(properties["bq-attempts"]);
+  if (fromProperty !== undefined) attempts = fromProperty;
+  return redeliveryCount > attempts ? redeliveryCount : attempts;
 }
 
 /** Blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — not `String.prototype.trim()`'s wider set. */
@@ -257,16 +306,27 @@ function decodePayload(data: Buffer | string): string {
  * Receives from a Pulsar subscription, decodes + validates each message, routes it to the
  * handler for its URN, and acknowledges it on success. A throwing handler
  * `negativeAcknowledge`s the message — the broker redelivers it and increments
- * `getRedeliveryCount()` (at-least-once). Routing uses the `bq-job` property (body URN as the
- * fallback); `attempts` is the `bq-attempts` property (body value as the fallback) reconciled to
- * `max(.., getRedeliveryCount())` for the handler.
+ * `getRedeliveryCount()` (at-least-once) — until `maxAttempts` deliveries are used up; the last one is
+ * dead-lettered to `<queue>.dlq` or acknowledged and dropped (ADR-0036). Routing uses the `bq-job`
+ * property (body URN as the fallback); `attempts` is the `bq-attempts` property (body value as the
+ * fallback) reconciled to `max(.., getRedeliveryCount())` for the handler.
  */
 export class PulsarConsumer {
+  private readonly maxAttempts: number;
+  private readonly warn: (message: string) => void;
+
   constructor(
     private readonly consumer: PulsarConsumerClient,
     private readonly handlers: BabelHandlers,
     private readonly options: PulsarConsumerOptions = {},
-  ) {}
+  ) {
+    const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+      throw new BabelQueueError(`maxAttempts must be an integer of at least 1, got ${String(maxAttempts)}.`);
+    }
+    this.maxAttempts = maxAttempts;
+    this.warn = options.onWarn ?? ((message) => console.warn(message));
+  }
 
   /** Receive one message (up to the receive timeout), route + settle it. Returns 1, or 0 on timeout. */
   async poll(): Promise<number> {
@@ -305,23 +365,8 @@ export class PulsarConsumer {
       return;
     }
 
-    const envelope = EnvelopeCodec.decode(decodePayload(message.getData()));
-
-    // attempts: the authoritative bq-attempts property (the body's value when it is absent or
-    // invalid), then max(.., getRedeliveryCount()): the redelivery count is 0-based, so it maps
-    // directly with no −1; the max never lowers a higher count republished from another SDK
-    // (the Go/Python transports retry by re-sending with attempts+1).
     const redeliveryCount = typeof message.getRedeliveryCount === "function" ? message.getRedeliveryCount() : 0;
-    // A body without an integer attempts stays as sent, so accepts() below still rejects it
-    // (the property can't repair a non-conformant body); the value is written only on a change.
-    const bodyAttempts = envelope.attempts;
-    let attempts = typeof bodyAttempts === "number" && Number.isInteger(bodyAttempts) ? bodyAttempts : 0;
-    const fromProperty = parseAttempts(properties["bq-attempts"]);
-    if (fromProperty !== undefined) attempts = fromProperty;
-    if (redeliveryCount > attempts) attempts = redeliveryCount;
-    if (typeof bodyAttempts === "number" && Number.isInteger(bodyAttempts) && bodyAttempts !== attempts) {
-      envelope.attempts = attempts;
-    }
+    const envelope = EnvelopeCodec.decode(decodePayload(message.getData()));
 
     // routing: the bq-job property wins; the body's URN is the fallback. A body with no URN is
     // still rejected below, whatever bq-job says.
@@ -331,13 +376,24 @@ export class PulsarConsumer {
     const urn = propertyUrn !== "" ? propertyUrn : bodyUrn;
 
     if (!EnvelopeCodec.accepts(envelope)) {
-      this.options.onError?.(
-        new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Apache Pulsar."),
-        envelope,
-        message,
-      );
-      await this.consumer.negativeAcknowledge(message);
+      // Poison (ADR-0036 decisions 2 and 4): a body that does not decode into an envelope, including an
+      // object with no valid identity, never reaches a handler. Its attempts come from the transport
+      // alone (bq-attempts, the redelivery count): there is no decodable body to read them from.
+      const error = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Apache Pulsar.");
+      this.options.onError?.(error, envelope, message);
+      await this.settle("poison", reconcileAttempts(properties, 0, redeliveryCount) + 1, null, message, error);
       return;
+    }
+
+    // attempts: the authoritative bq-attempts property (the body's value when it is absent or
+    // invalid), then max(.., getRedeliveryCount()): the redelivery count is 0-based, so it maps
+    // directly with no −1; the max never lowers a higher count republished from another SDK
+    // (the Go/Python transports retry by re-sending with attempts+1).
+    // accepts() above guarantees an integer body attempts; the value is written only on a change.
+    const bodyAttempts = envelope.attempts as number;
+    const attempts = reconcileAttempts(properties, bodyAttempts, redeliveryCount);
+    if (bodyAttempts !== attempts) {
+      envelope.attempts = attempts;
     }
 
     // Diagnostics only, and only for an accepted envelope (07a Java/.NET order): after accepts()
@@ -352,8 +408,9 @@ export class PulsarConsumer {
         await this.options.onUnknownUrn(envelope, message);
         await this.consumer.acknowledge(message);
       } else {
-        this.options.onError?.(new UnknownUrnError(urn), envelope, message);
-        await this.consumer.negativeAcknowledge(message);
+        const error = new UnknownUrnError(urn);
+        this.options.onError?.(error, envelope, message);
+        await this.settle("unknown_urn", attempts + 1, envelope as Envelope, message, error);
       }
       return;
     }
@@ -362,10 +419,99 @@ export class PulsarConsumer {
       await handler(envelope as Envelope, message, headersOf(message));
       await this.consumer.acknowledge(message);
     } catch (error) {
-      // Negative-ack releases the message — the broker redelivers and increments the count.
       this.options.onError?.(error, envelope, message);
-      await this.consumer.negativeAcknowledge(message);
+      await this.settle("failed", attempts + 1, envelope as Envelope, message, error);
     }
+  }
+
+  /**
+   * The settle decision of a retryable outcome (ADR-0036 decisions 1 and 2). `counted` is the reconciled
+   * attempts plus one for this delivery. A poison body with dead-lettering on is recorded without retry;
+   * every other outcome retries (`negativeAcknowledge`: the native redelivery count advances, so the
+   * next delivery counts one more) while `counted < maxAttempts`, then dead-letters or drops.
+   */
+  private async settle(
+    kind: SettleKind,
+    counted: number,
+    envelope: Envelope | null,
+    message: PulsarReceivedMessage,
+    error: unknown,
+  ): Promise<void> {
+    const producer = this.options.deadLetterProducer;
+    if (kind === "poison" && producer !== undefined) {
+      await this.deadLetter(producer, kind, counted, null, message, error);
+      return;
+    }
+    if (counted < this.maxAttempts) {
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+    if (producer !== undefined) {
+      await this.deadLetter(producer, kind, counted, envelope, message, error);
+      return;
+    }
+    this.warn(
+      `babelqueue: dropped a ${kind} Apache Pulsar message after ${counted} of ${this.maxAttempts} deliveries (dead-lettering is off).`,
+    );
+    await this.consumer.acknowledge(message);
+  }
+
+  /**
+   * Write the DLQ record, then acknowledge the original — only after the send succeeded. A failed send
+   * leaves the original negatively acknowledged, so it is redelivered and the write is tried again.
+   */
+  private async deadLetter(
+    producer: PulsarProducer,
+    kind: SettleKind,
+    counted: number,
+    envelope: Envelope | null,
+    message: PulsarReceivedMessage,
+    error: unknown,
+  ): Promise<void> {
+    try {
+      await producer.send(this.deadLetterMessage(producer, kind, counted, envelope, message, error));
+    } catch (writeError) {
+      this.warn(
+        `babelqueue: dead-letter write to ${producer.getTopic()} failed (${errorText(writeError)}); the message is left for redelivery.`,
+      );
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+    await this.consumer.acknowledge(message);
+  }
+
+  private deadLetterMessage(
+    producer: PulsarProducer,
+    kind: SettleKind,
+    counted: number,
+    envelope: Envelope | null,
+    message: PulsarReceivedMessage,
+    error: unknown,
+  ): PulsarProducerMessage {
+    const details = {
+      attempts: counted,
+      error: error instanceof Error ? error.message : null,
+      exception: error instanceof Error ? error.name : null,
+    };
+    if (envelope === null) {
+      // ADR-0035: the original bytes are kept; only the dead_letter block is added.
+      const original = this.options.queue ?? stripDlqSuffix(topicName(producer.getTopic()));
+      // No retry decision was taken, so the value is informational: the delivered count.
+      const delivered = counted - 1;
+      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, kind, original, {
+        ...details,
+        attempts: delivered,
+      }).dead_letter;
+      const data = message.getData();
+      const body = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data);
+      const record = buildPoisonRecord(body, JSON.stringify(deadLetter));
+      return { data: Buffer.from(record, "utf8"), properties: poisonProperties(record) };
+    }
+    // The envelope as the next hop will see it: attempts is the counted value, the same one that was
+    // compared against maxAttempts and that dead_letter.attempts records.
+    const original = envelope.meta?.queue || this.options.queue || stripDlqSuffix(topicName(producer.getTopic()));
+    const annotated = annotate({ ...envelope, attempts: counted }, kind, original, details);
+    return toPulsarMessage(annotated);
   }
 
   private notifyRoutingMismatch(propertyUrn: string, bodyUrn: string, envelope: IncomingEnvelope): void {
@@ -387,4 +533,38 @@ function safeProperties(message: PulsarReceivedMessage): { [key: string]: string
   } catch {
     return {};
   }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** `orders.dlq` -> `orders`: the queue a DLQ topic belongs to (a name without the suffix is kept). */
+function stripDlqSuffix(topic: string): string {
+  return topic.endsWith(".dlq") && topic.length > 4 ? topic.slice(0, -4) : topic;
+}
+
+/**
+ * Contract `bq-*` properties for a poison DLQ record, projected from whatever the body carries (a body
+ * that is not an object, or carries none of them, yields none).
+ */
+function poisonProperties(recordJson: string): { [key: string]: string } {
+  const properties: { [key: string]: string } = {};
+  let record: unknown;
+  try {
+    record = JSON.parse(recordJson);
+  } catch {
+    return properties; // nested deeper than JSON.parse can recurse
+  }
+  if (record === null || typeof record !== "object") return properties;
+  const top = record as Record<string, unknown>;
+  const str = (value: unknown): string | undefined => (typeof value === "string" && value !== "" ? value : undefined);
+  const job = str(top["job"]) ?? str(top["urn"]);
+  if (job) properties["bq-job"] = job;
+  const trace = str(top["trace_id"]);
+  if (trace) properties["bq-trace-id"] = trace;
+  const meta = top["meta"] !== null && typeof top["meta"] === "object" ? (top["meta"] as Record<string, unknown>) : {};
+  const id = str(meta["id"]);
+  if (id) properties["bq-message-id"] = id;
+  return properties;
 }

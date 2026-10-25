@@ -363,7 +363,9 @@ test("a missing or non-integer body attempts stays rejected, whatever bq-attempt
   for (const [name, mutate] of variants) {
     const env = JSON.parse(JSON.stringify(base)) as { [key: string]: unknown };
     mutate(env);
-    const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(env), 2, { "bq-attempts": "4" })]);
+    // Poison: never handled. Reconciled attempts 1 + 1 for this delivery is below the default cap of 3, so
+    // with dead-lettering off it is retried (negative ack); at the cap it would be dropped (ADR-0036).
+    const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(env), 1, { "bq-attempts": "1" })]);
     let handled = 0;
     let reported: unknown = null;
     await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();

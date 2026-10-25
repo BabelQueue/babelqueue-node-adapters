@@ -9,6 +9,38 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: redelivery is bounded (ADR-0036 decisions 1 and 2).** `PulsarConsumer` used to
+  `negativeAcknowledge` a failing handler, an unmapped URN (no `onUnknownUrn`) and a non-conformant body
+  without limit, so such a message looped forever. It now takes `maxAttempts` (default **3**, the total
+  number of deliveries, the first included; `1` = no retry; below 1 or non-integer throws
+  `BabelQueueError`). Counted attempt = `bq-attempts` (body `attempts` as the fallback) floored by
+  `getRedeliveryCount()`, plus one for the current delivery; while it is below `maxAttempts` the message is
+  negatively acknowledged, otherwise it is dead-lettered or dropped. With the defaults a message that keeps
+  failing is now dropped at its **third delivery** (set `maxAttempts` higher to keep retrying, or pass a
+  `deadLetterProducer` to keep the message).
+- A body that does not decode into an envelope (not JSON, not an object, an object with neither a valid
+  `job` nor a valid `urn`, or any other body the codec does not accept as a conformant envelope) is **poison**: it never reaches a handler or `onUnknownUrn`. With a
+  `deadLetterProducer` it is written to the DLQ at once, without retry; without one it takes the bounded
+  retry, then a drop. It used to be negatively acknowledged forever.
+- `@babelqueue/core` dependency range raised from `^1.4.0` to `^1.13.0` (`buildPoisonRecord`).
+- Conformance v1.7.0 vendored; the `pulsar_exhaustion` section runs (the 10 rows that set an
+  `on_unknown_urn` option belong to SDKs with that option and are reported as skipped).
+
+### Added
+- `PulsarConsumerOptions.maxAttempts`, `deadLetterProducer`, `queue` and `onWarn`; the exported
+  `DEFAULT_MAX_ATTEMPTS`. Dead-lettering is on exactly when `deadLetterProducer` (a producer on
+  `<queue>.dlq`) is set. The dead-letter record is the canonical envelope with a `dead_letter` block
+  (`reason` `failed` / `unknown_urn`, `dead_letter.attempts` and `attempts` = the counted value), or for a
+  poison body the ADR-0035 record (`reason: "poison"`, original bytes kept; invalid UTF-8 as base64). The
+  original is acknowledged only after the record was sent; a failed send leaves it negatively acknowledged.
+  A dropped message is acknowledged and reported through `onWarn` (default `console.warn`).
+- The native Pulsar `DeadLetterPolicy` is not used by the SDK (it amends ADR-0014).
+
+### Known gap
+- A message with an unsupported `bq-schema-version` still takes the version gate (`onError` and a
+  `negativeAcknowledge`), which this release does not bound.
+
 ## [1.2.0] - 2026-10-10
 
 ### Added
