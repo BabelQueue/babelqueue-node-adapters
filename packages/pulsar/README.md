@@ -42,7 +42,12 @@ const consumer = new PulsarConsumer(
       console.log(env.data.order_id, env.trace_id, env.attempts);
     },
   },
-  { onError: (err) => console.error(err) },
+  {
+    // Declare the subscription type (or pass `client`): an undeclared type counts as Exclusive and
+    // the constructor throws, see "Exclusive / Failover subscriptions" below.
+    subscriptionType: "Shared",
+    onError: (err) => console.error(err),
+  },
 );
 await consumer.run();
 ```
@@ -98,7 +103,10 @@ The SDK counts `counted = reconciled attempts + 1` (the reconciled value above p
 delivery) and decides for a retryable outcome — a handler that throws, an unmapped URN without an
 `onUnknownUrn` hook, or a poison body with dead-lettering off:
 
-- `counted < maxAttempts` → **retry**: `negativeAcknowledge` (the native redelivery count advances).
+- `counted < maxAttempts` → **retry**: with a `retryProducer`, re-publish to the same topic with
+  `bq-attempts` (and the body's `attempts`) set to `counted`, then acknowledge (the Go model);
+  without a producer or client, `negativeAcknowledge` (the native redelivery count advances on
+  `Shared` / `Key_Shared` only; see Exclusive / Failover below).
 - otherwise → **dead-letter** when a `deadLetterProducer` is given, else **drop** (acknowledge, and
   a warning through `onWarn`, default `console.warn`).
 
@@ -107,6 +115,7 @@ const dlq = await client.createProducer({ topic: "orders.dlq" });
 const consumer = new PulsarConsumer(sub, handlers, {
   maxAttempts: 3,          // default
   deadLetterProducer: dlq, // dead-lettering is on exactly when this is set
+  client,                  // lets the consumer build its own retry producer; see Exclusive / Failover below
   queue: "orders",         // dead_letter.original_queue of a poison record (default: the DLQ topic without ".dlq")
 });
 ```
@@ -123,6 +132,32 @@ neither a valid `job` nor a valid `urn`, or any other body the codec does not ac
 shape (a strict JSON object keeps every original byte and gains a `dead_letter` block with
 `reason: "poison"`; anything else is wrapped as `{"raw", "raw_encoding"?, "dead_letter"}`). Without
 one it takes the bounded retry above and is then dropped.
+
+**Exclusive / Failover subscriptions.** A negative acknowledgement advances the native redelivery
+count only on `Shared` / `Key_Shared`; on `Exclusive` / `Failover` (pulsar-client's default is
+`Exclusive`) the count stays 0, so a nack-driven retry would never reach `maxAttempts`. The retry is
+therefore a **re-publish** to the consumer's own topic with `bq-attempts` + 1 and an acknowledge, which
+carries the count in the message itself (reconciled as `max(bq-attempts, redeliveryCount)`) and bounds
+every subscription type. Give the consumer the means to publish:
+
+```ts
+const consumer = new PulsarConsumer(sub, handlers, {
+  client,                          // the pulsar-client Client: the consumer builds the retry producer itself,
+                                   // lazily on the first retry, on sub.getTopic() (or `topic`)
+  subscriptionType: "Exclusive",   // or "Shared" / "Key_Shared" (not declared = Exclusive, see below)
+});
+// or pass your own producer on the topic you read: { retryProducer: await client.createProducer({ topic }) }
+```
+
+A given `retryProducer` wins over `client`. The constructor **fails closed**: with `maxAttempts > 1`
+and neither a `retryProducer` nor a `client` (with a resolvable topic), `subscriptionType` `Exclusive`,
+`Failover` **or not declared** (it then counts as `Exclusive`, pulsar-client's default) throws a
+`BabelQueueError`. Declare `subscriptionType: "Shared"` or `"Key_Shared"` to keep the
+`negativeAcknowledge` retry without a producer. A poison body is re-published byte for byte, only
+`bq-attempts` moves; out-of-band headers (e.g. `traceparent`) ride along, and the incoming `bq-job`
+route is kept on the retry and on the DLQ record so every delivery reaches the same handler. A failed
+re-publish or producer creation leaves the original negatively acknowledged and is reported through
+`onWarn`.
 
 **Behaviour change (MINOR).** Redelivery used to be unbounded; with the defaults a message that keeps
 failing is now dropped (or dead-lettered) at its third delivery. Set `maxAttempts` higher to keep

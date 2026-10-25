@@ -6,6 +6,7 @@ import type { Envelope } from "@babelqueue/core";
 
 import {
   DEFAULT_MAX_ATTEMPTS,
+  type PulsarClientLike,
   PulsarConsumer,
   type BabelHandlers,
   type PulsarConsumerClient,
@@ -13,6 +14,7 @@ import {
   type PulsarProducerMessage,
   type PulsarReceivedMessage,
 } from "../src/index.js";
+import { sharedConsumer } from "./support.js";
 
 // ADR-0036 decisions 1, 2, 4 and 8: bounded redelivery, the poison route, dead_letter.attempts.
 
@@ -108,7 +110,7 @@ test("a handler that keeps failing is dead-lettered on its 3rd delivery, not red
   const client = new RedeliveringConsumer(message);
   const producer = new FakeProducer();
   const errors: unknown[] = [];
-  const consumer = new PulsarConsumer(client, failing, { deadLetterProducer: producer, onError: (e) => errors.push(e) });
+  const consumer = sharedConsumer(client, failing, { deadLetterProducer: producer, onError: (e) => errors.push(e) });
 
   assert.equal(await deliveriesUntilAck(consumer, client), 3);
   assert.equal(client.nacked, 2);
@@ -129,7 +131,7 @@ test("with dead-lettering off the 3rd delivery is acknowledged and dropped with 
   const message = new FakeMessage(bodyOf(0));
   const client = new RedeliveringConsumer(message);
   const warnings: string[] = [];
-  const consumer = new PulsarConsumer(client, failing, { onWarn: (w) => warnings.push(w) });
+  const consumer = sharedConsumer(client, failing, { onWarn: (w) => warnings.push(w) });
 
   assert.equal(await deliveriesUntilAck(consumer, client), 3);
   assert.equal(client.nacked, 2);
@@ -141,7 +143,7 @@ test("an unmapped URN without a hook is bounded and dead-lettered with reason un
   const message = new FakeMessage(bodyOf(0));
   const client = new RedeliveringConsumer(message);
   const producer = new FakeProducer();
-  const consumer = new PulsarConsumer(client, {}, { deadLetterProducer: producer });
+  const consumer = sharedConsumer(client, {}, { deadLetterProducer: producer });
 
   assert.equal(await deliveriesUntilAck(consumer, client), 3);
   const record = dlqRecord(producer);
@@ -153,7 +155,7 @@ test("maxAttempts 1 means no retry: the first failure is dead-lettered with atte
   const message = new FakeMessage(bodyOf(0));
   const client = new RedeliveringConsumer(message);
   const producer = new FakeProducer();
-  await new PulsarConsumer(client, failing, { maxAttempts: 1, deadLetterProducer: producer }).poll();
+  await sharedConsumer(client, failing, { maxAttempts: 1, deadLetterProducer: producer }).poll();
   assert.equal(client.nacked, 0);
   assert.equal(client.acked, 1);
   assert.equal(dlqRecord(producer).dead_letter.attempts, 1);
@@ -164,7 +166,7 @@ test("an onUnknownUrn hook keeps its behaviour: the hook runs and the message is
   const client = new RedeliveringConsumer(message);
   const producer = new FakeProducer();
   let hooked = 0;
-  await new PulsarConsumer(client, {}, { deadLetterProducer: producer, onUnknownUrn: () => void hooked++ }).poll();
+  await sharedConsumer(client, {}, { deadLetterProducer: producer, onUnknownUrn: () => void hooked++ }).poll();
   assert.equal(hooked, 1);
   assert.equal(client.acked, 1);
   assert.equal(producer.sent.length, 0);
@@ -173,7 +175,7 @@ test("an onUnknownUrn hook keeps its behaviour: the hook runs and the message is
 test("the dead-letter record keeps the redelivered attempts (bq-attempts floored by the redelivery count)", async () => {
   const client = new RedeliveringConsumer(new FakeMessage(bodyOf(0), 4, { "bq-attempts": "1" }));
   const producer = new FakeProducer();
-  await new PulsarConsumer(client, failing, { deadLetterProducer: producer }).poll();
+  await sharedConsumer(client, failing, { deadLetterProducer: producer }).poll();
   assert.equal(dlqRecord(producer).dead_letter.attempts, 5);
 });
 
@@ -183,7 +185,7 @@ test("a failed DLQ write leaves the original negatively acknowledged, and the ne
   const producer = new FakeProducer();
   producer.failures = 1;
   const warnings: string[] = [];
-  const consumer = new PulsarConsumer(client, failing, { deadLetterProducer: producer, onWarn: (w) => warnings.push(w) });
+  const consumer = sharedConsumer(client, failing, { deadLetterProducer: producer, onWarn: (w) => warnings.push(w) });
 
   await consumer.poll();
   assert.equal(client.acked, 0);
@@ -199,7 +201,7 @@ test("a failed DLQ write leaves the original negatively acknowledged, and the ne
 test("maxAttempts must be an integer of at least 1", () => {
   const client = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
   for (const bad of [0, -1, 1.5, Number.NaN]) {
-    assert.throws(() => new PulsarConsumer(client, {}, { maxAttempts: bad }), /maxAttempts must be an integer of at least 1/);
+    assert.throws(() => sharedConsumer(client, {}, { maxAttempts: bad }), /maxAttempts must be an integer of at least 1/);
   }
 });
 
@@ -209,7 +211,7 @@ test("the default onWarn writes to console.warn", async () => {
   const seen: string[] = [];
   console.warn = (m: unknown) => void seen.push(String(m));
   try {
-    await new PulsarConsumer(client, failing).poll();
+    await sharedConsumer(client, failing).poll();
   } finally {
     console.warn = original;
   }
@@ -233,7 +235,7 @@ for (const [label, raw] of bodies) {
     const producer = new FakeProducer();
     let handled = 0;
     let hooked = 0;
-    await new PulsarConsumer(
+    await sharedConsumer(
       client,
       { [URN]: () => void handled++ },
       { deadLetterProducer: producer, onUnknownUrn: () => void hooked++ },
@@ -251,7 +253,7 @@ for (const [label, raw] of bodies) {
 
 test("a poison body keeps its bytes: an object is spliced, anything else is wrapped (ADR-0035)", async () => {
   const spliced = new FakeProducer();
-  await new PulsarConsumer(
+  await sharedConsumer(
     new RedeliveringConsumer(new FakeMessage('{"data":{"big":1e400},"attempts":0}')),
     {},
     { deadLetterProducer: spliced },
@@ -260,7 +262,7 @@ test("a poison body keeps its bytes: an object is spliced, anything else is wrap
   assert.ok(text.startsWith('{"data":{"big":1e400},"attempts":0,"dead_letter":{'), text);
 
   const wrapped = new FakeProducer();
-  await new PulsarConsumer(
+  await sharedConsumer(
     new RedeliveringConsumer(new FakeMessage(Buffer.from([0xff, 0xfe, 0x41]))),
     {},
     { deadLetterProducer: wrapped },
@@ -270,7 +272,7 @@ test("a poison body keeps its bytes: an object is spliced, anything else is wrap
   assert.equal(record["raw_encoding"], "base64");
 
   const text2 = new FakeProducer();
-  await new PulsarConsumer(
+  await sharedConsumer(
     new RedeliveringConsumer(new FakeMessage("not-json")),
     {},
     { deadLetterProducer: text2 },
@@ -282,7 +284,7 @@ test("a poison body keeps its bytes: an object is spliced, anything else is wrap
 
 test("an identity-less object that still carries a trace id and message id projects them onto the DLQ message", async () => {
   const producer = new FakeProducer();
-  await new PulsarConsumer(
+  await sharedConsumer(
     new RedeliveringConsumer(new FakeMessage('{"trace_id":"t-1","meta":{"id":"m-1"},"data":{}}')),
     {},
     { deadLetterProducer: producer },
@@ -292,7 +294,7 @@ test("an identity-less object that still carries a trace id and message id proje
 
 test("the poison queue name is the queue option when given", async () => {
   const producer = new FakeProducer();
-  await new PulsarConsumer(
+  await sharedConsumer(
     new RedeliveringConsumer(new FakeMessage("not-json")),
     {},
     { deadLetterProducer: producer, queue: "billing" },
@@ -304,7 +306,7 @@ test("poison with dead-lettering off takes the bounded retry, then a drop", asyn
   const message = new FakeMessage("not-json");
   const client = new RedeliveringConsumer(message);
   const warnings: string[] = [];
-  const consumer = new PulsarConsumer(client, failing, { onWarn: (w) => warnings.push(w) });
+  const consumer = sharedConsumer(client, failing, { onWarn: (w) => warnings.push(w) });
   assert.equal(await deliveriesUntilAck(consumer, client), 3);
   assert.equal(client.nacked, 2);
   assert.match(warnings[0] as string, /dropped a poison/);
@@ -312,7 +314,7 @@ test("poison with dead-lettering off takes the bounded retry, then a drop", asyn
 
 test("poison counts attempts from bq-attempts and the redelivery count, not from the body", async () => {
   const client = new RedeliveringConsumer(new FakeMessage('{"attempts":0,"data":{}}', 0, { "bq-attempts": "2" }));
-  await new PulsarConsumer(client, {}, { onWarn: () => undefined }).poll();
+  await sharedConsumer(client, {}, { onWarn: () => undefined }).poll();
   assert.equal(client.nacked, 0);
   assert.equal(client.acked, 1, "reconciled 2 + 1 reaches the default cap of 3");
 });
@@ -321,7 +323,7 @@ test("a failed DLQ write of a poison body leaves it negatively acknowledged", as
   const client = new RedeliveringConsumer(new FakeMessage("not-json"));
   const producer = new FakeProducer();
   producer.failures = 1;
-  const consumer = new PulsarConsumer(client, {}, { deadLetterProducer: producer, onWarn: () => undefined });
+  const consumer = sharedConsumer(client, {}, { deadLetterProducer: producer, onWarn: () => undefined });
   await consumer.poll();
   assert.equal(client.acked, 0);
   assert.equal(client.nacked, 1);
@@ -334,7 +336,312 @@ test("a message routed on bq-job to a handler still fails through the bounded pa
   const env: Envelope = EnvelopeCodec.make("urn:babel:other", {}, { queue: "orders" });
   const client = new RedeliveringConsumer(new FakeMessage(EnvelopeCodec.encode(env), 0, { "bq-job": URN }));
   const producer = new FakeProducer();
-  const consumer = new PulsarConsumer(client, failing, { deadLetterProducer: producer });
+  const consumer = sharedConsumer(client, failing, { deadLetterProducer: producer });
   assert.equal(await deliveriesUntilAck(consumer, client), 3);
   assert.equal(dlqRecord(producer).dead_letter.reason, "failed");
+});
+
+// --- retryProducer: Go-model retry, bounded on every subscription type (Exclusive / Failover) ------------
+
+/**
+ * An Exclusive / Failover subscription: pulsar-client's negative acknowledgement redelivers the message
+ * but its redelivery count stays 0, so a nack-driven retry never advances the native count. A re-published
+ * message is a new message (count 0 as well): only `bq-attempts` carries the attempts.
+ */
+class ExclusiveTopic implements PulsarConsumerClient, PulsarProducer {
+  queue: FakeMessage[] = [];
+  acked = 0;
+  nacked = 0;
+  sent: PulsarProducerMessage[] = [];
+  failSends = 0;
+  constructor(first: FakeMessage) {
+    this.queue.push(first);
+  }
+  getTopic(): string {
+    return "persistent://public/default/orders";
+  }
+  async receive(): Promise<PulsarReceivedMessage> {
+    const next = this.queue.shift();
+    if (next === undefined) throw new Error("Failed to receive message: TimeOut");
+    return next;
+  }
+  acknowledge(): void {
+    this.acked += 1;
+  }
+  negativeAcknowledge(message: PulsarReceivedMessage): void {
+    this.nacked += 1;
+    this.queue.push(message as FakeMessage); // redelivered unchanged, redelivery count stays 0
+  }
+  async send(message: PulsarProducerMessage): Promise<unknown> {
+    if (this.failSends > 0) {
+      this.failSends -= 1;
+      throw new Error("broker down");
+    }
+    this.sent.push(message);
+    this.queue.push(new FakeMessage(message.data, 0, message.properties ?? {}));
+    return {};
+  }
+}
+
+async function drain(consumer: PulsarConsumer, topic: ExclusiveTopic, limit = 20): Promise<number> {
+  let polls = 0;
+  // Done when nothing is left to deliver: a retry acknowledges the original but re-publishes a new message.
+  while (topic.queue.length > 0 && polls < limit) {
+    await consumer.poll();
+    polls += 1;
+  }
+  return polls;
+}
+
+test("Exclusive/Failover regression: without a retryProducer a nack never advances the count (the loop this option closes)", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  const consumer = sharedConsumer(topic, failing, { deadLetterProducer: new FakeProducer(), onError: () => undefined });
+  assert.equal(await drain(consumer, topic), 20, "still not terminated after 20 deliveries");
+  assert.equal(topic.nacked, 20);
+});
+
+test("Exclusive/Failover: with a retryProducer a failing handler stops at its 3rd delivery and is dead-lettered", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  const dlq = new FakeProducer();
+  const consumer = sharedConsumer(topic, failing, { retryProducer: topic, deadLetterProducer: dlq, onError: () => undefined });
+
+  assert.equal(await drain(consumer, topic), 3);
+  assert.equal(topic.nacked, 0, "retry is a re-publish + ack, never a nack");
+  assert.equal(topic.sent.length, 2);
+  assert.equal(topic.acked, 3, "each delivery is acknowledged (2 retries + the dead-letter)");
+  const record = dlqRecord(dlq);
+  assert.equal(record.dead_letter.reason, "failed");
+  assert.equal(record.dead_letter.attempts, 3);
+});
+
+test("a retry re-publishes bq-attempts = counted with the body's attempts in sync, on the consumer's own topic", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0), 0, { traceparent: "00-aa-bb-01", "bq-delay": "500" }));
+  await sharedConsumer(topic, failing, { retryProducer: topic, onError: () => undefined }).poll();
+
+  assert.equal(topic.sent.length, 1);
+  const sent = topic.sent[0] as PulsarProducerMessage;
+  assert.equal(sent.properties?.["bq-attempts"], "1");
+  assert.equal(sent.properties?.["bq-job"], URN);
+  assert.equal(sent.properties?.["traceparent"], "00-aa-bb-01", "out-of-band headers are carried");
+  assert.equal(sent.properties?.["bq-delay"], undefined, "the one-shot delay is not repeated");
+  assert.equal((JSON.parse(sent.data.toString("utf8")) as { attempts: number }).attempts, 1);
+  assert.equal(topic.acked, 1);
+  assert.equal(topic.nacked, 0);
+});
+
+test("an unmapped URN is bounded the same way on Exclusive/Failover", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  const dlq = new FakeProducer();
+  const consumer = sharedConsumer(topic, {}, { retryProducer: topic, deadLetterProducer: dlq, onError: () => undefined });
+  assert.equal(await drain(consumer, topic), 3);
+  assert.equal(dlqRecord(dlq).dead_letter.reason, "unknown_urn");
+});
+
+test("poison with dead-lettering off is retried byte for byte with bq-attempts + 1, then dropped (Exclusive/Failover)", async () => {
+  const raw = Buffer.from([0xff, 0xfe, 0x41]);
+  const topic = new ExclusiveTopic(new FakeMessage(raw));
+  const warnings: string[] = [];
+  const consumer = sharedConsumer(topic, failing, { retryProducer: topic, onError: () => undefined, onWarn: (w) => warnings.push(w) });
+
+  assert.equal(await drain(consumer, topic), 3);
+  assert.equal(topic.sent.length, 2);
+  assert.deepEqual((topic.sent[0] as PulsarProducerMessage).data, raw, "body bytes untouched");
+  assert.equal((topic.sent[0] as PulsarProducerMessage).properties?.["bq-attempts"], "1");
+  assert.equal((topic.sent[1] as PulsarProducerMessage).properties?.["bq-attempts"], "2");
+  assert.match(warnings[0] as string, /dropped a poison/);
+});
+
+test("a failed retry re-publish leaves the original negatively acknowledged and the next delivery retries again", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  topic.failSends = 1;
+  const warnings: string[] = [];
+  const consumer = sharedConsumer(topic, failing, { retryProducer: topic, onError: () => undefined, onWarn: (w) => warnings.push(w) });
+
+  await consumer.poll();
+  assert.equal(topic.acked, 0);
+  assert.equal(topic.nacked, 1);
+  assert.match(warnings[0] as string, /retry re-publish to .*orders failed \(broker down\)/);
+
+  await consumer.poll();
+  assert.equal(topic.acked, 1);
+  assert.equal(topic.sent.length, 1);
+});
+
+test("a re-published message and the native redelivery count reconcile to the higher value", async () => {
+  // bq-attempts 1 (a re-publish) with a Shared redelivery count of 2: reconciled 2, counted 3 -> dead-letter.
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(1), 2, { "bq-attempts": "1" }));
+  const dlq = new FakeProducer();
+  await sharedConsumer(topic, failing, { retryProducer: topic, deadLetterProducer: dlq, onError: () => undefined }).poll();
+  assert.equal(dlqRecord(dlq).dead_letter.attempts, 3);
+  assert.equal(topic.sent.length, 0);
+});
+
+// --- the incoming route (bq-job) survives a retry and the DLQ record (Go publishKeepingRoute) ----------
+
+test("a message routed on bq-job stays on that handler across retries and reaches the DLQ as failed", async () => {
+  const OTHER = "urn:babel:other";
+  const env = EnvelopeCodec.make(OTHER, { order_id: 1 }, { queue: "orders" }); // the body names another URN
+  const topic = new ExclusiveTopic(new FakeMessage(EnvelopeCodec.encode(env), 0, { "bq-job": URN }));
+  const dlq = new FakeProducer();
+  const routedTo: string[] = [];
+  const consumer = sharedConsumer(
+    topic,
+    {
+      [URN]: () => {
+        routedTo.push(URN);
+        throw new Error("boom");
+      },
+      [OTHER]: () => {
+        routedTo.push(OTHER);
+      },
+    },
+    { retryProducer: topic, deadLetterProducer: dlq, onError: () => undefined },
+  );
+
+  assert.equal(await drain(consumer, topic), 3);
+  assert.deepEqual(routedTo, [URN, URN, URN], "every delivery reaches the bq-job handler");
+  for (const sent of topic.sent) assert.equal(sent.properties?.["bq-job"], URN);
+  const record = dlqRecord(dlq);
+  assert.equal(record.dead_letter.reason, "failed");
+  assert.equal((dlq.sent[0] as PulsarProducerMessage).properties?.["bq-job"], URN, "the DLQ record keeps the route");
+});
+
+test("a message without a bq-job property is published with its body URN", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  await sharedConsumer(topic, failing, { retryProducer: topic, onError: () => undefined }).poll();
+  assert.equal((topic.sent[0] as PulsarProducerMessage).properties?.["bq-job"], URN);
+});
+
+test("a poison body keeps the incoming bq-job on its retry and its DLQ record", async () => {
+  const retry = new ExclusiveTopic(new FakeMessage("not-json", 0, { "bq-job": URN }));
+  await sharedConsumer(retry, failing, { retryProducer: retry, onWarn: () => undefined, onError: () => undefined }).poll();
+  assert.equal((retry.sent[0] as PulsarProducerMessage).properties?.["bq-job"], URN);
+
+  const dlq = new FakeProducer();
+  await sharedConsumer(new RedeliveringConsumer(new FakeMessage("not-json", 0, { "bq-job": URN })), {}, { deadLetterProducer: dlq }).poll();
+  assert.equal((dlq.sent[0] as PulsarProducerMessage).properties?.["bq-job"], URN);
+});
+
+// --- the consumer builds its own retry producer from the client; Exclusive/Failover are checked at setup ---
+
+/** An Exclusive topic that also acts as the client: createProducer hands out the topic as the producer. */
+class ClientOver implements PulsarClientLike {
+  created: { topic: string }[] = [];
+  failures = 0;
+  constructor(private readonly topic: ExclusiveTopic) {}
+  async createProducer(config: { topic: string }): Promise<PulsarProducer> {
+    if (this.failures > 0) {
+      this.failures -= 1;
+      throw new Error("no producer");
+    }
+    this.created.push(config);
+    return this.topic;
+  }
+}
+
+class TopicAwareExclusive extends ExclusiveTopic {
+  override getTopic(): string {
+    return "persistent://public/default/orders";
+  }
+}
+
+test("with a client the consumer builds the retry producer itself, once, on the subscription's topic", async () => {
+  const topic = new TopicAwareExclusive(new FakeMessage(bodyOf(0)));
+  const client = new ClientOver(topic);
+  const dlq = new FakeProducer();
+  const consumer = new PulsarConsumer(topic, failing, {
+    client,
+    subscriptionType: "Exclusive",
+    deadLetterProducer: dlq,
+    onError: () => undefined,
+  });
+
+  assert.equal(client.created.length, 0, "lazy: nothing is created before the first retry");
+  assert.equal(await drain(consumer, topic), 3);
+  assert.deepEqual(client.created, [{ topic: "persistent://public/default/orders" }], "created once");
+  assert.equal(topic.nacked, 0);
+  assert.equal(dlqRecord(dlq).dead_letter.attempts, 3);
+});
+
+test("a given retryProducer wins over the client; the topic option overrides getTopic", async () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  const client = new ClientOver(topic);
+  await new PulsarConsumer(topic, failing, { client, retryProducer: topic, onError: () => undefined }).poll();
+  assert.equal(client.created.length, 0);
+  assert.equal(topic.sent.length, 1);
+
+  const other = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  const otherClient = new ClientOver(other);
+  await new PulsarConsumer(other, failing, { client: otherClient, topic: "orders-x", onError: () => undefined }).poll();
+  assert.deepEqual(otherClient.created, [{ topic: "orders-x" }]);
+});
+
+test("a failed producer creation warns, nacks, and is tried again on the next retry", async () => {
+  const topic = new TopicAwareExclusive(new FakeMessage(bodyOf(0)));
+  const client = new ClientOver(topic);
+  client.failures = 1;
+  const warnings: string[] = [];
+  const consumer = new PulsarConsumer(topic, failing, { client, onError: () => undefined, onWarn: (w) => warnings.push(w) });
+
+  await consumer.poll();
+  assert.equal(topic.nacked, 1);
+  assert.match(warnings[0] as string, /creating the retry producer on .*orders failed \(no producer\)/);
+
+  await consumer.poll();
+  assert.equal(topic.sent.length, 1);
+  assert.equal(topic.acked, 1);
+});
+
+test("Exclusive / Failover without a retry producer or client is rejected at construction", () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  for (const subscriptionType of ["Exclusive", "Failover"] as const) {
+    assert.throws(
+      () => new PulsarConsumer(topic, failing, { subscriptionType }),
+      /needs a retryProducer \(or a client plus a topic\)/,
+      subscriptionType,
+    );
+  }
+  // a client alone is not enough when no topic can be resolved (this subscription has no getTopic)
+  const noTopic = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
+  assert.throws(
+    () => new PulsarConsumer(noTopic, failing, { subscriptionType: "Exclusive", client: new ClientOver(topic) }),
+    /needs a retryProducer/,
+  );
+});
+
+test("Exclusive / Failover are accepted with a producer, a client plus topic, or maxAttempts 1", () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  new PulsarConsumer(topic, failing, { subscriptionType: "Exclusive", retryProducer: topic });
+  new PulsarConsumer(topic, failing, { subscriptionType: "Failover", client: new ClientOver(topic), topic: "orders" });
+  new PulsarConsumer(topic, failing, { subscriptionType: "Exclusive", maxAttempts: 1 });
+});
+
+test("Shared / Key_Shared / KeyShared keep the nack path without a producer or client", async () => {
+  for (const subscriptionType of ["Shared", "Key_Shared", "KeyShared"] as const) {
+    const client = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
+    const consumer = new PulsarConsumer(client, failing, { subscriptionType, onError: () => undefined, onWarn: () => undefined });
+    assert.equal(await deliveriesUntilAck(consumer, client), 3, subscriptionType);
+    assert.equal(client.nacked, 2);
+  }
+});
+
+test("an undeclared subscriptionType counts as Exclusive: no retry producer or client is rejected at construction", () => {
+  const client = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
+  assert.throws(
+    () => new PulsarConsumer(client, failing),
+    /An undeclared subscriptionType \(treated as Exclusive\) needs a retryProducer.*subscriptionType: "Shared"/s,
+  );
+  assert.throws(() => new PulsarConsumer(client, failing, { deadLetterProducer: new FakeProducer() }), /undeclared subscriptionType/);
+});
+
+test("an undeclared subscriptionType is accepted with a retryProducer, a client plus topic, or maxAttempts 1", () => {
+  const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
+  new PulsarConsumer(topic, failing, { retryProducer: topic });
+  new PulsarConsumer(topic, failing, { client: new ClientOver(topic), topic: "orders" });
+  new PulsarConsumer(topic, failing, { maxAttempts: 1 });
+});
+
+test("an unknown subscriptionType is rejected", () => {
+  const client = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
+  assert.throws(() => new PulsarConsumer(client, {}, { subscriptionType: "Nope" as never }), /Unknown subscriptionType "Nope"/);
 });

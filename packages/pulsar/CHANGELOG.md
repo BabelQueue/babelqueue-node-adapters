@@ -27,6 +27,31 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Conformance v1.7.0 vendored; the `pulsar_exhaustion` section runs (the 10 rows that set an
   `on_unknown_urn` option belong to SDKs with that option and are reported as skipped).
 
+### Fixed
+- **Bounded retry on `Exclusive` / `Failover` subscriptions.** A negative acknowledgement does not advance
+  `getRedeliveryCount()` on those subscription types, so the nack-driven retry never reached `maxAttempts`.
+  A retry can now re-publish the message to the consumer's own topic with `bq-attempts` = counted (body
+  `attempts` in sync, out-of-band headers carried, a poison body byte for byte) and acknowledge the original,
+  the Go model, so the bound holds on every subscription type. New options: `client` (the consumer builds the
+  retry producer itself, lazily on the first retry, on `topic` or the subscription's `getTopic()`),
+  `retryProducer` (your own producer on that topic; wins over `client`), `topic` and `subscriptionType`.
+  A failed re-publish or producer creation leaves the original negatively acknowledged and warns through
+  `onWarn`. The retry and the DLQ message keep the route the delivery arrived on: a non-blank incoming `bq-job`
+  property is carried over even when the body names another URN, so every delivery reaches the same handler
+  (the Go runtime's `publishKeepingRoute`).
+- **Behaviour change: the constructor fails closed on a subscription it cannot bound.** On `Exclusive` and
+  `Failover` a negative acknowledgement does not advance the redelivery count, so a retry without a
+  re-publish would loop forever. `subscriptionType` (new option) is therefore checked at construction: with
+  `maxAttempts > 1` (the default is 3) and neither a `retryProducer` nor a `client` with a resolvable topic,
+  `new PulsarConsumer(...)` throws `BabelQueueError` for `Exclusive` and `Failover` — and **also when
+  `subscriptionType` is not declared**, which counts as `Exclusive` (pulsar-client's own default).
+  **Who is affected:** everyone who builds `new PulsarConsumer(sub, handlers, options)` with the default
+  `maxAttempts` and passes none of `client`, `retryProducer` or `subscriptionType`. **Fix, either one:** pass
+  `client` (the pulsar-client `Client`; the consumer builds its retry producer itself), or declare
+  `subscriptionType: "Shared"` (or `"Key_Shared"`) when the subscription really is one — the nack retry is
+  bounded there. `maxAttempts: 1` (no retry) needs neither.
+- New exported types `PulsarClientLike` and `PulsarSubscriptionType`; `PulsarConsumerClient.getTopic?()`.
+
 ### Added
 - `PulsarConsumerOptions.maxAttempts`, `deadLetterProducer`, `queue` and `onWarn`; the exported
   `DEFAULT_MAX_ATTEMPTS`. Dead-lettering is on exactly when `deadLetterProducer` (a producer on

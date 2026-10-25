@@ -18,7 +18,7 @@
  *     });
  *     const consumer = new PulsarConsumer(sub, {
  *       "urn:babel:orders:created": async (env) => { ... },
- *     });
+ *     }, { subscriptionType: "Shared" }); // declare it (or pass `client`): see PulsarConsumerOptions
  *     await consumer.run();
  *
  * This implements §5 of the broker-bindings contract: the canonical envelope is the message
@@ -88,10 +88,23 @@ export interface PulsarReceivedMessage {
  * satisfies it structurally; a fake satisfies it in tests.
  */
 export interface PulsarConsumerClient {
+  /** The topic the subscription reads (pulsar-client `Consumer.getTopic()`); used to build the retry producer. */
+  getTopic?(): string;
   receive(timeoutMs?: number): Promise<PulsarReceivedMessage>;
   acknowledge(message: PulsarReceivedMessage): Promise<void> | void;
   negativeAcknowledge(message: PulsarReceivedMessage): Promise<void> | void;
 }
+
+/**
+ * The subset of the Pulsar client this adapter calls to build its own retry producer. A `Client` from
+ * `pulsar-client` satisfies it structurally.
+ */
+export interface PulsarClientLike {
+  createProducer(config: { topic: string }): Promise<PulsarProducer>;
+}
+
+/** The subscription type, as pulsar-client names it (`Key_Shared` is accepted as an alias of `KeyShared`). */
+export type PulsarSubscriptionType = "Exclusive" | "Shared" | "Failover" | "KeyShared" | "Key_Shared";
 
 // --- Property projection (contract §5.2) ---------------------------------------
 
@@ -239,6 +252,35 @@ export interface PulsarConsumerOptions {
    */
   deadLetterProducer?: PulsarProducer;
   /**
+   * A producer on the consumer's **own** topic. A retry re-publishes the message to that topic with
+   * `bq-attempts` (and the body's `attempts`) raised to the counted value and then acknowledges the
+   * original — the Go model. The count then lives in the message itself, so the bound holds on every
+   * subscription type. Optional when {@link client} is given (the consumer builds the producer itself);
+   * a failed re-publish leaves the original negatively acknowledged (never lost).
+   *
+   * Without a producer or a client a retry is a `negativeAcknowledge`, which advances the native
+   * redelivery count only on `Shared` / `Key_Shared`: on `Exclusive` / `Failover` it stays 0 and the retry
+   * would never reach `maxAttempts`, so that combination is rejected at construction (see
+   * {@link subscriptionType}).
+   */
+  retryProducer?: PulsarProducer;
+  /**
+   * The Pulsar client the consumer builds its retry producer from, lazily on the first retry, on
+   * {@link topic} (default `getTopic()` of the subscription). Ignored when {@link retryProducer} is given.
+   */
+  client?: PulsarClientLike;
+  /** The topic the retry producer is created on (default: the subscription's `getTopic()`). */
+  topic?: string;
+  /**
+   * The subscription type the consumer was created with. `Exclusive` and `Failover` cannot bound a
+   * nack-driven retry (a negative acknowledgement does not advance the redelivery count there), so with
+   * `maxAttempts > 1` they require a {@link retryProducer} or a {@link client}. **Not declaring it counts as
+   * `Exclusive`** (pulsar-client's own default, and the fail-closed choice): without a `retryProducer` or a
+   * `client` the constructor throws `BabelQueueError`. Declare `"Shared"` or `"Key_Shared"` to keep the
+   * `negativeAcknowledge` retry without a producer.
+   */
+  subscriptionType?: PulsarSubscriptionType;
+  /**
    * The queue name written to `dead_letter.original_queue` of a poison record (a decodable envelope
    * uses its own `meta.queue`). Defaults to the {@link deadLetterProducer} topic without its `.dlq`
    * suffix.
@@ -306,13 +348,15 @@ function decodePayload(data: Buffer | string): string {
  * Receives from a Pulsar subscription, decodes + validates each message, routes it to the
  * handler for its URN, and acknowledges it on success. A throwing handler
  * `negativeAcknowledge`s the message — the broker redelivers it and increments
- * `getRedeliveryCount()` (at-least-once) — until `maxAttempts` deliveries are used up; the last one is
+ * `getRedeliveryCount()` (at-least-once; with a `retryProducer` the message is instead re-published with
+ * `bq-attempts` + 1, which also bounds `Exclusive` / `Failover` subscriptions) — until `maxAttempts` deliveries are used up; the last one is
  * dead-lettered to `<queue>.dlq` or acknowledged and dropped (ADR-0036). Routing uses the `bq-job`
  * property (body URN as the fallback); `attempts` is the `bq-attempts` property (body value as the
  * fallback) reconciled to `max(.., getRedeliveryCount())` for the handler.
  */
 export class PulsarConsumer {
   private readonly maxAttempts: number;
+  private builtRetryProducer: Promise<PulsarProducer | undefined> | undefined;
   private readonly warn: (message: string) => void;
 
   constructor(
@@ -325,7 +369,51 @@ export class PulsarConsumer {
       throw new BabelQueueError(`maxAttempts must be an integer of at least 1, got ${String(maxAttempts)}.`);
     }
     this.maxAttempts = maxAttempts;
+    this.checkRetryBound(maxAttempts);
     this.warn = options.onWarn ?? ((message) => console.warn(message));
+  }
+
+  /**
+   * Setup check: on `Exclusive` / `Failover` (and an undeclared type) a negative acknowledgement does not advance the native
+   * redelivery count, so a retry needs a re-publish. Fail loudly here instead of looping at run time.
+   */
+  private checkRetryBound(maxAttempts: number): void {
+    const declared = this.options.subscriptionType;
+    if (declared !== undefined && !["Exclusive", "Shared", "Failover", "KeyShared"].includes(declared.replace("_", ""))) {
+      throw new BabelQueueError(`Unknown subscriptionType "${String(declared)}".`);
+    }
+    // An undeclared type is treated as Exclusive (fail closed).
+    const type = declared === undefined ? "Exclusive" : declared.replace("_", "");
+    if (type !== "Exclusive" && type !== "Failover") return;
+    if (maxAttempts === 1 || this.options.retryProducer !== undefined) return;
+    if (this.options.client !== undefined && this.retryTopic() !== undefined) return;
+    const shown = declared === undefined ? "An undeclared subscriptionType (treated as Exclusive)" : `A ${type} subscription`;
+    throw new BabelQueueError(
+      `${shown} needs a retryProducer (or a client plus a topic) to bound retries: ` +
+        "a negative acknowledgement does not advance the redelivery count there, so a retry would never reach maxAttempts. " +
+        'Pass a client or retryProducer, or declare subscriptionType: "Shared" / "Key_Shared".',
+    );
+  }
+
+  private retryTopic(): string | undefined {
+    const configured = this.options.topic;
+    if (configured !== undefined && configured !== "") return configured;
+    const own = typeof this.consumer.getTopic === "function" ? this.consumer.getTopic() : undefined;
+    return own !== undefined && own !== "" ? own : undefined;
+  }
+
+  /** The retry producer: the one given, else one built (once) from the client; undefined when neither exists. */
+  private async resolveRetryProducer(): Promise<PulsarProducer | undefined> {
+    if (this.options.retryProducer !== undefined) return this.options.retryProducer;
+    const client = this.options.client;
+    const topic = this.retryTopic();
+    if (client === undefined || topic === undefined) return undefined;
+    this.builtRetryProducer ??= client.createProducer({ topic }).catch((error: unknown) => {
+      this.builtRetryProducer = undefined; // try again on the next retry
+      this.warn(`babelqueue: creating the retry producer on ${topic} failed (${errorText(error)}).`);
+      return undefined;
+    });
+    return this.builtRetryProducer;
   }
 
   /** Receive one message (up to the receive timeout), route + settle it. Returns 1, or 0 on timeout. */
@@ -443,7 +531,7 @@ export class PulsarConsumer {
       return;
     }
     if (counted < this.maxAttempts) {
-      await this.consumer.negativeAcknowledge(message);
+      await this.retry(counted, envelope, message);
       return;
     }
     if (producer !== undefined) {
@@ -454,6 +542,48 @@ export class PulsarConsumer {
       `babelqueue: dropped a ${kind} Apache Pulsar message after ${counted} of ${this.maxAttempts} deliveries (dead-lettering is off).`,
     );
     await this.consumer.acknowledge(message);
+  }
+
+  /**
+   * Retry one delivery. With a {@link PulsarConsumerOptions.retryProducer}: re-publish to the consumer's
+   * own topic carrying `bq-attempts = counted` (reconcile = max(bq-attempts, RedeliveryCount) on the next
+   * delivery), then acknowledge the original — only after the send succeeded. Otherwise `negativeAcknowledge`.
+   */
+  private async retry(counted: number, envelope: Envelope | null, message: PulsarReceivedMessage): Promise<void> {
+    const producer = await this.resolveRetryProducer();
+    if (producer === undefined) {
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+    try {
+      await producer.send(this.retryMessage(counted, envelope, message));
+    } catch (writeError) {
+      this.warn(
+        `babelqueue: retry re-publish to ${producer.getTopic()} failed (${errorText(writeError)}); the message is left for redelivery.`,
+      );
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+    await this.consumer.acknowledge(message);
+  }
+
+  private retryMessage(counted: number, envelope: Envelope | null, message: PulsarReceivedMessage): PulsarProducerMessage {
+    // Out-of-band headers (e.g. a traceparent) ride along; the contract bq-* properties are rebuilt and win,
+    // and the one-shot bq-delay of the first publish is not repeated.
+    const carried = headersOf(message);
+    delete carried["bq-delay"];
+    if (envelope !== null) {
+      return keepRoute(toPulsarMessage({ ...envelope, attempts: counted }, carried), message);
+    }
+    // A poison body is retried byte for byte (there is no envelope to re-encode); only the counter moves.
+    const data = message.getData();
+    return keepRoute(
+      {
+        data: typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data),
+        properties: { ...carried, "bq-attempts": String(counted) },
+      },
+      message,
+    );
   }
 
   /**
@@ -505,13 +635,13 @@ export class PulsarConsumer {
       const data = message.getData();
       const body = typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data);
       const record = buildPoisonRecord(body, JSON.stringify(deadLetter));
-      return { data: Buffer.from(record, "utf8"), properties: poisonProperties(record) };
+      return keepRoute({ data: Buffer.from(record, "utf8"), properties: poisonProperties(record) }, message);
     }
     // The envelope as the next hop will see it: attempts is the counted value, the same one that was
     // compared against maxAttempts and that dead_letter.attempts records.
     const original = envelope.meta?.queue || this.options.queue || stripDlqSuffix(topicName(producer.getTopic()));
     const annotated = annotate({ ...envelope, attempts: counted }, kind, original, details);
-    return toPulsarMessage(annotated);
+    return keepRoute(toPulsarMessage(annotated), message);
   }
 
   private notifyRoutingMismatch(propertyUrn: string, bodyUrn: string, envelope: IncomingEnvelope): void {
@@ -533,6 +663,20 @@ function safeProperties(message: PulsarReceivedMessage): { [key: string]: string
   } catch {
     return {};
   }
+}
+
+/**
+ * Keep the route a delivery arrived on: when the incoming message carries a non-blank `bq-job` property
+ * (the consumer routes on it, §5.2/§5.7) the re-published retry or DLQ message carries the same value, even
+ * if the body names another URN. Otherwise the second delivery could reach a different handler (Go's
+ * `publishKeepingRoute`).
+ */
+function keepRoute(outgoing: PulsarProducerMessage, incoming: PulsarReceivedMessage): PulsarProducerMessage {
+  const route: unknown = safeProperties(incoming)["bq-job"];
+  if (typeof route === "string" && route.trim() !== "") {
+    outgoing.properties = { ...outgoing.properties, "bq-job": route };
+  }
+  return outgoing;
 }
 
 function errorText(error: unknown): string {

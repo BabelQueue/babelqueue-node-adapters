@@ -8,7 +8,6 @@ import { EnvelopeCodec } from "@babelqueue/core";
 
 import { ConformanceResults } from "../../../test-support/results.js";
 import {
-  PulsarConsumer,
   pulsarProperties,
   type BabelHandlers,
   type PulsarConsumerClient,
@@ -16,6 +15,7 @@ import {
   type PulsarProducerMessage,
   type PulsarReceivedMessage,
 } from "../src/index.js";
+import { sharedConsumer } from "./support.js";
 
 // The vendored canonical suite (synced from conformance/). The `pulsar` block locks the §5
 // property projection (bq-* string→string) + the attempts = max(body, redeliveryCount)
@@ -102,7 +102,7 @@ test("pulsar conformance: attempts reconciliation matches the golden", async () 
       };
 
       let seen = -1;
-      await new PulsarConsumer(new OneShotConsumer(message), {
+      await sharedConsumer(new OneShotConsumer(message), {
         "urn:babel:orders:created": (env) => {
           seen = env.attempts ?? -1;
         },
@@ -133,7 +133,7 @@ test("pulsar conformance: schema_version_gate decides decode vs reject before th
       const client = new OneShotConsumer(message);
       let calls = 0;
       let errors = 0;
-      await new PulsarConsumer(
+      await sharedConsumer(
         client,
         { [urn]: () => void (calls += 1) },
         { onError: () => void (errors += 1) },
@@ -171,6 +171,9 @@ test("pulsar conformance: pulsar_exhaustion settle decision matches the golden",
   const cases = manifest.pulsar_exhaustion.cases;
   assert.ok(cases.length > 0);
 
+  // Every row runs twice: retry as a negative acknowledgement (Shared) and as a re-publish through a
+  // retryProducer (the Go model, bounded on Exclusive/Failover too). The result is recorded per row, passing
+  // only when both modes agree.
   for (const [index, c] of cases.entries()) {
     const id = ConformanceResults.caseId("pulsar_exhaustion", c, index);
 
@@ -182,58 +185,70 @@ test("pulsar conformance: pulsar_exhaustion settle decision matches the golden",
     }
 
     await results.run("pulsar_exhaustion", id, async () => {
-      const urn = "urn:babel:orders:created";
-      const raw =
-        c.kind === "poison"
-          ? "not-json"
-          : EnvelopeCodec.encode({ ...EnvelopeCodec.make(urn, { x: 1 }, { queue: "orders" }), attempts: c.body_attempts ?? 0 });
-      const properties: Record<string, string> = c.bq_attempts === undefined ? {} : { "bq-attempts": c.bq_attempts };
-      const message: PulsarReceivedMessage = {
-        getData: () => raw,
-        getProperties: () => properties,
-        getRedeliveryCount: () => c.redelivery_count,
-      };
+      for (const withRetryProducer of [false, true]) {
+        const retryProducer = new RecordingProducer();
+        const urn = "urn:babel:orders:created";
+        const raw =
+          c.kind === "poison"
+            ? "not-json"
+            : EnvelopeCodec.encode({ ...EnvelopeCodec.make(urn, { x: 1 }, { queue: "orders" }), attempts: c.body_attempts ?? 0 });
+        const properties: Record<string, string> = c.bq_attempts === undefined ? {} : { "bq-attempts": c.bq_attempts };
+        const message: PulsarReceivedMessage = {
+          getData: () => raw,
+          getProperties: () => properties,
+          getRedeliveryCount: () => c.redelivery_count,
+        };
 
-      const client = new OneShotConsumer(message);
-      const producer = new RecordingProducer();
-      const handlers: BabelHandlers =
-        c.kind === "failed"
-          ? {
-              [urn]: () => {
-                throw new Error("boom");
-              },
+        const client = new OneShotConsumer(message);
+        const producer = new RecordingProducer();
+        const handlers: BabelHandlers =
+          c.kind === "failed"
+            ? {
+                [urn]: () => {
+                  throw new Error("boom");
+                },
+              }
+            : {};
+        await sharedConsumer(client, handlers, {
+          ...(c.max_attempts === undefined ? {} : { maxAttempts: c.max_attempts }),
+          ...(c.dead_letter ? { deadLetterProducer: producer, queue: "orders" } : {}),
+          ...(withRetryProducer ? { retryProducer } : {}),
+          onError: () => undefined,
+          onWarn: () => undefined,
+        }).poll();
+
+        switch (c.expect.outcome) {
+          case "retry":
+            if (withRetryProducer) {
+              assert.equal(retryProducer.sent.length, 1, "retry = re-publish with bq-attempts + 1");
+              assert.equal(client.acked.length, 1);
+              assert.equal(client.nacked.length, 0);
+            } else {
+              assert.equal(client.nacked.length, 1, "retry = negativeAcknowledge");
+              assert.equal(client.acked.length, 0);
             }
-          : {};
-      await new PulsarConsumer(client, handlers, {
-        ...(c.max_attempts === undefined ? {} : { maxAttempts: c.max_attempts }),
-        ...(c.dead_letter ? { deadLetterProducer: producer, queue: "orders" } : {}),
-        onError: () => undefined,
-        onWarn: () => undefined,
-      }).poll();
-
-      switch (c.expect.outcome) {
-        case "retry":
-          assert.equal(client.nacked.length, 1, "retry = negativeAcknowledge");
-          assert.equal(client.acked.length, 0);
-          assert.equal(producer.sent.length, 0);
-          break;
-        case "drop":
-          assert.equal(client.acked.length, 1, "drop = acknowledge");
-          assert.equal(client.nacked.length, 0);
-          assert.equal(producer.sent.length, 0);
-          break;
-        case "dlq": {
-          assert.equal(client.acked.length, 1, "dlq = acknowledge after the write");
-          assert.equal(client.nacked.length, 0);
-          assert.equal(producer.sent.length, 1);
-          const record = JSON.parse((producer.sent[0] as PulsarProducerMessage).data.toString("utf8")) as {
-            dead_letter: { reason: string; attempts: number };
-          };
-          assert.equal(record.dead_letter.reason, c.expect.reason);
-          if (c.expect.dead_letter_attempts !== undefined) {
-            assert.equal(record.dead_letter.attempts, c.expect.dead_letter_attempts);
+            assert.equal(producer.sent.length, 0);
+            break;
+          case "drop":
+            assert.equal(retryProducer.sent.length, 0);
+            assert.equal(client.acked.length, 1, "drop = acknowledge");
+            assert.equal(client.nacked.length, 0);
+            assert.equal(producer.sent.length, 0);
+            break;
+          case "dlq": {
+            assert.equal(retryProducer.sent.length, 0);
+            assert.equal(client.acked.length, 1, "dlq = acknowledge after the write");
+            assert.equal(client.nacked.length, 0);
+            assert.equal(producer.sent.length, 1);
+            const record = JSON.parse((producer.sent[0] as PulsarProducerMessage).data.toString("utf8")) as {
+              dead_letter: { reason: string; attempts: number };
+            };
+            assert.equal(record.dead_letter.reason, c.expect.reason);
+            if (c.expect.dead_letter_attempts !== undefined) {
+              assert.equal(record.dead_letter.attempts, c.expect.dead_letter_attempts);
+            }
+            break;
           }
-          break;
         }
       }
     });
