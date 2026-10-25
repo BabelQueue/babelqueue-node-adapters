@@ -85,20 +85,25 @@ Without a `deadLetterSender` it is reported and abandoned, so `MaxDeliveryCount`
 dead-letter sub-queue. `dead_letter.original_queue` is the `queue` option, else the receiver's `entityPath`,
 else the sender's entity path without `.dlq`.
 
-**Bodies and `skipParsingBodyAsJson`.** `@azure/service-bus` parses a data-section body that holds valid JSON into an
-object unless the receiver is created with `skipParsingBodyAsJson: true`. The consumer still routes such a message
-(it re-serialises the parsed value to decode the envelope), but the original bytes are gone, so it **never writes a DLQ
-record from a parsed body**: a version-gated or poison delivery whose body was parsed is reported and abandoned (the
-native mechanism keeps it), never completed. Create the receiver with `skipParsingBodyAsJson: true` to get exact
-bytes and the full `deadLetterSender` behaviour. DLQ records are always sent as bytes (the SDK would otherwise
-JSON-encode a string into a quoted literal).
+**Bodies, the default receiver and `skipParsingBodyAsJson`.** `@azure/service-bus` parses a data-section body that holds
+valid JSON into an object unless the receiver is created with `skipParsingBodyAsJson: true`. The consumer does not
+depend on that setting: it reads the exact bytes from the raw AMQP message the SDK keeps on every received message
+(`_rawAmqpMessage.body`, rhea's decoded section: `{ typecode: 0x75, content: Buffer }` for a data section, an array of
+Buffers for several, which are concatenated; an amqp-value body arrives unwrapped, as a plain string or Buffer, and is read as is). With a
+`deadLetterSender`, a poison or version-gated delivery is therefore written to `<queue>.dlq` byte for byte even on a
+default receiver. A shape the adapter does not recognise (an amqp-sequence, a non-text amqp-value, no raw message at all)
+leaves the bytes unknown: no record is written and the delivery is reported and abandoned (the native mechanism keeps
+it), never completed. `skipParsingBodyAsJson: true` always delivers exact bytes. DLQ records are always sent as bytes (the
+SDK would otherwise JSON-encode a string into a quoted literal).
 
 **Upgrading from a release before the publisher fix.** Upgrade every consumer first, then the publishers: an old
 consumer (`<= 1.2.0`) cannot read the new wire body and would abandon every message to the native dead-letter queue.
 A new consumer also reads the quoted JSON string literal that old publishers left in the queue (a body that is a
 quoted JSON string whose content is a valid envelope is opened once, with either receiver setting); any other
-quoted string is poison. Note that with the default receiver the SDK's `JSON.parse` already rounds integers above
-2^53 and `1e400`-style numbers before the consumer sees them; `skipParsingBodyAsJson: true` avoids that.
+quoted string is poison. With the default receiver the SDK's `JSON.parse` has already rounded integers above 2^53
+and `1e400`-style numbers in the parsed view; the consumer decodes the envelope from the raw bytes when it can, but the
+core codec's own decode follows `JSON.parse` semantics for `data`, so use `skipParsingBodyAsJson: true` where exact
+number forms matter to your handler.
 
 **Publisher wire format.** `AsbPublisher` / `toServiceBusMessage` send the envelope as bytes (a `Buffer`), so the data
 section holds the envelope JSON itself, byte-identical to the other SDKs (GR-5).

@@ -485,3 +485,123 @@ test("a legacy double-encoded body whose content is a version-gated delivery is 
   assert.deepEqual(log, ["send", "complete"]);
   assert.equal(wireText(dlq.sent[0]!.body), bytes.toString("utf8"));
 });
+
+// --- default receiver (JSON-parsed body) together with a deadLetterSender (ADR-0037 decision 2) -----------------
+
+/**
+ * rhea's decoded section (`rhea/lib/message.js`: `new Section(typecode, content)`), which `AmqpAnnotatedMessage.fromRheaMessage`
+ * passes through as `_rawAmqpMessage.body`. A data section is typecode 0x75 with the received Buffer as `content`
+ * (an array of Buffers when there are several); an amqp-sequence is 0x76. An amqp-value is NOT wrapped by rhea: it is
+ * the plain value (a string or a Buffer). `Section(0x77, …)` below is a defensive shape only, not one rhea produces.
+ */
+class Section {
+  constructor(readonly typecode: number, readonly content: unknown) {}
+}
+
+/**
+ * A delivery as the default `@azure/service-bus` receiver builds it: `body` is the JSON-parsed view of the data section,
+ * and `_rawAmqpMessage.body` is rhea's `Section { typecode: 0x75, content: Buffer }` holding the exact bytes received.
+ */
+function parsedDelivery(raw: string, extra: Partial<AsbReceivedMessage> = {}): AsbReceivedMessage {
+  return {
+    body: JSON.parse(raw) as unknown,
+    _rawAmqpMessage: { body: new Section(0x75, Buffer.from(raw, "utf8")), bodyType: "data" },
+    deliveryCount: 1,
+    ...extra,
+  };
+}
+
+test("default receiver + deadLetterSender: a poison body that the SDK parsed is written to <queue>.dlq from the raw bytes and completed", async () => {
+  const original = '{ "foo": 1,\n  "big": 12345678901234567890, "ratio": 1.50 }';
+  const log: string[] = [];
+  const dlq = new DlqSender(log);
+  await new AsbConsumer(loggingReceiver(parsedDelivery(original), log), {}, { deadLetterSender: dlq, onError: () => undefined }).poll();
+
+  assert.deepEqual(log, ["send", "complete"], "the BabelQueue DLQ, never the native sub-queue (no abandon / dead-letter)");
+  const record = wireText(dlq.sent[0]!.body);
+  assert.ok(record.startsWith(original.slice(0, -1) + ',"dead_letter":'), record);
+  assert.ok(record.includes("12345678901234567890") && record.includes("1.50"), "no re-encoding: number forms and the big integer survive");
+  assert.equal((JSON.parse(record) as { dead_letter: { reason: string } }).dead_letter.reason, "poison");
+});
+
+test("default receiver + deadLetterSender: a version-gated delivery goes to <queue>.dlq as the raw bytes and is completed", async () => {
+  const original = '{\n  "job": "urn:babelqueue:order.created",\n  "data": { "big": 12345678901234567890 },\n  "meta": {"schema_version": 2}\n}\n';
+  const log: string[] = [];
+  const dlq = new DlqSender(log);
+  await new AsbConsumer(
+    loggingReceiver(parsedDelivery(original, { applicationProperties: { "bq-schema-version": "2" } }), log),
+    {},
+    { deadLetterSender: dlq, onError: () => undefined },
+  ).poll();
+  assert.deepEqual(log, ["send", "complete"]);
+  assert.equal(wireText(dlq.sent[0]!.body), original, "byte for byte");
+});
+
+test("default receiver: an envelope is decoded from the raw section bytes and routed to its handler", async () => {
+  const raw = EnvelopeCodec.encode(envelope());
+  const log: string[] = [];
+  let seen: Envelope | null = null;
+  // the parsed view is deliberately unusable: only the raw Section carries the envelope text
+  await new AsbConsumer(
+    loggingReceiver({ body: undefined, _rawAmqpMessage: { body: new Section(0x75, Buffer.from(raw, "utf8")), bodyType: "data" }, deliveryCount: 1 }, log),
+    { [URN]: (e) => { seen = e; } },
+  ).poll();
+  assert.equal(seen!.job, URN);
+  assert.deepEqual(log, ["complete"]);
+});
+
+test("rhea section shapes: several data sections are concatenated; a plain amqp-value string / Buffer is read as is (defensive Section(0x77) too)", async () => {
+  const original = '{ "foo": 1, "big": 12345678901234567890 }';
+  const cases: Array<[string, unknown]> = [
+    ["data sections (array of Buffers)", new Section(0x75, [Buffer.from(original.slice(0, 10)), Buffer.from(original.slice(10))])],
+    ["amqp-value string (plain value, as rhea delivers it)", original],
+    ["amqp-value binary (plain Buffer, as rhea delivers it)", Buffer.from(original)],
+    ["defensive: Section(0x77) with a string content", new Section(0x77, original)],
+    ["defensive: Section(0x77) with a binary content", new Section(0x77, Buffer.from(original))],
+  ];
+  for (const [name, body] of cases) {
+    const log: string[] = [];
+    const dlq = new DlqSender(log);
+    await new AsbConsumer(
+      loggingReceiver({ body: { foo: 1 }, _rawAmqpMessage: { body }, deliveryCount: 1 }, log),
+      {},
+      { deadLetterSender: dlq, onError: () => undefined },
+    ).poll();
+    assert.deepEqual(log, ["send", "complete"], name);
+    assert.ok(wireText(dlq.sent[0]!.body).startsWith(original.slice(0, -1) + ',"dead_letter":'), name);
+  }
+});
+
+test("unrecognised raw shapes keep the safe path: reported and abandoned, never completed", async () => {
+  const unknown: Array<[string, unknown]> = [
+    ["amqp-sequence section", new Section(0x76, [[1, 2]])],
+    ["amqp-value of a non-text value (defensive Section(0x77))", new Section(0x77, { map: true })],
+    ["amqp-value of a non-text plain value (a map)", { map: true }],
+    ["a data section with a non-binary content", new Section(0x75, "text")],
+    ["a data-section array with a non-binary part", new Section(0x75, [Buffer.from("{}"), 5])],
+    ["an empty data-section array", new Section(0x75, [])],
+    ["an object without a typecode", { content: Buffer.from("{}") }],
+  ];
+  for (const [name, body] of unknown) {
+    const log: string[] = [];
+    const dlq = new DlqSender(log);
+    const errors: unknown[] = [];
+    await new AsbConsumer(
+      loggingReceiver({ body: { foo: 1 }, _rawAmqpMessage: { body }, deliveryCount: 1 }, log),
+      {},
+      { deadLetterSender: dlq, onError: (e) => void errors.push(e) },
+    ).poll();
+    assert.deepEqual(log, ["abandon"], name);
+    assert.equal(dlq.sent.length, 0, name);
+    assert.match((errors[errors.length - 1] as Error).message, /no raw AMQP body/, name);
+  }
+});
+
+test("default receiver + deadLetterSender without any raw view: still abandoned and reported, never completed (no byte-faithful record possible)", async () => {
+  const log: string[] = [];
+  const dlq = new DlqSender(log);
+  const errors: unknown[] = [];
+  await new AsbConsumer(loggingReceiver({ body: { foo: 1 }, deliveryCount: 1 }, log), {}, { deadLetterSender: dlq, onError: (e) => void errors.push(e) }).poll();
+  assert.deepEqual(log, ["abandon"]);
+  assert.match((errors[errors.length - 1] as Error).message, /no raw AMQP body/);
+});

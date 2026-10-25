@@ -31,11 +31,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
      it is a quoted JSON string whose content is a valid envelope; any other quoted string stays poison, as before.
      The step is meant for draining and can be dropped in a later major.
 - A data-section body that `@azure/service-bus` already parsed into an object (the default receiver) used to be
-  decoded via `String(object)` (`"[object Object]"`) and treated as poison. It is now re-serialised before decoding, so
-  an envelope written by another SDK routes to its handler.
-- DLQ writes (`deadLetterSender`) send bytes, never a string the SDK would quote. A version-gated or poison delivery
-  whose body the SDK already parsed (no exact bytes) is reported and abandoned, never completed into a record
-  (use a receiver with `skipParsingBodyAsJson: true`).
+  decoded via `String(object)` (`"[object Object]"`) and treated as poison. It is now decoded from the exact bytes (the raw AMQP
+  body; re-serialised only when no raw view exists), so an envelope written by another SDK routes to its handler.
+- DLQ writes (`deadLetterSender`) send bytes, never a string the SDK would quote.
+- **A default receiver (JSON-parsed body) together with a `deadLetterSender` now writes to `<queue>.dlq` (ADR-0037
+  decision 2).** The consumer reads the exact bytes from the raw AMQP message the SDK keeps on the received message
+  (`_rawAmqpMessage.body`, rhea's decoded section: `{ typecode: 0x75, content: Buffer }`, an array of Buffers for several
+  data sections (concatenated), or, for an amqp-value, the plain string / Buffer rhea gives unwrapped), so a poison body (the ADR-0035
+  record) and a version-gated delivery (the raw body) are written byte for byte and the message is completed, instead of
+  being abandoned to the native sub-queue until `MaxDeliveryCount`. Envelopes are decoded from those bytes too. A
+  shape that is not recognised (amqp-sequence, a non-text amqp-value, no raw message) is still reported and abandoned,
+  never completed.
 
 ### Changed
 - **Behaviour change (only with a `deadLetterSender`): poison bodies and version-gated deliveries go to

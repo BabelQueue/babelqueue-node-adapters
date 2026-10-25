@@ -76,6 +76,14 @@ export interface AsbReceivedMessage {
   messageId?: string;
   deliveryCount?: number;
   applicationProperties?: { [key: string]: unknown };
+  /**
+   * Optional (a `ServiceBusReceivedMessage` has it, `readonly _rawAmqpMessage: AmqpAnnotatedMessage`): the raw AMQP
+   * message the SDK decoded this one from. Its `body` is rhea's undecoded view: for a data section a
+   * `Section { typecode: 0x75, content: Buffer }` (`content` an array of Buffers when there are several sections), for an
+   * amqp-value section the plain value itself (rhea does not wrap an amqp-value: a string or a Buffer), whereas {@link body} is the SDK's JSON-parsed view (unless the receiver
+   * was created with `skipParsingBodyAsJson: true`). The consumer reads the exact bytes from here.
+   */
+  _rawAmqpMessage?: { body?: unknown; bodyType?: string };
 }
 
 /**
@@ -114,12 +122,13 @@ export interface AsbReceiver {
 const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
 
 /**
- * Reported (and the message abandoned, never completed) when a DLQ record cannot be written byte-faithfully because the
- * receiver already parsed the body. Create the receiver with `skipParsingBodyAsJson: true` to receive exact bytes.
+ * Reported (and the message abandoned, never completed) when a DLQ record cannot be written byte-faithfully: the receiver
+ * parsed the body and the message exposes no raw AMQP view to recover the bytes from. Only a receiver or SDK build that
+ * hides both is affected; `skipParsingBodyAsJson: true` always delivers exact bytes.
  */
 const UNKNOWN_BODY_BYTES =
-  "The message body was already parsed from JSON by the receiver, so its exact bytes are unknown and no DLQ record is written. " +
-  "Create the receiver with skipParsingBodyAsJson: true.";
+  "The message body was already parsed from JSON by the receiver and the message exposes no raw AMQP body, so its exact bytes are " +
+  "unknown and no DLQ record is written. Create the receiver with skipParsingBodyAsJson: true.";
 
 /** Reason recorded on a message dead-lettered by the version gate. */
 const UNSUPPORTED_SCHEMA_VERSION_REASON = "unsupported schema version";
@@ -256,13 +265,59 @@ export class AsbPublisher {
 // --- Consumer ------------------------------------------------------------------
 
 /**
- * The exact bytes of a received body, or `undefined` when they are not known. `@azure/service-bus` parses a
- * data-section body that holds valid JSON into an object / array / number unless the receiver is created with
- * `skipParsingBodyAsJson: true`; the original bytes (whitespace, number forms, key order) are gone then, so a record
- * built from them would not be byte-faithful. A string is its UTF-8 encoding; a `Buffer` / `Uint8Array` (what a
- * binary body, or any body with `skipParsingBodyAsJson: true`, is) is returned as is; an empty body is no bytes.
+ * The exact bytes held by the raw AMQP body (`_rawAmqpMessage.body`), or `undefined` when it is absent or has a shape this
+ * adapter does not read. rhea hands over a decoded section as `{ typecode, content }`:
+ * - `0x75` (data): `content` is the `Buffer` received; several data sections arrive as an array of Buffers, which are
+ *   concatenated (the AMQP body is the sequence of the sections' bytes);
+ * - an amqp-value is not wrapped by rhea: it arrives as the plain value, a string (its UTF-8 bytes) or a Buffer (its bytes);
+ * - `0x77` `{ typecode, content }` (defensive only, not a shape rhea produces): a string or binary `content` is read the same way;
+ * - `0x76` (amqp-sequence) and everything else are unknown.
+ * Unknown shapes leave the bytes unknown, and
+ * the caller falls back to `message.body` (then to the safe path: report and abandon).
  */
-function bodyBytes(body: unknown): Uint8Array | undefined {
+function rawAmqpBodyBytes(message: AsbReceivedMessage): Uint8Array | undefined {
+  let raw: unknown;
+  try {
+    raw = message._rawAmqpMessage?.body;
+  } catch {
+    return undefined;
+  }
+  return sectionBytes(raw);
+}
+
+function sectionBytes(raw: unknown): Uint8Array | undefined {
+  if (raw instanceof Uint8Array) return raw;
+  if (typeof raw === "string") return Buffer.from(raw, "utf8");
+  if (raw === null || typeof raw !== "object") return undefined;
+  const { typecode, content } = raw as { typecode?: unknown; content?: unknown };
+  if (typecode === 0x75) {
+    if (content instanceof Uint8Array) return content;
+    if (Array.isArray(content) && content.length > 0 && content.every((part) => part instanceof Uint8Array)) {
+      return Buffer.concat(content as Uint8Array[]);
+    }
+    return undefined;
+  }
+  if (typecode === 0x77) {
+    if (typeof content === "string") return Buffer.from(content, "utf8");
+    if (content instanceof Uint8Array) return content;
+  }
+  return undefined;
+}
+
+/**
+ * The exact bytes of a received body, or `undefined` when they are not known. `@azure/service-bus` parses a data-section
+ * body that holds valid JSON into an object / array / number unless the receiver is created with
+ * `skipParsingBodyAsJson: true`, so `message.body` alone may have lost the original bytes (whitespace, number forms,
+ * key order). The raw AMQP message the SDK keeps (`_rawAmqpMessage`) still holds them, so it is read first (see
+ * {@link rawAmqpBodyBytes} for the rhea section shapes). Otherwise a
+ * string `message.body` is its UTF-8 encoding, a `Buffer` / `Uint8Array` (a binary body, or any body with
+ * `skipParsingBodyAsJson: true`) is returned as is, and an empty body is no bytes. A body that was parsed and has no raw
+ * view has no known bytes.
+ */
+function bodyBytes(message: AsbReceivedMessage): Uint8Array | undefined {
+  const raw = rawAmqpBodyBytes(message);
+  if (raw !== undefined) return raw;
+  const body = message.body;
   if (body == null) return new Uint8Array(0);
   if (typeof body === "string") return Buffer.from(body, "utf8");
   if (body instanceof Uint8Array) return body;
@@ -287,15 +342,14 @@ function unwrapLegacyQuotedEnvelope(text: string): string {
 }
 
 /**
- * The text an envelope is decoded from: the exact bytes when known (a `skipParsingBodyAsJson: true` receiver), the
- * string the default receiver already parsed out of a legacy quoted literal, or the JSON of an already-parsed body.
- * A legacy double-encoded body is opened by {@link unwrapLegacyQuotedEnvelope} on either path.
+ * The text an envelope is decoded from: the exact bytes when known (the raw AMQP body, or a `skipParsingBodyAsJson: true`
+ * receiver's `Buffer`), the string a default receiver parsed out of a legacy quoted literal, or the JSON of an
+ * already-parsed body. A legacy double-encoded body is opened by {@link unwrapLegacyQuotedEnvelope} on every path.
  */
-function bodyText(body: unknown): string {
-  if (body == null) return "";
-  if (typeof body === "string") return unwrapLegacyQuotedEnvelope(body);
-  if (body instanceof Uint8Array) return unwrapLegacyQuotedEnvelope(Buffer.from(body).toString("utf8"));
-  return JSON.stringify(body) ?? "";
+function bodyText(message: AsbReceivedMessage): string {
+  const bytes = bodyBytes(message);
+  if (bytes !== undefined) return unwrapLegacyQuotedEnvelope(Buffer.from(bytes).toString("utf8"));
+  return JSON.stringify(message.body) ?? "";
 }
 
 /** `orders.dlq` -> `orders`: the queue a DLQ entity belongs to (a name without the suffix is kept). */
@@ -383,7 +437,7 @@ export class AsbConsumer {
       return;
     }
 
-    const envelope = EnvelopeCodec.decode(bodyText(message.body));
+    const envelope = EnvelopeCodec.decode(bodyText(message));
 
     // attempts = max(current, deliveryCount − 1): deliveryCount (1-based) is the native
     // redelivery floor; the max never lowers a higher body count republished from another SDK.
@@ -454,7 +508,7 @@ export class AsbConsumer {
     }
     this.options.onError?.(new BabelQueueError(description), {}, message);
     try {
-      const bytes = bodyBytes(message.body);
+      const bytes = bodyBytes(message);
       if (bytes === undefined) throw new BabelQueueError(UNKNOWN_BODY_BYTES);
       // Bytes, never a string: the SDK would JSON-encode a string into a quoted literal.
       const record: AsbMessage = { body: Buffer.from(bytes) };
@@ -488,7 +542,7 @@ export class AsbConsumer {
         error: error.message,
         exception: error.name,
       }).dead_letter;
-      const bytes = bodyBytes(message.body);
+      const bytes = bodyBytes(message);
       if (bytes === undefined) throw new BabelQueueError(UNKNOWN_BODY_BYTES);
       const record = buildPoisonRecord(bytes, JSON.stringify(deadLetter));
       // Bytes, never a string: the SDK would JSON-encode a string into a quoted literal.
