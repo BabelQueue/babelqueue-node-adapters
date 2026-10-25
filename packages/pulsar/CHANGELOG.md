@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-25
+
 ### Changed
 - **Behaviour change: redelivery is bounded (ADR-0036 decisions 1 and 2).** `PulsarConsumer` used to
   `negativeAcknowledge` a failing handler, an unmapped URN (no `onUnknownUrn`) and a non-conformant body

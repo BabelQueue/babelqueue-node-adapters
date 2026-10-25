@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-25
+
 ### Changed
 - **Behaviour change: `dead_letter.attempts` is the counted attempt (ADR-0036 decision 8).** When retries
   are exhausted (`reason: "failed"`, or `"unknown_urn"` through the bounded `fail` path) the consumer used to
