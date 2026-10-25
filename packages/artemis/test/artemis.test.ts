@@ -199,39 +199,97 @@ test("a terminal failure with no DLQ drops and accepts", async () => {
   assert.equal(delivery.released.length, 0);
 });
 
-test("a non-conformant message is forwarded raw to the DLQ and accepted", async () => {
+test("a non-conformant message is dead-lettered as an ADR-0035 poison record and accepted after the write", async () => {
   const dlq = new FakeSender();
-  const { context: ctx, delivery } = context({ body: "not-json" });
+  const { context: ctx, delivery } = context({ body: "not-json", delivery_count: 2 });
   let reported: unknown;
-  const options = { deadLetterSender: dlq, onError: (e: unknown) => { reported = e; } };
+  const options = { deadLetterSender: dlq, queue: "orders", onError: (e: unknown) => { reported = e; } };
 
   await new ArtemisConsumer({}, options).handle(ctx);
 
   assert.equal(dlq.sent.length, 1);
-  assert.equal(messageBody(dlq.sent[0]!), "not-json");
+  const record = JSON.parse(messageBody(dlq.sent[0]!)) as { raw: string; raw_encoding?: string; dead_letter: Record<string, unknown> };
+  assert.equal(record.raw, "not-json");
+  assert.equal(record.raw_encoding, undefined);
+  assert.equal(record.dead_letter["reason"], "poison");
+  assert.equal(record.dead_letter["original_queue"], "orders");
+  assert.equal(record.dead_letter["attempts"], 2);
   assert.equal(delivery.accepted, 1);
+  assert.equal(delivery.released.length, 0);
   assert.ok(reported);
 });
 
-// Raw DLQ parity: the .NET (AMQP 1.0) and Java (JMS) Artemis consumers forward ONLY the body of an
-// undecodable / gated message (`new Message(body)` / `createTextMessage(body)`). Node matches that.
-test("raw DLQ (non-conformant and gated): the forwarded message carries only the body", async () => {
-  const rich = (): AmqpMessage => ({
+test("poison: an object body is spliced byte for byte and an invalid UTF-8 body is wrapped as base64", async () => {
+  const original = '{"job": 5, "big": 12345678901234567890, "ratio": 1.50}';
+  const spliced = new FakeSender();
+  await new ArtemisConsumer({}, { deadLetterSender: spliced }).handle(context({ body: original }).context);
+  const text = messageBody(spliced.sent[0]!);
+  assert.ok(text.startsWith(original.slice(0, -1) + ',"dead_letter":'), text);
+  assert.equal((JSON.parse(text) as { dead_letter: { reason: string } }).dead_letter.reason, "poison");
+
+  const bytes = Buffer.from([0xff, 0xfe, 0x00, 0x41]);
+  const wrapped = new FakeSender();
+  await new ArtemisConsumer({}, { deadLetterSender: wrapped }).handle(context({ body: bytes }).context);
+  const record = JSON.parse(messageBody(wrapped.sent[0]!)) as { raw: string; raw_encoding: string };
+  assert.equal(record.raw_encoding, "base64");
+  assert.deepEqual(Buffer.from(record.raw, "base64"), bytes);
+});
+
+test("poison: original_queue falls back to the listened receiver address", async () => {
+  const dlq = new FakeSender();
+  const receiver = Object.assign(new FakeReceiver(), { source: { address: "billing" } });
+  new ArtemisConsumer({}, { deadLetterSender: dlq }).listen(receiver);
+  await receiver.handler!(context({ body: "x" }).context);
+  assert.equal((JSON.parse(messageBody(dlq.sent[0]!)) as { dead_letter: { original_queue: string } }).dead_letter.original_queue, "billing");
+});
+
+test("poison: original_queue follows the receiver the message arrived on when one consumer serves several", async () => {
+  const dlq = new FakeSender();
+  const consumer = new ArtemisConsumer({}, { deadLetterSender: dlq });
+  await consumer.handle({ ...context({ body: "x" }).context, receiver: { source: { address: "billing" } } });
+  await consumer.handle({ ...context({ body: "y" }).context, receiver: { source: { address: "orders" } } });
+  const queues = dlq.sent.map((m) => (JSON.parse(messageBody(m)) as { dead_letter: { original_queue: string } }).dead_letter.original_queue);
+  assert.deepEqual(queues, ["billing", "orders"]);
+});
+
+test("gate: a binary or data-section body is forwarded as received (same object), never decoded to text", async () => {
+  const bytes = Buffer.from([0xff, 0xfe, 0x41]);
+  for (const body of [bytes, { typecode: 0x75, content: bytes }]) {
+    const dlq = new FakeSender();
+    const message: AmqpMessage = { body, application_properties: { bq_schema_version: "2" } };
+    await new ArtemisConsumer({}, { deadLetterSender: dlq }).handle(context(message).context);
+    assert.equal(dlq.sent[0]!.body, body);
+  }
+});
+
+test("poison without a DLQ sender, or under unknownUrn delete, is reported/accepted and dropped (never retried)", async () => {
+  for (const options of [{}, { unknownUrn: UnknownUrnStrategy.DELETE, deadLetterSender: new FakeSender() }, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER }]) {
+    const { context: ctx, delivery } = context({ body: "not-json" });
+    let errors = 0;
+    await new ArtemisConsumer({}, { ...options, onError: () => void (errors += 1) }).handle(ctx);
+    assert.equal(delivery.accepted, 1);
+    assert.equal(delivery.released.length, 0);
+    assert.equal(errors, 1);
+    const sender = (options as { deadLetterSender?: FakeSender }).deadLetterSender;
+    if (sender) assert.equal(sender.sent.length, 0, "delete never writes a record");
+  }
+});
+
+// Raw DLQ parity: a gated message is forwarded as ONLY its body (`new Message(body)` / `createTextMessage(body)`),
+// byte for byte, with no dead_letter block. A poison body is a different record (ADR-0035) and is tested above.
+test("raw DLQ (gated): the forwarded message carries only the body", async () => {
+  const dlq = new FakeSender();
+  const message: AmqpMessage = {
     body: "not-json",
     correlation_id: "corr-1",
     content_type: "application/json",
     message_annotations: { [JMS_TYPE_KEY]: URN },
     application_properties: { custom: "x", bq_schema_version: "2" },
-  });
-  for (const gate of [false, true]) {
-    const dlq = new FakeSender();
-    const message = rich();
-    if (!gate) delete message.application_properties;
-    const { context: ctx } = context(message);
-    await new ArtemisConsumer({}, { deadLetterSender: dlq }).handle(ctx);
-    assert.equal(dlq.sent.length, 1, `gate=${gate}`);
-    assert.deepEqual(dlq.sent[0], { body: "not-json" }, `gate=${gate}`);
-  }
+  };
+  const { context: ctx } = context(message);
+  await new ArtemisConsumer({}, { deadLetterSender: dlq }).handle(ctx);
+  assert.equal(dlq.sent.length, 1);
+  assert.deepEqual(dlq.sent[0], { body: "not-json" });
 });
 
 // --- consumer: schema-version gate (contract §7.7) ---------------------------
@@ -287,6 +345,34 @@ test("gate: an unsupported version is forwarded raw to the DLQ and accepted with
     assert.equal(errors.length, 1);
     assert.equal((errors[0] as unknown[])[1], null);
   }
+});
+
+test("gate: unknownUrn delete accepts without writing a record; release, fail and a hook behave as fail", async () => {
+  const del = new FakeSender();
+  const deleted = context(gated("2"));
+  await new ArtemisConsumer({}, { unknownUrn: UnknownUrnStrategy.DELETE, deadLetterSender: del }).handle(deleted.context);
+  assert.equal(del.sent.length, 0);
+  assert.equal(deleted.delivery.accepted, 1);
+
+  for (const unknownUrn of [UnknownUrnStrategy.RELEASE, UnknownUrnStrategy.FAIL, UnknownUrnStrategy.DEAD_LETTER, undefined]) {
+    const dlq = new FakeSender();
+    const c = context(gated("2"));
+    await new ArtemisConsumer({}, { deadLetterSender: dlq, ...(unknownUrn ? { unknownUrn } : {}) }).handle(c.context);
+    assert.equal(dlq.sent.length, 1, String(unknownUrn));
+    assert.equal(c.delivery.accepted, 1);
+    assert.equal(c.delivery.released.length, 0, "a version-gated delivery is never released for retry");
+  }
+});
+
+test("gate: the first delivery settles it whatever the delivery-count says (no retry)", async () => {
+  const dlq = new FakeSender();
+  const message = gated("2");
+  message.delivery_count = 9;
+  const c = context(message);
+  await new ArtemisConsumer({}, { deadLetterSender: dlq, maxTries: 99 }).handle(c.context);
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(c.delivery.accepted, 1);
+  assert.equal(c.delivery.released.length, 0);
 });
 
 test("gate: without a DLQ sender the rejected message is only reported and accepted", async () => {

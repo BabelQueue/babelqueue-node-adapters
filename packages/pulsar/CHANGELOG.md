@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: version-gated deliveries are settled, not looped (ADR-0037 decision 1).** A message
+  whose `bq-schema-version` property is present, not blank and not the supported version used to be
+  `negativeAcknowledge`d on every delivery, without limit. It is now settled on its **first delivery**,
+  without decoding, a handler call or a retry: with a `deadLetterProducer` the body is written to
+  `<queue>.dlq` exactly as received (no `dead_letter` block) and acknowledged after the write; without one
+  it is acknowledged and dropped (warned via `onWarn`). A failed write leaves it negatively acknowledged,
+  so the write is retried on the redelivery. `onError` is still called with the version error.
+- Conformance v1.8.0 vendored; the `version_gate_pulsar` section runs (the 9 rows that set an
+  `on_unknown_urn` option other than `fail` belong to SDKs with that option and are reported as skipped).
+
 ## [1.3.0] - 2026-10-25
 
 ### Changed

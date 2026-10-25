@@ -39,9 +39,30 @@ new Worker(
 );
 ```
 
-`processor` validates each envelope (`EnvelopeCodec.accepts`) and routes by URN; a
-non-conformant envelope throws (BullMQ retries/fails per its options), and an
-unmapped URN throws unless you pass `onUnknownUrn`.
+`processor` validates each envelope (`EnvelopeCodec.accepts`) and routes by URN. A
+non-conformant envelope is **poison** (ADR-0037 decision 3): it fails with BullMQ's
+`UnrecoverableError` — **no retry**, straight to BullMQ's failed set, which keeps the job data. An
+unmapped URN, an exhausted handler failure and a throwing handler keep BullMQ's own retry and
+failed-set behaviour; an unmapped URN throws unless you pass `onUnknownUrn`.
+
+To also keep poison jobs in a BabelQueue dead-letter queue, pass `deadLetterQueue` (opt-in):
+
+```ts
+const handler = processor(handlers, {
+  deadLetterQueue: true, // a Queue instance, a queue name, or `true` for "<queue>.dlq"
+  onError: (error, job) => console.error("DLQ add failed", job.id, error),
+});
+new Worker("orders", handler, { connection });
+// on shutdown: await handler.close(); // closes a Queue the adapter created (string / true)
+```
+
+The [ADR-0035](https://babelqueue.com) record (`dead_letter.reason: "poison"`: an object body is spliced
+with a `dead_letter` block, anything else wrapped in `raw`) is added to that queue as a job, named like the
+poison job, **before** the job fails. A `Queue` instance is used as given; a name or `true` creates a `Queue`
+on the worker's connection and prefix (one per queue name, so a processor shared by several Workers sends each queue's records to its own `<queue>.dlq`). If adding the record fails, the failure goes to `onError` and the job
+still fails as unrecoverable. The body fed to the record rule is the job data serialised as JSON, and
+BullMQ has already parsed what it stored, so a value `JSON.parse` cannot carry (`1e400`, an integer beyond
+2^53) is lost before the adapter sees it — a property of BullMQ.
 
 > BullMQ stores jobs in its own Redis structures, so this gives the canonical
 > envelope **shape + URN routing + trace propagation** to BullMQ-based Node

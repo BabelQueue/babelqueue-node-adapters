@@ -80,10 +80,15 @@ converge on the same number.
 
 **Version gate (§5.7 step 3).** Before the body is decoded the consumer reads
 `bq-schema-version`. Missing or blank: nothing changes ("blank" is the same set in every SDK: the empty string or only ASCII whitespace — space, `\t`, `\n`, `\v`, `\f`, `\r`; NBSP, U+0085, U+FEFF, U+3000 and the like are not blank). Any value other than the core's supported
-`SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message **undecoded** through the same
-path as a non-conformant envelope — `onError` (an error naming the version, with an empty
-envelope) and a `negativeAcknowledge`; the handler, `onUnknownUrn` and `onRoutingMismatch` are
-not called.
+`SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message **undecoded**: `onError` (an error
+naming the version, with an empty envelope), then it is settled on its **first delivery**
+(ADR-0037 decision 1) — with a `deadLetterProducer` the body is written to `<queue>.dlq` exactly as
+received (no `dead_letter` block, no re-encoding) and acknowledged only after the write; without one
+it is acknowledged and dropped (a warning goes to `onWarn`). A failed write leaves the message
+negatively acknowledged (never acknowledged, never counted as a retry), so the write is tried again
+on the redelivery. It is never retried, whatever `bq-attempts`, the redelivery count or `maxAttempts`
+say; the handler, `onUnknownUrn` and `onRoutingMismatch` are not called. This consumer has no
+unknown-URN strategy option, so it behaves as `fail`.
 
 If the `bq-job` property and the body's URN differ, routing follows the property and the
 optional `onRoutingMismatch(propertyUrn, bodyUrn, envelope)` hook is called (default: no-op).
@@ -163,8 +168,8 @@ re-publish or producer creation leaves the original negatively acknowledged and 
 
 **Behaviour change (MINOR).** Redelivery used to be unbounded; with the defaults a message that keeps
 failing is now dropped (or dead-lettered) at its third delivery. Set `maxAttempts` higher to keep
-more retries. A message with an unsupported `bq-schema-version` still takes the version gate above
-(`onError` and a `negativeAcknowledge`).
+more retries. A message with an unsupported `bq-schema-version` takes the version gate above, not this
+retry path.
 
 The producer/consumer are injected, so the unit tests use fakes — no Pulsar, no broker. Dual
 ESM + CJS.

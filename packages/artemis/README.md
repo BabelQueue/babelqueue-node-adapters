@@ -81,9 +81,14 @@ strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 **Version gate (§7.7).** Before the body is decoded the consumer reads the `bq_schema_version`
 application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
 whitespace) follows the normal decode path; any other value is compared as-is (never trimmed) to
-`"1"`. A message that does not match is rejected undecoded: reported to `onError`, its raw body
-forwarded to the `deadLetterSender` (when configured), then `accept`ed — but only **after the broker
-has accepted the DLQ delivery** (rhea `accepted` event on the DLQ sender). If the DLQ delivery is
+`"1"`. A message that does not match is rejected undecoded and settled on its **first delivery**
+(ADR-0037 decision 1): never decoded, never given to a handler, never retried. Under
+`unknownUrn: "delete"`, or without a `deadLetterSender`, it is `accept`ed and dropped (reported to
+`onError`). Otherwise its raw body, byte for byte and without a `dead_letter` block, is forwarded to the
+`deadLetterSender`, then `accept`ed — but only **after the broker
+has accepted the DLQ delivery** (rhea `accepted` event on the DLQ sender). Only the explicitly
+configured `unknownUrn` strategy is read (`release` and `fail` behave alike here: a version-gated
+delivery is never released). If the DLQ delivery is
 rejected/released/modified, the link closes, `send` throws, or `deadLetterTimeoutMs` (default 30000)
 elapses, the failure is reported to `onError` and the source message gets a plain `release()` instead —
 after `deadLetterRetryDelayMs` (default 1000) so a persistently failing DLQ is not a hot redelivery
@@ -93,6 +98,17 @@ route the message to the broker's DLA (or delete it when no DLA is configured). 
 delivery stays unsettled and holds one receiver credit. The DLQ confirmation listens on the DLQ
 sender only for the duration of each gate send and re-dispatches events that are not its own to the
 sender's session.
+
+**Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope (not JSON,
+not valid UTF-8, a JSON value that is not an envelope, an unsupported `meta.schema_version`, an object with
+no valid identity) is never given to a handler and never retried. With a `deadLetterSender` the **ADR-0035
+record** is written to `<queue>.dlq` — built with the core's `buildPoisonRecord`: an object body is spliced
+byte for byte with a `dead_letter` block (`reason: "poison"`), anything else is wrapped as
+`{"raw": …, "dead_letter": …}` (invalid UTF-8 as base64 with `"raw_encoding": "base64"`) — and the message is
+`accept`ed only after the broker accepted that delivery (a failed write releases it, like the gate path).
+`dead_letter.original_queue` is the `queue` option, else the `address` of the receiver the message arrived on (`context.receiver`), else of the receiver passed to `listen()` (set `queue` when one consumer serves several receivers). A version-gated body is forwarded to the DLQ as received (a Buffer or data-section body is not decoded to text).
+Under `unknownUrn: "delete"`, or without a `deadLetterSender`, the message is accepted and dropped
+(reported to `onError`). The raw forward of earlier releases is gone.
 
 > `autoaccept: false` is required — the consumer owns the disposition. `handle(context)` is also
 > exposed directly for testing or a custom event wiring.

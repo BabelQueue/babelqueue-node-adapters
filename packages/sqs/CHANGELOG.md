@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: poison bodies and version-gated deliveries are settled by the SDK when a BabelQueue DLQ is
+  configured (ADR-0037 decisions 1 and 2).** Before, both were only reported and left undeleted, so SQS
+  redelivered them until the queue's `RedrivePolicy` moved them. With a `deadLetterQueueUrl`: a poison body is
+  sent to `<queue>.dlq` as the ADR-0035 record (`reason: "poison"`) and a version-gated delivery as its raw body
+  (byte for byte, no `dead_letter` block), and the message is deleted only after the send succeeded, on its
+  **first delivery**. A failed send leaves it undeleted (visibility expiry redelivers it, the write is tried
+  again). Under `unknownUrn: "delete"` both are deleted without a record. With **no** `deadLetterQueueUrl`
+  nothing changes: they are reported and left to the native `RedrivePolicy`. The version gate reads only the
+  explicitly configured `unknownUrn` strategy: an `onUnknownUrn` hook (and the `delete` it implies) never
+  applies to it.
+### Added
+- `SqsMessage.MessageId` (optional): the dedup id of a raw/poison record sent to a `.fifo` DLQ.
+
+### Changed (tests)
+- Conformance v1.8.0 vendored; the `poison_dlq` and `version_gate_sqs` sections run.
+
 ## [1.3.0] - 2026-10-24
 
 > **Release order:** this version depends on `@babelqueue/core ^1.13.0`. Publish `babelqueue-node`

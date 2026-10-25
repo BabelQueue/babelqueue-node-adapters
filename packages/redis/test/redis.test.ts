@@ -159,6 +159,52 @@ test("a zset poison outcome is dead-lettered as a poison record through the cons
   assertPoisonRecord(dlq[0]!.args[1]!, "[1,2]", "orders");
 });
 
+// --- deadLetterQueue: null disables only exhausted / unknown-URN dead-lettering (ADR-0037 decision 5) ---------
+
+test("deadLetterQueue: null still dead-letters a poison body, to the default <queue>.dlq", async () => {
+  const client = new FakeRedis();
+  await new RedisConsumer(client, "orders", {}, { deadLetterQueue: null }).handle(legacy("not-json"));
+
+  const dlq = client.called("legacyDeadLetter");
+  assert.equal(dlq.length, 1, "the poison record is written, not dropped");
+  assert.equal(dlq[0]!.keys[2], "orders.dlq");
+  assertPoisonRecord(dlq[0]!.args[2]!, "not-json", "orders");
+  assert.equal(client.called("legacyAck").length, 0, "settled by the dead-letter script, not a plain ack");
+});
+
+test("deadLetterQueue: null with a zset poison outcome writes the record to <queue>.dlq, unconditionally", async () => {
+  const client = new FakeRedis();
+  client.zsetReserves.push(["[1,2]", "[1,2]", "1"]);
+  await new RedisConsumer(client, "orders", {}, { layout: "zset", blockTimeout: 0, deadLetterQueue: null }).poll();
+
+  const dlq = client.called("zsetDeadLetterPoison");
+  assert.equal(dlq.length, 1);
+  assert.equal(dlq[0]!.keys[1], "orders.dlq");
+  assertPoisonRecord(dlq[0]!.args[1]!, "[1,2]", "orders");
+});
+
+test("a configured deadLetterQueue name still receives poison records", async () => {
+  const client = new FakeRedis();
+  await new RedisConsumer(client, "orders", {}, { deadLetterQueue: "orders.failed" }).handle(legacy("not-json"));
+  assert.equal(client.called("legacyDeadLetter")[0]!.keys[2], "orders.failed");
+});
+
+test("deadLetterQueue: null still drops an exhausted message and degrades unknown URN dead_letter to delete", async () => {
+  const exhausted = new FakeRedis();
+  await new RedisConsumer(exhausted, "orders", { [URN]: () => { throw new Error("boom"); } }, { maxTries: 3, deadLetterQueue: null }).handle(
+    legacy(EnvelopeCodec.encode(envelope(2))),
+  );
+  assert.equal(exhausted.called("legacyDeadLetter").length, 0);
+  assert.equal(exhausted.called("legacyAck").length, 1);
+
+  const unknown = new FakeRedis();
+  await new RedisConsumer(unknown, "orders", {}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterQueue: null }).handle(
+    legacy(EnvelopeCodec.encode(envelope())),
+  );
+  assert.equal(unknown.called("legacyDeadLetter").length, 0);
+  assert.equal(unknown.called("legacyAck").length, 1);
+});
+
 // --- exact bytes: a body that is not valid UTF-8 (ADR-0035 section 1, no U+FFFD substitution) ----------
 
 const BAD_BYTES = Buffer.from([0x7b, 0xff, 0xfe, 0x20, 0x6e, 0x6f, 0x74, 0x2d, 0x6a, 0x73, 0x6f, 0x6e]); // `{\xff\xfe not-json`

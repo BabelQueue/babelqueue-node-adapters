@@ -53,7 +53,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.4.0"
+    "@babelqueue/core": "^1.13.0"
   },
   "peerDependencies": {
     "rhea": "^3.0.0"

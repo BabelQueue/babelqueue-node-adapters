@@ -9,6 +9,32 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: a poison body is dead-lettered as the ADR-0035 record (ADR-0037 decision 2).** A body
+  that does not decode into a valid envelope used to be forwarded to the DLQ as its raw bytes, with no
+  `dead_letter` block. With a `deadLetterSender` the consumer now writes the ADR-0035 record (object body
+  spliced byte for byte, anything else wrapped in `raw` / `raw_encoding`, `dead_letter.reason: "poison"`,
+  built with the core's `buildPoisonRecord`) and accepts the message only after the broker accepted it. A
+  DLQ reader written against the old raw form must handle the new shape. Under `unknownUrn: "delete"` such a
+  body is now accepted and dropped without a record; without a `deadLetterSender` it is accepted and dropped
+  (reported to `onError`), as before.
+- **Behaviour change: the version gate follows ADR-0037 decision 1.** A version-gated delivery under
+  `unknownUrn: "delete"` is accepted and dropped; before, its raw body was still written to the DLQ. Every
+  other row is unchanged (raw body to the DLQ, accepted after the write; accepted and dropped without a
+  DLQ sender; a failed write releases it). Only the configured `unknownUrn` strategy is read.
+### Fixed
+- The version-gate DLQ copy forwards the body as received (a Buffer / data-section body is no longer decoded to text and back, which corrupted invalid UTF-8).
+
+### Added
+- `queue` consumer option and `context.receiver.source.address` / the `source.address` of the receiver given to `listen()`: the queue name written
+  to `dead_letter.original_queue` of a poison record.
+- `messageBody`-style exact bytes are used for the poison record, so a body that is not valid UTF-8 is not
+  corrupted.
+
+### Changed (dependencies and tests)
+- `@babelqueue/core` dependency range raised from `^1.4.0` to `^1.13.0` (`buildPoisonRecord`).
+- Conformance v1.8.0 vendored; the `poison_dlq` and `version_gate_artemis` sections run.
+
 ## [1.2.1] - 2026-10-11
 
 ### Fixed

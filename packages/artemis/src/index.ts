@@ -27,18 +27,35 @@
  * sees the `traceparent` and links the consumer span as a child. A header-less publish is
  * byte-identical. GR-1: the wire envelope body is never touched.
  *
- * **Version gate (§7.7).** Before decoding the body the consumer reads the `bq_schema_version`
- * application property (underscores, ADR-0017). A missing or blank value (empty or only ASCII
- * whitespace) follows the normal decode path; any other value is compared, untrimmed, to the supported
- * `"1"`, and a message that does not match is rejected undecoded — reported to `onError`, the raw body
- * forwarded to the DLQ sender (when configured) and the message accepted **only after the broker has
- * accepted the DLQ delivery**. If the DLQ send fails, is refused (rejected/released/modified), the link
- * closes or `deadLetterTimeoutMs` elapses, the failure is reported and, after `deadLetterRetryDelayMs`,
- * the source message gets a plain `released` outcome (no `delivery_failed`: the broker's delivery
- * counter and `max-delivery-attempts` stay untouched) — never accepted, never handed to a handler.
+ * **Version gate (§7.7, ADR-0037 decision 1).** Before decoding the body the consumer reads the
+ * `bq_schema_version` application property (underscores, ADR-0017). A missing or blank value (empty or only
+ * ASCII whitespace) follows the normal decode path; any other value is compared, untrimmed, to the supported
+ * `"1"`, and a message that does not match is rejected undecoded and settled on its **first delivery**: never
+ * decoded, never given to a handler or the unknown-URN path, never retried. `unknownUrn: "delete"` accepts it
+ * (dropped); without a DLQ sender it is accepted and dropped (reported to `onError`); otherwise the raw body
+ * goes to the DLQ sender and the message is accepted **only after the broker has accepted the DLQ delivery**.
+ * If the DLQ send fails, is refused (rejected/released/modified), the link closes or `deadLetterTimeoutMs`
+ * elapses, the failure is reported and, after `deadLetterRetryDelayMs`, the source message gets a plain
+ * `released` outcome (no `delivery_failed`: the broker's delivery counter and `max-delivery-attempts` stay
+ * untouched) — never accepted, never handed to a handler. Only the explicitly configured `unknownUrn`
+ * strategy is read; `release` and `fail` behave alike here (a version-gated delivery is never released).
+ *
+ * **Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope is never
+ * handed to a handler and never retried. `unknownUrn: "delete"` accepts it; with a DLQ sender the ADR-0035
+ * record (`reason: "poison"`, built with the core's `buildPoisonRecord`: an object body is spliced, anything
+ * else wrapped, invalid UTF-8 as base64) is written to `<queue>.dlq` and the message accepted only after the
+ * broker accepted it; without a DLQ sender it is accepted and dropped (reported to `onError`).
  */
 
-import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
+import {
+  annotate,
+  BabelQueueError,
+  buildPoisonRecord,
+  EnvelopeCodec,
+  SCHEMA_VERSION,
+  UnknownUrnError,
+  UnknownUrnStrategy,
+} from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
@@ -69,6 +86,8 @@ export interface AmqpDelivery {
 export interface AmqpEventContext {
   message?: AmqpMessage;
   delivery?: AmqpDelivery;
+  /** Optional (rhea sets it): the receiver the message arrived on; its `source.address` names the queue of a poison record. */
+  receiver?: { source?: { address?: string } | null };
 }
 
 /**
@@ -102,6 +121,8 @@ export interface AmqpSender {
 /** The subset of a rhea receiver this adapter wires to (its `message` event). */
 export interface AmqpReceiver {
   on(event: "message", handler: (context: AmqpEventContext) => void): unknown;
+  /** Optional (a rhea receiver has it): its `address` names the queue for a poison record's `original_queue`. */
+  source?: { address?: string } | null;
 }
 
 // --- Projection (contract §7.2) ------------------------------------------------
@@ -160,6 +181,20 @@ export function messageBody(message: AmqpMessage): string {
     if (typeof content === "string") return content;
   }
   return String(body);
+}
+
+/** The message body as the exact bytes received (a string body is its UTF-8 encoding), for the poison record. */
+function messageBodyBytes(message: AmqpMessage): Uint8Array {
+  const body = message.body;
+  if (body == null) return new Uint8Array(0);
+  if (typeof body === "string") return Buffer.from(body, "utf8");
+  if (Buffer.isBuffer(body)) return body;
+  if (typeof body === "object" && "content" in body) {
+    const content = (body as { content: unknown }).content;
+    if (Buffer.isBuffer(content)) return content;
+    if (typeof content === "string") return Buffer.from(content, "utf8");
+  }
+  return Buffer.from(String(body), "utf8");
 }
 
 function jmsType(message: AmqpMessage): string | undefined {
@@ -419,8 +454,17 @@ export interface ArtemisConsumerOptions {
   deadLetterRetryDelayMs?: number;
   /** Attempts before terminal dead-lettering (default 3). */
   maxTries?: number;
-  /** Strategy for a URN with no handler (default `fail`). */
+  /**
+   * Strategy for a URN with no handler (default `fail`). It is also the only strategy the version gate and the
+   * poison route read: `delete` accepts (drops) such a delivery (ADR-0037).
+   */
   unknownUrn?: string;
+  /**
+   * The queue this consumer reads, written to `dead_letter.original_queue` of a poison record (a decodable
+   * envelope uses its own `meta.queue`). Defaults to the `address` of the receiver the message arrived on (`context.receiver`),
+   * else of the receiver passed to {@link ArtemisConsumer.listen}; set it when one consumer serves several receivers.
+   */
+  queue?: string;
   /** Called for a non-conformant message, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, context: AmqpEventContext) => void;
 }
@@ -436,6 +480,7 @@ export interface ArtemisConsumerOptions {
 export class ArtemisConsumer {
   private readonly maxTries: number;
   private readonly unknownUrn: string;
+  private listenedQueue: string | undefined;
 
   constructor(
     private readonly handlers: BabelHandlers,
@@ -447,6 +492,8 @@ export class ArtemisConsumer {
 
   /** Wire this consumer to a rhea receiver's `message` event (auto-accept must be off). */
   listen(receiver: AmqpReceiver): void {
+    const address = receiver.source?.address;
+    if (typeof address === "string" && address !== "") this.listenedQueue = address;
     receiver.on("message", (context) => this.handle(context));
   }
 
@@ -461,28 +508,16 @@ export class ArtemisConsumer {
       const gateError = new BabelQueueError(
         `Rejected a message from Artemis with unsupported bq_schema_version "${unsupported}" (supported: ${SCHEMA_VERSION}).`,
       );
-      // Accept only after the broker has accepted the DLQ copy; otherwise release (plain, after a pause) so
-      // the message is never lost and never reaches a handler. Reports come after the settlement, or are
-      // isolated, so a throwing onError can never leave the message unsettled.
-      try {
-        await this.deadLetterRawConfirmed(messageBody(message));
-      } catch (dlqError) {
-        this.safeReport(gateError, null, context);
-        this.safeReport(dlqError, null, context);
-        await this.releaseAfterBackoff(delivery);
-        return;
-      }
-      delivery?.accept();
-      this.safeReport(gateError, null, context);
+      await this.settleVersionGated(context, message, gateError);
       return;
     }
 
     const decoded = EnvelopeCodec.decode(messageBody(message));
 
     if (!EnvelopeCodec.accepts(decoded)) {
-      // A non-conformant / poison message may lack the fields to annotate; forward it raw.
-      this.report(new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Artemis."), decoded, context);
-      await this.settleAfterDeadLetter(context, decoded, () => this.deadLetterRaw(messageBody(message)));
+      const poisonError = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Artemis.");
+      this.safeReport(poisonError, decoded, context);
+      await this.settlePoison(context, message, decoded, poisonError);
       return;
     }
 
@@ -575,16 +610,71 @@ export class ArtemisConsumer {
     await sendConfirmed(sender, artemisMessage(annotated), this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
   }
 
-  /** Poison path: forward the raw body, confirmed like the gate path. */
-  private deadLetterRaw(raw: string): Promise<void> {
-    return this.deadLetterRawConfirmed(raw);
+  /**
+   * Version-gated delivery (ADR-0037 decision 1): accepted (dropped) under `unknownUrn: "delete"` or without a DLQ
+   * sender; otherwise the raw body is forwarded to the DLQ and the message accepted only after the broker accepted
+   * that delivery. A failed write is reported and the message released (plain, after a pause) so it is never lost
+   * and never reaches a handler. Reports come after the settlement, or are isolated, so a throwing `onError` can
+   * never leave the message unsettled.
+   */
+  private async settleVersionGated(context: AmqpEventContext, message: AmqpMessage, gateError: BabelQueueError): Promise<void> {
+    const delivery = context.delivery;
+    if (this.unknownUrn === UnknownUrnStrategy.DELETE || this.options.deadLetterSender === undefined) {
+      delivery?.accept();
+      this.safeReport(gateError, null, context);
+      return;
+    }
+    try {
+      // The body as received (a data-section object or Buffer is forwarded as is, never decoded to text and back).
+      await this.sendToDeadLetter(this.options.deadLetterSender, { body: message.body ?? "" });
+    } catch (dlqError) {
+      this.safeReport(gateError, null, context);
+      this.safeReport(dlqError, null, context);
+      await this.releaseAfterBackoff(delivery);
+      return;
+    }
+    delivery?.accept();
+    this.safeReport(gateError, null, context);
   }
 
-  /** Forward the raw body and wait for the broker's `accepted` (a no-op without a DLQ sender). */
-  private async deadLetterRawConfirmed(raw: string): Promise<void> {
+  /**
+   * Poison body (ADR-0037 decision 2): accepted (dropped) under `unknownUrn: "delete"` or without a DLQ sender;
+   * otherwise the ADR-0035 record is written to the DLQ and the message accepted only after the broker accepted
+   * it. A failed write is reported and the message released, exactly like the gate path. `dead_letter.attempts`
+   * is informational: the delivered count.
+   */
+  private async settlePoison(
+    context: AmqpEventContext,
+    message: AmqpMessage,
+    decoded: IncomingEnvelope,
+    error: BabelQueueError,
+  ): Promise<void> {
+    const delivery = context.delivery;
     const sender = this.options.deadLetterSender;
-    if (!sender) return;
-    await sendConfirmed(sender, { body: raw }, this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
+    if (this.unknownUrn === UnknownUrnStrategy.DELETE || sender === undefined) {
+      delivery?.accept();
+      return;
+    }
+    try {
+      const delivered = deliveryCount(message);
+      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, "poison", this.options.queue ?? context.receiver?.source?.address ?? this.listenedQueue ?? "", {
+        attempts: delivered,
+        error: error.message,
+        exception: error.name,
+      }).dead_letter;
+      const record = buildPoisonRecord(messageBodyBytes(message), JSON.stringify(deadLetter));
+      await this.sendToDeadLetter(sender, { body: record });
+    } catch (dlqError) {
+      this.safeReport(dlqError, decoded, context);
+      await this.releaseAfterBackoff(delivery);
+      return;
+    }
+    delivery?.accept();
+  }
+
+  /** Send to the DLQ and wait for the broker's `accepted`. */
+  private sendToDeadLetter(sender: AmqpSender, message: AmqpMessage): Promise<void> {
+    return sendConfirmed(sender, message, this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
   }
 
   /** Plain `released` outcome (the broker's delivery counter is not touched), after the retry delay. */

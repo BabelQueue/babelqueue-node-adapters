@@ -136,7 +136,7 @@ test("pulsar conformance: schema_version_gate decides decode vs reject before th
       await sharedConsumer(
         client,
         { [urn]: () => void (calls += 1) },
-        { onError: () => void (errors += 1) },
+        { onError: () => void (errors += 1), onWarn: () => undefined },
       ).poll();
 
       if (c.expect === "decode") {
@@ -146,8 +146,9 @@ test("pulsar conformance: schema_version_gate decides decode vs reject before th
       } else {
         assert.equal(calls, 0, label);
         assert.equal(errors, 1, label);
-        assert.equal(client.acked.length, 0, label);
-        assert.equal(client.nacked.length, 1, label);
+        // ADR-0037: a rejected version is settled on its first delivery (no DLQ here: acknowledged, dropped).
+        assert.equal(client.acked.length, 1, label);
+        assert.equal(client.nacked.length, 0, label);
       }
     });
   }
@@ -249,6 +250,104 @@ test("pulsar conformance: pulsar_exhaustion settle decision matches the golden",
             }
             break;
           }
+        }
+      }
+    });
+  }
+});
+
+// --- version_gate_pulsar (ADR-0037 decision 1, broker-bindings §5.7) ----------------
+
+interface VersionGateCase {
+  name: string;
+  on_unknown_urn?: string;
+  dead_letter: "on" | "off";
+  dlq_write?: "ok" | "fails";
+  bq_attempts?: string;
+  expect: { outcome: "ack" | "dlq_raw" | "unsettled" | "native"; record?: string; outcome_no_writer?: string };
+}
+
+const versionGate = (JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8")) as {
+  version_gate_pulsar: { cases: VersionGateCase[]; incoming_bodies: { name: string; body: string }[] };
+}).version_gate_pulsar;
+
+/** A producer whose send either records the message or rejects. */
+class GateProducer implements PulsarProducer {
+  sent: PulsarProducerMessage[] = [];
+  constructor(private readonly fails: boolean) {}
+  getTopic(): string {
+    return "persistent://public/default/orders.dlq";
+  }
+  async send(message: PulsarProducerMessage): Promise<unknown> {
+    if (this.fails) throw new Error("dlq write failed");
+    this.sent.push(message);
+    return {};
+  }
+}
+
+test("pulsar conformance: version_gate_pulsar settles on the first delivery, undecoded", async () => {
+  assert.ok(versionGate.cases.length > 0);
+  assert.ok(versionGate.incoming_bodies.length > 0);
+
+  for (const [index, c] of versionGate.cases.entries()) {
+    const id = ConformanceResults.caseId("version_gate_pulsar", c, index);
+
+    // Node's Pulsar consumer has no unknown-URN strategy option (it behaves as `fail`): the rows that set
+    // another strategy belong to the Go and Python runtimes, and are skipped, never passed.
+    if (c.on_unknown_urn !== undefined && c.on_unknown_urn !== "fail") {
+      results.record("version_gate_pulsar", id, { status: "skip", reason: `ADR-0037: no on_unknown_urn option (${c.on_unknown_urn})` });
+      continue;
+    }
+
+    await results.run("version_gate_pulsar", id, async () => {
+      // `dead_letter: off` means no producer exists in this consumer, so the no-writer outcome applies.
+      const outcome = c.dead_letter === "off" ? (c.expect.outcome_no_writer ?? c.expect.outcome) : c.expect.outcome;
+
+      for (const incoming of versionGate.incoming_bodies) {
+        const properties: Record<string, string> = { "bq-schema-version": "2" };
+        if (c.bq_attempts !== undefined) properties["bq-attempts"] = c.bq_attempts;
+        const bytes = Buffer.from(incoming.body, "utf8");
+        const message: PulsarReceivedMessage = {
+          getData: () => bytes,
+          getProperties: () => properties,
+          getRedeliveryCount: () => 5,
+        };
+
+        const client = new OneShotConsumer(message);
+        const producer = new GateProducer(c.dlq_write === "fails");
+        let handled = 0;
+        await sharedConsumer(
+          client,
+          { "urn:babelqueue:order.created": () => void (handled += 1) },
+          {
+            onUnknownUrn: () => void (handled += 1),
+            onError: () => undefined,
+            onWarn: () => undefined,
+            ...(c.dead_letter === "on" ? { deadLetterProducer: producer, queue: "orders" } : {}),
+          },
+        ).poll();
+
+        const label = `${c.name} / ${incoming.name}`;
+        assert.equal(handled, 0, `${label}: no handler and no onUnknownUrn call`);
+        switch (outcome) {
+          case "ack":
+            assert.equal(client.acked.length, 1, label);
+            assert.equal(client.nacked.length, 0, label);
+            assert.equal(producer.sent.length, 0, label);
+            break;
+          case "dlq_raw":
+            assert.equal(client.acked.length, 1, `${label}: acknowledged after the write`);
+            assert.equal(client.nacked.length, 0, label);
+            assert.equal(producer.sent.length, 1, label);
+            assert.ok((producer.sent[0] as PulsarProducerMessage).data.equals(bytes), `${label}: the record is the incoming body, byte for byte`);
+            break;
+          case "unsettled":
+            assert.equal(client.acked.length, 0, `${label}: never acknowledged`);
+            assert.equal(client.nacked.length, 1, `${label}: negatively acknowledged, not retried`);
+            assert.equal(producer.sent.length, 0, label);
+            break;
+          default:
+            assert.fail(`${label}: unexpected outcome ${outcome}`);
         }
       }
     });

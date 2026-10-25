@@ -6,6 +6,24 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+### Changed
+- **Behaviour change: a poison job is no longer retried (ADR-0037 decision 3).** A job whose data does not decode
+  into a valid envelope used to throw a `BabelQueueError`, so BullMQ retried it as an ordinary failure up to the
+  job's `attempts`. It now fails with BullMQ's `UnrecoverableError`: no retry, straight to the failed set (which
+  keeps the job data). Code that caught `BabelQueueError` from the processor for this case must now handle
+  `UnrecoverableError`. Unmapped URNs, exhausted handler failures and handler errors are unchanged.
+- `@babelqueue/core` dependency range raised from `^1.4.0` to `^1.13.0` (`buildPoisonRecord`). `bullmq` is now
+  imported at runtime (`Queue`, `UnrecoverableError`); it was already a required peer dependency.
+
+### Added
+- `processor` option **`deadLetterQueue?: Queue | string | true`** (opt-in): the ADR-0035 poison record
+  (`reason: "poison"`) is also added to it as a job before the job fails. A `Queue` is used as given, a string
+  creates a `Queue` of that name on the worker's connection, `true` one named `<queue>.dlq`. Also the `queue`
+  and `onError` options, and `close()` on the returned processor (closes a `Queue` the adapter created).
+- Conformance v1.8.0 vendored; the `poison_dlq` section runs (15 of its 43 bodies are delivered as BullMQ job
+  data through the processor; the others, which cannot reach the adapter as job data, run through the same core
+  record builder).
+
 ## [1.1.0] - 2026-06-21
 
 ### Added

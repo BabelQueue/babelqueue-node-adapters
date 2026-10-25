@@ -71,8 +71,22 @@ is purely additive.
 **Version gate (§3.7).** Before the body is decoded the consumer reads the `bq-schema-version`
 message attribute. A missing or blank value (empty or only ASCII whitespace) changes nothing; any
 other value that is not exactly `"1"` (`"2"`, `"x"`, `"01"`, `" 1"` — never trimmed) rejects the
-message **undecoded**: it reaches `onError` (with an empty envelope) and is left undeleted, so it is
-redelivered and the `RedrivePolicy` below moves it to the DLQ.
+message **undecoded**: it reaches `onError` (with an empty envelope) and is settled on its **first
+delivery** (ADR-0037 decision 1) — never decoded, never given to a handler or `onUnknownUrn`, never retried
+by the SDK. With a `deadLetterQueueUrl` the body is sent to it exactly as received (no `dead_letter` block)
+and the message is deleted only after the send succeeded (a failed send leaves it undeleted, so visibility
+expiry redelivers it and the write is tried again). Under `unknownUrn: "delete"` it is deleted. Without a
+`deadLetterQueueUrl` it is left to the **native** mechanism: not deleted, so visibility expiry redelivers it
+and the `RedrivePolicy` below moves it to the DLQ. Only the explicitly configured `unknownUrn` strategy is
+read — an `onUnknownUrn` hook (and the `delete` it implies when no strategy is set) never applies to a
+version-gated delivery.
+
+**Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope is never given
+to a handler and never retried. With a `deadLetterQueueUrl` the **ADR-0035 record** (`reason: "poison"`, built
+with the core's `buildPoisonRecord`: an object body spliced byte for byte, anything else wrapped in `raw`) is
+sent to the DLQ and the message deleted only after the send; `unknownUrn: "delete"` deletes it; without a DLQ
+URL it is left to the native `RedrivePolicy`, as above. Like the version gate, the poison route reads only the explicitly configured `unknownUrn` strategy: an `onUnknownUrn` hook (and the `delete` it implies when no strategy is set) never drops a poison body. A `.fifo` DLQ gets the source queue as
+`MessageGroupId` and the source `MessageId` as `MessageDeduplicationId`.
 
 > **Poison messages — configure a `RedrivePolicy`.** With the `0 s` default, a handler
 > that always fails is retried back-to-back until the queue's native `RedrivePolicy`
