@@ -281,6 +281,11 @@ live("zset: a failing handler is released with attempts + 1 and dead-lettered at
   assert.deepEqual(attemptsSeen, [0, 1, 2]);
   const keys = zsetKeys(name);
   assert.equal(await client.llen(`${name}.dlq`), 1);
+  // ADR-0036 decision 8: the third delivery (job.attempts 2) is written with the counted value 3.
+  const record = JSON.parse((await client.lindex(`${name}.dlq`, 0)) as string) as Envelope;
+  assert.equal(record.dead_letter?.reason, "failed");
+  assert.equal(record.dead_letter?.attempts, 3);
+  assert.equal(record.attempts, 3);
   assert.equal(await client.zcard(keys.reserved), 0);
   assert.equal(await client.zcard(keys.delayed), 0);
   assert.equal(await client.llen(keys.ready), 0);

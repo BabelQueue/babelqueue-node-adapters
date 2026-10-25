@@ -101,7 +101,11 @@ test("a terminal failure dead-letters to <queue>.dlq with a dead_letter block", 
   const dlq = client.called("legacyDeadLetter");
   assert.equal(dlq.length, 1);
   assert.equal(dlq[0]!.keys[2], "orders.dlq");
-  assert.equal((EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope).dead_letter!.reason, "failed");
+  const record = EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope;
+  assert.equal(record.dead_letter!.reason, "failed");
+  // ADR-0036 decision 8: the counted attempt (delivered 2 + 1 for this delivery), like Go and Python
+  assert.equal(record.dead_letter!.attempts, 3);
+  assert.equal(record.attempts, 3);
 });
 
 test("a non-conformant message is dead-lettered as an ADR-0035 poison record and acked", async () => {
@@ -274,6 +278,8 @@ test("unknown URN with fail dead-letters (reason unknown_urn) once attempts reac
   assert.equal(dlq[0]!.keys[2], "orders.dlq");
   const record = EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope;
   assert.equal(record.dead_letter!.reason, "unknown_urn");
+  assert.equal(record.dead_letter!.attempts, 3, "bounded fail path: delivered 2 + 1");
+  assert.equal(record.attempts, 3);
 });
 
 test("unknown URN with delete acks without routing", async () => {
@@ -291,7 +297,21 @@ test("unknown URN with dead_letter dead-letters and acks", async () => {
     legacy(EnvelopeCodec.encode(envelope())),
   );
   const dlq = client.called("legacyDeadLetter");
-  assert.equal((EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope).dead_letter!.reason, "unknown_urn");
+  const record = EnvelopeCodec.decode(dlq[0]!.args[2]!) as Envelope;
+  assert.equal(record.dead_letter!.reason, "unknown_urn");
+  // a direct dead-letter makes no retry decision: the delivered value, informational
+  assert.equal(record.dead_letter!.attempts, 0);
+});
+
+test("dead_letter.attempts is the delivered attempts plus one, whatever maxTries", async () => {
+  for (const [delivered, maxTries] of [[0, 1], [4, 5], [6, 3]] as const) {
+    const client = new FakeRedis();
+    await new RedisConsumer(client, "orders", { [URN]: () => { throw new Error("boom"); } }, { maxTries }).handle(
+      legacy(EnvelopeCodec.encode(envelope(delivered))),
+    );
+    const record = EnvelopeCodec.decode(client.called("legacyDeadLetter")[0]!.args[2]!) as Envelope;
+    assert.equal(record.dead_letter!.attempts, delivered + 1, `delivered ${delivered}`);
+  }
 });
 
 test("run stops when the supplier returns false", async () => {
@@ -305,6 +325,19 @@ test("run stops when the supplier returns false", async () => {
 function zset(raw: string): Reservation {
   return { layout: "zset", raw, reserved: raw };
 }
+
+test("zset layout: an exhausted failure writes dead_letter.attempts = job.attempts + 1", async () => {
+  const client = new FakeRedis();
+  const raw = EnvelopeCodec.encode(envelope(2));
+  await new RedisConsumer(client, "orders", { [URN]: () => { throw new Error("boom"); } }, { layout: "zset", maxTries: 3 }).handle(
+    zset(raw),
+  );
+  const dlq = client.called("zsetDeadLetter");
+  assert.equal(dlq.length, 1);
+  const record = EnvelopeCodec.decode(dlq[0]!.args[1]!) as Envelope;
+  assert.equal(record.dead_letter!.reason, "failed");
+  assert.equal(record.dead_letter!.attempts, 3);
+});
 
 test("zset release raises only attempts and keeps every other byte, including integers above 2^53", async () => {
   const client = new FakeRedis();

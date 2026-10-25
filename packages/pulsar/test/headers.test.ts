@@ -5,7 +5,6 @@ import { EnvelopeCodec } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier } from "@babelqueue/core";
 
 import {
-  PulsarConsumer,
   PulsarPublisher,
   headersOf,
   pulsarProperties,
@@ -16,6 +15,7 @@ import {
   type PulsarProducerMessage,
   type PulsarReceivedMessage,
 } from "../src/index.js";
+import { sharedConsumer } from "./support.js";
 
 const URN = "urn:babel:orders:created";
 const TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
@@ -112,7 +112,7 @@ test("the consumer surfaces the carried traceparent to the handler", async () =>
   let seen: HeaderCarrier | null = null;
   const handlers: BabelHandlers = { [URN]: (_e, _m, headers) => { seen = headers; } };
 
-  await new PulsarConsumer(consumer, handlers).poll();
+  await sharedConsumer(consumer, handlers).poll();
 
   assert.equal(seen!["traceparent"], TRACEPARENT);
   assert.equal(consumer.acked.length, 1);

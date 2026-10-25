@@ -5,7 +5,6 @@ import { EnvelopeCodec } from "@babelqueue/core";
 import type { Envelope } from "@babelqueue/core";
 
 import {
-  PulsarConsumer,
   PulsarPublisher,
   pulsarProperties,
   toPulsarMessage,
@@ -15,6 +14,7 @@ import {
   type PulsarProducerMessage,
   type PulsarReceivedMessage,
 } from "../src/index.js";
+import { sharedConsumer } from "./support.js";
 
 const URN = "urn:babel:orders:created";
 
@@ -129,7 +129,7 @@ test("attempts is the redelivery count and the message is acknowledged", async (
   const consumer = new FakeConsumer([new FakeMessage(body(0), 2)]);
   let seen = -1;
   const handlers: BabelHandlers = { [URN]: (env) => void (seen = env.attempts ?? -1) };
-  const count = await new PulsarConsumer(consumer, handlers).poll();
+  const count = await sharedConsumer(consumer, handlers).poll();
   assert.equal(count, 1);
   assert.equal(seen, 2);
   assert.equal(consumer.acked.length, 1);
@@ -138,7 +138,7 @@ test("attempts is the redelivery count and the message is acknowledged", async (
 test("first delivery is zero attempts", async () => {
   const consumer = new FakeConsumer([new FakeMessage(body(0), 0)]);
   let seen = -1;
-  await new PulsarConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
+  await sharedConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
   assert.equal(seen, 0);
 });
 
@@ -146,7 +146,7 @@ test("a higher body attempt count is never lowered by the redelivery count", asy
   // Republish-driven retry carried attempts=5 in the body; redelivery count is only 1.
   const consumer = new FakeConsumer([new FakeMessage(body(5), 1)]);
   let seen = -1;
-  await new PulsarConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
+  await sharedConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
   assert.equal(seen, 5);
 });
 
@@ -158,7 +158,7 @@ test("a throwing handler negative-acknowledges and reports onError", async () =>
       throw new Error("boom");
     },
   };
-  await new PulsarConsumer(consumer, handlers, { onError: (e) => void (reported = e) }).poll();
+  await sharedConsumer(consumer, handlers, { onError: (e) => void (reported = e) }).poll();
   assert.ok(reported instanceof Error);
   assert.equal(consumer.nacked.length, 1);
   assert.equal(consumer.acked.length, 0);
@@ -167,7 +167,7 @@ test("a throwing handler negative-acknowledges and reports onError", async () =>
 test("an unknown URN with a hook acknowledges", async () => {
   const consumer = new FakeConsumer([new FakeMessage(body(0), 0)]);
   let called = false;
-  await new PulsarConsumer(consumer, {}, { onUnknownUrn: () => void (called = true) }).poll();
+  await sharedConsumer(consumer, {}, { onUnknownUrn: () => void (called = true) }).poll();
   assert.equal(called, true);
   assert.equal(consumer.acked.length, 1);
 });
@@ -175,7 +175,7 @@ test("an unknown URN with a hook acknowledges", async () => {
 test("an unknown URN without a hook negative-acknowledges and reports onError", async () => {
   const consumer = new FakeConsumer([new FakeMessage(body(0), 0)]);
   let reported: unknown = null;
-  await new PulsarConsumer(consumer, {}, { onError: (e) => void (reported = e) }).poll();
+  await sharedConsumer(consumer, {}, { onError: (e) => void (reported = e) }).poll();
   assert.ok(reported instanceof Error);
   assert.equal(consumer.nacked.length, 1);
 });
@@ -189,7 +189,7 @@ test("a non-conformant envelope negative-acknowledges and reports onError", asyn
   });
   const consumer = new FakeConsumer([new FakeMessage(bad, 0)]);
   let reported: unknown = null;
-  await new PulsarConsumer(consumer, {}, { onError: (e) => void (reported = e) }).poll();
+  await sharedConsumer(consumer, {}, { onError: (e) => void (reported = e) }).poll();
   assert.ok(reported instanceof Error);
   assert.equal(consumer.nacked.length, 1);
 });
@@ -211,7 +211,7 @@ test("bq-job property routes the message even when the body names a different UR
     [URN]: (env) => void seen.push(`property:${EnvelopeCodec.urn(env)}`),
     [OTHER]: () => void seen.push("body"),
   };
-  await new PulsarConsumer(consumer, handlers).poll();
+  await sharedConsumer(consumer, handlers).poll();
   // routed to the property's handler; the handler still gets the body's envelope
   assert.deepEqual(seen, [`property:${OTHER}`]);
   assert.equal(consumer.acked.length, 1);
@@ -221,7 +221,7 @@ test("onRoutingMismatch is called with both URNs and the body envelope; onError 
   const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": `  ${URN}  ` })]);
   const calls: Array<[string, string, string]> = [];
   const errors: unknown[] = [];
-  await new PulsarConsumer(
+  await sharedConsumer(
     consumer,
     { [URN]: () => undefined },
     {
@@ -246,7 +246,7 @@ test("onRoutingMismatch is not called when there is no mismatch", async () => {
   for (const [raw, props] of cases) {
     let called = false;
     const consumer = new FakeConsumer([new FakeMessage(raw, 0, props)]);
-    await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
+    await sharedConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
     assert.equal(called, false, JSON.stringify(props));
   }
 });
@@ -261,7 +261,7 @@ test("a throwing or rejecting onRoutingMismatch hook still routes and acknowledg
     const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": URN })]);
     let handled = 0;
     let reported = 0;
-    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onRoutingMismatch: hook, onError: () => void reported++ }).poll();
+    await sharedConsumer(consumer, { [URN]: () => void handled++ }, { onRoutingMismatch: hook, onError: () => void reported++ }).poll();
     assert.equal(handled, 1);
     assert.equal(reported, 0);
     assert.equal(consumer.acked.length, 1);
@@ -273,7 +273,7 @@ test("blank or missing bq-job falls back to the body URN", async () => {
   for (const props of [{}, { "bq-job": "" }, { "bq-job": "   " }] as Array<{ [key: string]: string }>) {
     const consumer = new FakeConsumer([new FakeMessage(body(), 0, props)]);
     let handled = 0;
-    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }).poll();
+    await sharedConsumer(consumer, { [URN]: () => void handled++ }).poll();
     assert.equal(handled, 1, JSON.stringify(props));
     assert.equal(consumer.acked.length, 1);
   }
@@ -284,7 +284,7 @@ test("a body without a job is rejected even when bq-job is set", async () => {
   const consumer = new FakeConsumer([new FakeMessage(noJob, 0, { "bq-job": URN })]);
   let handled = 0;
   let reported: unknown = null;
-  await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
+  await sharedConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
   assert.equal(handled, 0);
   assert.ok(reported instanceof Error);
   assert.equal(consumer.nacked.length, 1);
@@ -294,7 +294,7 @@ test("a body without a job is rejected even when bq-job is set", async () => {
 async function attemptsSeen(raw: string, props: { [key: string]: string }, redelivery = 0): Promise<number> {
   const consumer = new FakeConsumer([new FakeMessage(raw, redelivery, props)]);
   let seen = -1;
-  await new PulsarConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
+  await sharedConsumer(consumer, { [URN]: (env) => void (seen = env.attempts ?? -1) }).poll();
   return seen;
 }
 
@@ -327,7 +327,7 @@ test("a missing bq-attempts falls back to the body value", async () => {
 
 test("poll returns 0 on a receive timeout", async () => {
   const consumer = new FakeConsumer([]);
-  const count = await new PulsarConsumer(consumer, {}).poll();
+  const count = await sharedConsumer(consumer, {}).poll();
   assert.equal(count, 0);
 });
 
@@ -339,14 +339,14 @@ test("poll rethrows a non-timeout receive error", async () => {
     acknowledge() {},
     negativeAcknowledge() {},
   };
-  await assert.rejects(new PulsarConsumer(consumer, {}).poll(), /connection refused/);
+  await assert.rejects(sharedConsumer(consumer, {}).poll(), /connection refused/);
 });
 
 test("run stops once the signal is aborted", async () => {
   const consumer = new FakeConsumer([]);
   const controller = new AbortController();
   controller.abort();
-  await new PulsarConsumer(consumer, {}).run(controller.signal); // returns immediately
+  await sharedConsumer(consumer, {}).run(controller.signal); // returns immediately
   assert.equal(consumer.acked.length, 0);
 });
 
@@ -363,10 +363,12 @@ test("a missing or non-integer body attempts stays rejected, whatever bq-attempt
   for (const [name, mutate] of variants) {
     const env = JSON.parse(JSON.stringify(base)) as { [key: string]: unknown };
     mutate(env);
-    const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(env), 2, { "bq-attempts": "4" })]);
+    // Poison: never handled. Reconciled attempts 1 + 1 for this delivery is below the default cap of 3, so
+    // with dead-lettering off it is retried (negative ack); at the cap it would be dropped (ADR-0036).
+    const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(env), 1, { "bq-attempts": "1" })]);
     let handled = 0;
     let reported: unknown = null;
-    await new PulsarConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
+    await sharedConsumer(consumer, { [URN]: () => void handled++ }, { onError: (e) => void (reported = e) }).poll();
     assert.equal(handled, 0, name);
     assert.ok(reported instanceof Error, name);
     assert.equal(consumer.nacked.length, 1, name);
@@ -378,7 +380,7 @@ test("attempts is written only when the integer body value really changes", asyn
   const seenRaw: string[] = [];
   const capture = (env: Envelope): void => void seenRaw.push(JSON.stringify(env));
   const same = body(3);
-  await new PulsarConsumer(new FakeConsumer([new FakeMessage(same, 3, { "bq-attempts": "3" })]), { [URN]: capture }).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage(same, 3, { "bq-attempts": "3" })]), { [URN]: capture }).poll();
   assert.equal(seenRaw[0], JSON.stringify(JSON.parse(same)));
   assert.equal(await attemptsSeen(body(3), { "bq-attempts": "4" }), 4);
 });
@@ -386,7 +388,7 @@ test("attempts is written only when the integer body value really changes", asyn
 test("onRoutingMismatch sees the reconciled attempts", async () => {
   const consumer = new FakeConsumer([new FakeMessage(bodyWithUrn(OTHER), 0, { "bq-job": URN, "bq-attempts": "4" })]);
   const seen: unknown[] = [];
-  await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: (_p, _b, env) => void seen.push(env.attempts) }).poll();
+  await sharedConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: (_p, _b, env) => void seen.push(env.attempts) }).poll();
   assert.deepEqual(seen, [4]);
 });
 
@@ -395,7 +397,7 @@ test("onRoutingMismatch is not called for a rejected envelope", async () => {
   bad.meta.schema_version = 2;
   const consumer = new FakeConsumer([new FakeMessage(JSON.stringify(bad), 0, { "bq-job": URN })]);
   let called = false;
-  await new PulsarConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
+  await sharedConsumer(consumer, { [URN]: () => undefined }, { onRoutingMismatch: () => void (called = true), onError: () => undefined }).poll();
   assert.equal(called, false);
   assert.equal(consumer.nacked.length, 1);
 });
@@ -408,7 +410,7 @@ test("a missing or blank bq-schema-version decodes and delivers as before", asyn
   for (const props of [{} as { [key: string]: string }, ...blanks.map((v) => ({ "bq-schema-version": v }))]) {
     const consumer = new FakeConsumer([new FakeMessage(body(), 0, props)]);
     const seen: Envelope[] = [];
-    await new PulsarConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
+    await sharedConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
     assert.equal(seen.length, 1);
     assert.equal(consumer.acked.length, 1);
     assert.equal(consumer.nacked.length, 0);
@@ -418,7 +420,7 @@ test("a missing or blank bq-schema-version decodes and delivers as before", asyn
 test("bq-schema-version \"1\" is delivered", async () => {
   const consumer = new FakeConsumer([new FakeMessage(body(), 0, { "bq-schema-version": "1" })]);
   const seen: Envelope[] = [];
-  await new PulsarConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
+  await sharedConsumer(consumer, { [URN]: (env) => void seen.push(env) }).poll();
   assert.equal(seen.length, 1);
   assert.equal(consumer.acked.length, 1);
 });
@@ -432,7 +434,7 @@ test("an unsupported bq-schema-version is rejected undecoded: onError + nack, no
     const consumer = new FakeConsumer([new FakeMessage(garbage, 0, { "bq-schema-version": value, "bq-job": URN })]);
     const errors: Array<{ error: unknown; envelope: unknown }> = [];
     let handled = false;
-    await new PulsarConsumer(
+    await sharedConsumer(
       consumer,
       { [URN]: () => void (handled = true) },
       { onError: (error, envelope) => void errors.push({ error, envelope }) },
@@ -453,7 +455,7 @@ test("a gated message neither reaches onUnknownUrn nor the routing-mismatch hook
   const consumer = new FakeConsumer([new FakeMessage(body(), 0, { "bq-schema-version": "2", "bq-job": OTHER })]);
   let unknown = false;
   let mismatch = false;
-  await new PulsarConsumer(consumer, { [URN]: () => undefined }, {
+  await sharedConsumer(consumer, { [URN]: () => undefined }, {
     onUnknownUrn: () => void (unknown = true),
     onRoutingMismatch: () => void (mismatch = true),
     onError: () => undefined,
