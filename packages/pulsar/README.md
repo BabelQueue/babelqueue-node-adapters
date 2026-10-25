@@ -43,7 +43,7 @@ const consumer = new PulsarConsumer(
     },
   },
   {
-    // Declare the subscription type (or pass `client`): an undeclared type counts as Exclusive and
+    // Declare the subscription type (or pass `client` together with `topic`, the topic you subscribed to): an undeclared type counts as Exclusive and
     // the constructor throws, see "Exclusive / Failover subscriptions" below.
     subscriptionType: "Shared",
     onError: (err) => console.error(err),
@@ -116,6 +116,7 @@ const consumer = new PulsarConsumer(sub, handlers, {
   maxAttempts: 3,          // default
   deadLetterProducer: dlq, // dead-lettering is on exactly when this is set
   client,                  // lets the consumer build its own retry producer; see Exclusive / Failover below
+  topic: "orders",         // ... on the topic you subscribed to (pulsar-client's Consumer has no getTopic())
   queue: "orders",         // dead_letter.original_queue of a poison record (default: the DLQ topic without ".dlq")
 });
 ```
@@ -143,14 +144,15 @@ every subscription type. Give the consumer the means to publish:
 ```ts
 const consumer = new PulsarConsumer(sub, handlers, {
   client,                          // the pulsar-client Client: the consumer builds the retry producer itself,
-                                   // lazily on the first retry, on sub.getTopic() (or `topic`)
+                                   // lazily on the first retry
+  topic: "orders",                 // the topic you subscribed to (pulsar-client's Consumer has no getTopic())
   subscriptionType: "Exclusive",   // or "Shared" / "Key_Shared" (not declared = Exclusive, see below)
 });
 // or pass your own producer on the topic you read: { retryProducer: await client.createProducer({ topic }) }
 ```
 
 A given `retryProducer` wins over `client`. The constructor **fails closed**: with `maxAttempts > 1`
-and neither a `retryProducer` nor a `client` (with a resolvable topic), `subscriptionType` `Exclusive`,
+and neither a `retryProducer` nor a `client` (with its `topic`), `subscriptionType` `Exclusive`,
 `Failover` **or not declared** (it then counts as `Exclusive`, pulsar-client's default) throws a
 `BabelQueueError`. Declare `subscriptionType: "Shared"` or `"Key_Shared"` to keep the
 `negativeAcknowledge` retry without a producer. A poison body is re-published byte for byte, only

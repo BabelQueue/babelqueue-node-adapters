@@ -563,6 +563,82 @@ test("with a client the consumer builds the retry producer itself, once, on the 
   assert.equal(dlqRecord(dlq).dead_letter.attempts, 3);
 });
 
+/**
+ * The real pulsar-client `Consumer` shape: receive / acknowledge / negativeAcknowledge and NO `getTopic()`
+ * (only pulsar-client's Producer has one). Redelivery on Exclusive/Failover leaves the count at 0.
+ */
+class RealShapeConsumer implements PulsarConsumerClient {
+  queue: FakeMessage[] = [];
+  acked = 0;
+  nacked = 0;
+  constructor(first: FakeMessage) {
+    this.queue.push(first);
+  }
+  async receive(): Promise<PulsarReceivedMessage> {
+    const next = this.queue.shift();
+    if (next === undefined) throw new Error("Failed to receive message: TimeOut");
+    return next;
+  }
+  acknowledge(): void {
+    this.acked += 1;
+  }
+  negativeAcknowledge(message: PulsarReceivedMessage): void {
+    this.nacked += 1;
+    this.queue.push(message as FakeMessage);
+  }
+}
+
+test("pulsar-client shape (no Consumer.getTopic): a client alone on Exclusive / Failover / undeclared throws and asks for `topic`", () => {
+  const real = new RealShapeConsumer(new FakeMessage(bodyOf(0)));
+  assert.equal((real as { getTopic?: unknown }).getTopic, undefined);
+  const client: PulsarClientLike = { createProducer: async () => new FakeProducer() };
+  for (const subscriptionType of ["Exclusive", "Failover", undefined] as const) {
+    assert.throws(
+      () => new PulsarConsumer(real, failing, { client, ...(subscriptionType ? { subscriptionType } : {}) }),
+      /with a client needs the `topic` option.*cannot report its own topic/s,
+      String(subscriptionType),
+    );
+  }
+});
+
+test("pulsar-client shape (no Consumer.getTopic): client + topic builds the retry producer on that topic and bounds Exclusive", async () => {
+  const real = new RealShapeConsumer(new FakeMessage(bodyOf(0)));
+  const created: { topic: string }[] = [];
+  const republished: PulsarProducerMessage[] = [];
+  const client: PulsarClientLike = {
+    async createProducer(config) {
+      created.push(config);
+      return {
+        getTopic: () => config.topic,
+        async send(message: PulsarProducerMessage) {
+          republished.push(message);
+          real.queue.push(new FakeMessage(message.data, 0, message.properties ?? {})); // count stays 0
+          return {};
+        },
+      };
+    },
+  };
+  const dlq = new FakeProducer();
+  const consumer = new PulsarConsumer(real, failing, {
+    client,
+    topic: "persistent://public/default/orders",
+    subscriptionType: "Exclusive",
+    deadLetterProducer: dlq,
+    onError: () => undefined,
+  });
+
+  let polls = 0;
+  while (real.queue.length > 0 && polls < 20) {
+    await consumer.poll();
+    polls += 1;
+  }
+  assert.equal(polls, 3);
+  assert.equal(real.nacked, 0);
+  assert.deepEqual(created, [{ topic: "persistent://public/default/orders" }], "built once, on the given topic");
+  assert.equal(republished.length, 2);
+  assert.equal(dlqRecord(dlq).dead_letter.attempts, 3);
+});
+
 test("a given retryProducer wins over the client; the topic option overrides getTopic", async () => {
   const topic = new ExclusiveTopic(new FakeMessage(bodyOf(0)));
   const client = new ClientOver(topic);
@@ -605,7 +681,7 @@ test("Exclusive / Failover without a retry producer or client is rejected at con
   const noTopic = new RedeliveringConsumer(new FakeMessage(bodyOf(0)));
   assert.throws(
     () => new PulsarConsumer(noTopic, failing, { subscriptionType: "Exclusive", client: new ClientOver(topic) }),
-    /needs a retryProducer/,
+    /needs the `topic` option/,
   );
 });
 

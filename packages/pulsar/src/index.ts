@@ -18,7 +18,7 @@
  *     });
  *     const consumer = new PulsarConsumer(sub, {
  *       "urn:babel:orders:created": async (env) => { ... },
- *     }, { subscriptionType: "Shared" }); // declare it (or pass `client`): see PulsarConsumerOptions
+ *     }, { subscriptionType: "Shared" }); // declare it (or pass `client` together with `topic`): see PulsarConsumerOptions
  *     await consumer.run();
  *
  * This implements §5 of the broker-bindings contract: the canonical envelope is the message
@@ -88,7 +88,11 @@ export interface PulsarReceivedMessage {
  * satisfies it structurally; a fake satisfies it in tests.
  */
 export interface PulsarConsumerClient {
-  /** The topic the subscription reads (pulsar-client `Consumer.getTopic()`); used to build the retry producer. */
+  /**
+   * The topic the subscription reads. pulsar-client's `Consumer` has **no** such method (only its `Producer`
+   * does), so with it the topic comes from the {@link PulsarConsumerOptions.topic} option; a custom
+   * subscription wrapper may provide this to make `topic` unnecessary.
+   */
   getTopic?(): string;
   receive(timeoutMs?: number): Promise<PulsarReceivedMessage>;
   acknowledge(message: PulsarReceivedMessage): Promise<void> | void;
@@ -266,10 +270,15 @@ export interface PulsarConsumerOptions {
   retryProducer?: PulsarProducer;
   /**
    * The Pulsar client the consumer builds its retry producer from, lazily on the first retry, on
-   * {@link topic} (default `getTopic()` of the subscription). Ignored when {@link retryProducer} is given.
+   * {@link topic}. Needs `topic` (pulsar-client's `Consumer` cannot tell its topic). Ignored when
+   * {@link retryProducer} is given.
    */
   client?: PulsarClientLike;
-  /** The topic the retry producer is created on (default: the subscription's `getTopic()`). */
+  /**
+   * The topic the retry producer is created on — the topic the consumer reads. Required together with
+   * {@link client} (a pulsar-client `Consumer` has no `getTopic()`); a subscription wrapper that provides
+   * `getTopic()` makes it optional.
+   */
   topic?: string;
   /**
    * The subscription type the consumer was created with. `Exclusive` and `Failover` cannot bound a
@@ -388,10 +397,17 @@ export class PulsarConsumer {
     if (maxAttempts === 1 || this.options.retryProducer !== undefined) return;
     if (this.options.client !== undefined && this.retryTopic() !== undefined) return;
     const shown = declared === undefined ? "An undeclared subscriptionType (treated as Exclusive)" : `A ${type} subscription`;
+    if (this.options.client !== undefined) {
+      // A client alone cannot name the topic: pulsar-client's Consumer has no getTopic().
+      throw new BabelQueueError(
+        `${shown} with a client needs the \`topic\` option (the topic this consumer reads) to build the retry producer: ` +
+          "pulsar-client's Consumer cannot report its own topic.",
+      );
+    }
     throw new BabelQueueError(
       `${shown} needs a retryProducer (or a client plus a topic) to bound retries: ` +
         "a negative acknowledgement does not advance the redelivery count there, so a retry would never reach maxAttempts. " +
-        'Pass a client or retryProducer, or declare subscriptionType: "Shared" / "Key_Shared".',
+        'Pass a client plus topic (the topic you subscribed to), or a retryProducer, or declare subscriptionType: "Shared" / "Key_Shared".',
     );
   }
 
