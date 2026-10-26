@@ -26,12 +26,22 @@
  * authoritative attempt count is `ApproximateReceiveCount`, surfaced to handlers as
  * `attempts = count − 1`.
  *
- * **Version gate (§3.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+ * **Version gate (§3.7, ADR-0037 decision 1).** Before the body is decoded the consumer reads the `bq-schema-version`
  * message attribute. A missing or blank value (empty or only ASCII whitespace) changes nothing; any
  * value other than the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the
- * message undecoded through the same path as a non-conformant envelope — `onError` (with an error
- * naming the version, and an empty envelope since nothing was decoded) and the message is left
- * undeleted, so it is redelivered and the queue's `RedrivePolicy` moves it to the DLQ.
+ * message undecoded (`onError` with an error naming the version and an empty envelope) and settles it on its
+ * **first delivery**: never decoded, never given to a handler, `onUnknownUrn` or a retry. Under
+ * `unknownUrn: "delete"` it is deleted; with a `deadLetterQueueUrl` the body, byte for byte and without a
+ * `dead_letter` block, is sent to the DLQ and deleted only after the send succeeded (a failed send leaves it
+ * undeleted: visibility expiry redelivers it and the write is tried again); without a `deadLetterQueueUrl`
+ * it is left to the **native** mechanism — not deleted, so visibility expiry redelivers it and the queue's
+ * `RedrivePolicy` moves it to the native DLQ (pair the queue with one). Only the explicitly configured
+ * `unknownUrn` strategy is read: an `onUnknownUrn` hook never changes it (a hook-only consumer behaves as `fail`).
+ *
+ * **Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope is never given
+ * to a handler and never retried. `unknownUrn: "delete"` deletes it; with a `deadLetterQueueUrl` the ADR-0035
+ * record (`reason: "poison"`, built with the core's `buildPoisonRecord`) is sent to the DLQ and the message
+ * deleted only after the send succeeded; without one it is left to the native mechanism, as above.
  *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional String `MessageAttributes` **beside** the contract `bq-*`
@@ -43,6 +53,8 @@
  * `/sqs` and PHP `SqsTransport` wiring. GR-1: the wire envelope body is never touched.
  */
 
+import { createHash } from "node:crypto";
+
 import {
   BabelQueueError,
   EnvelopeCodec,
@@ -50,6 +62,7 @@ import {
   UnknownUrnError,
   UnknownUrnStrategy,
   annotate,
+  buildPoisonRecord,
   retryBackoffBound,
   retryBackoffDelay,
 } from "@babelqueue/core";
@@ -71,6 +84,7 @@ export interface SqsMessageAttributeValue {
 }
 
 export interface SqsMessage {
+  MessageId?: string;
   Body?: string;
   ReceiptHandle?: string;
   MessageAttributes?: Record<string, SqsMessageAttributeValue>;
@@ -296,6 +310,9 @@ export interface SqsConsumerOptions extends RetryBackoffOptions {
    * otherwise report and leave for visibility-timeout redelivery, i.e. `fail`). `release` uses
    * `ChangeMessageVisibility` with {@link unknownUrnReleaseDelay}; `dead_letter` sends the annotated
    * envelope to {@link deadLetterQueueUrl} then deletes, degrading to `delete` when no DLQ is set.
+   *
+   * The version gate and the poison route read **only this explicitly configured strategy** (ADR-0037): an
+   * `onUnknownUrn` hook, and the `delete` it implies when no strategy is set, never apply to them.
    */
   unknownUrn?: string;
   /** Backoff (seconds) for the `release` unknown-URN strategy (default 0 = redeliver now). */
@@ -315,7 +332,9 @@ export interface SqsConsumerOptions extends RetryBackoffOptions {
    */
   releaseDelay?: number | ((attempts: number) => number);
   /**
-   * The cross-language `<queue>.dlq` URL for the `dead_letter` strategy (opt-in; default none). A
+   * The cross-language `<queue>-dlq` URL (opt-in; default none; SQS names cannot contain a dot): the `dead_letter` strategy, poison bodies
+   * (ADR-0035 record) and version-gated deliveries (the raw body) are written here. Without it a poison or
+   * version-gated delivery is left to the queue's native `RedrivePolicy` (ADR-0037). A
    * `.fifo` DLQ is sent with `MessageGroupId` (the source queue name) and `MessageDeduplicationId`
    * (`meta.id`).
    */
@@ -421,16 +440,14 @@ export class SqsConsumer {
   }
 
   private async handle(message: SqsMessage): Promise<void> {
-    // §3.7: gate on the bq-schema-version attribute before the body is decoded. The message is
-    // not deleted, so SQS redelivers it and the queue's RedrivePolicy moves it to the DLQ.
+    // §3.7: gate on the bq-schema-version attribute before the body is decoded (ADR-0037 decision 1).
     const rejectedVersion = unsupportedSchemaVersion(message);
     if (rejectedVersion !== undefined) {
-      this.options.onError?.(
+      await this.settleVersionGated(
+        message,
         new BabelQueueError(
           `Rejected a message from SQS with unsupported bq-schema-version "${rejectedVersion}" (supported: ${SCHEMA_VERSION}).`,
         ),
-        {},
-        message,
       );
       return;
     }
@@ -447,11 +464,7 @@ export class SqsConsumer {
     }
 
     if (!EnvelopeCodec.accepts(envelope)) {
-      this.options.onError?.(
-        new BabelQueueError("Rejected a non-conformant BabelQueue envelope from SQS."),
-        envelope,
-        message,
-      );
+      await this.settlePoison(message, envelope, new BabelQueueError("Rejected a non-conformant BabelQueue envelope from SQS."));
       return;
     }
 
@@ -476,6 +489,62 @@ export class SqsConsumer {
     // SqsDeleteError and the message is NOT released — releasing at the (default 0 s) backoff would
     // redeliver an already-processed message immediately; it returns on visibility expiry instead.
     await this.guard(envelope, message, () => this.deleteHandled(message));
+  }
+
+  /**
+   * Version-gated delivery (ADR-0037 decision 1). `unknownUrn: "delete"` deletes it; with a DLQ the raw body goes
+   * to `<queue>-dlq` and the message is deleted only after the send; otherwise it is reported and left for the
+   * queue's native mechanism (never deleted, never released by the SDK). Only the configured strategy is read.
+   */
+  private async settleVersionGated(message: SqsMessage, gateError: BabelQueueError): Promise<void> {
+    this.options.onError?.(gateError, {}, message);
+    const dlq = this.options.deadLetterQueueUrl;
+    if (this.options.unknownUrn === UnknownUrnStrategy.DELETE) {
+      await this.guard({}, message, () => this.deleteHandled(message));
+      return;
+    }
+    if (!dlq) return; // native: SQS redelivers on visibility expiry, RedrivePolicy moves it after maxReceiveCount
+    await this.guard({}, message, async () => {
+      await this.sendRaw(dlq, message, message.Body ?? "");
+      await this.deleteHandled(message);
+    });
+  }
+
+  /**
+   * Poison body (ADR-0037 decision 2). `unknownUrn: "delete"` deletes it; with a DLQ the ADR-0035 record is sent
+   * and the message deleted only after the send; otherwise it is reported and left for the native mechanism.
+   */
+  private async settlePoison(message: SqsMessage, envelope: IncomingEnvelope, error: BabelQueueError): Promise<void> {
+    this.options.onError?.(error, envelope, message);
+    const dlq = this.options.deadLetterQueueUrl;
+    if (this.options.unknownUrn === UnknownUrnStrategy.DELETE) {
+      await this.guard(envelope, message, () => this.deleteHandled(message));
+      return;
+    }
+    if (!dlq) return; // native, as above
+    await this.guard(envelope, message, async () => {
+      const source = queueNameFromUrl(this.queueUrl);
+      const count = Number.parseInt(message.Attributes?.["ApproximateReceiveCount"] ?? "", 10);
+      const delivered = Number.isFinite(count) && count > 1 ? count - 1 : 0; // informational: deliveries before this one
+      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, "poison", source, {
+        attempts: delivered,
+        error: error.message,
+        exception: error.name,
+      }).dead_letter;
+      const record = buildPoisonRecord(Buffer.from(message.Body ?? "", "utf8"), JSON.stringify(deadLetter));
+      await this.sendRaw(dlq, message, record);
+      await this.deleteHandled(message);
+    });
+  }
+
+  /** Send `body` to the DLQ as is (a `.fifo` DLQ gets the source queue as group and a stable dedup id). */
+  private async sendRaw(dlq: string, message: SqsMessage, body: string): Promise<void> {
+    const input: SendMessageInput = { QueueUrl: dlq, MessageBody: body };
+    if (dlq.endsWith(".fifo")) {
+      input.MessageGroupId = queueNameFromUrl(this.queueUrl);
+      input.MessageDeduplicationId = message.MessageId ?? createHash("sha256").update(message.Body ?? "").digest("hex");
+    }
+    await this.client.sendMessage(input);
   }
 
   /** The release delay (seconds) for a failed handler: `releaseDelay` (alias) wins, else the A9 backoff, else 0. */
@@ -561,7 +630,7 @@ export class SqsConsumer {
       MessageAttributes: toMessageAttributes(annotated),
     };
     if (dlq.endsWith(".fifo")) {
-      // A FIFO DLQ (`<queue>.dlq.fifo`) rejects a send without a group; dedup on meta.id (§3.2).
+      // A FIFO DLQ (`<queue>-dlq.fifo`) rejects a send without a group; dedup on meta.id (§3.2).
       input.MessageGroupId = source;
       if (annotated.meta?.id) input.MessageDeduplicationId = annotated.meta.id;
     }

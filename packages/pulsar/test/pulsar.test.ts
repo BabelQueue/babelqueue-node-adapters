@@ -425,7 +425,7 @@ test("bq-schema-version \"1\" is delivered", async () => {
   assert.equal(consumer.acked.length, 1);
 });
 
-test("an unsupported bq-schema-version is rejected undecoded: onError + nack, no handler", async () => {
+test("an unsupported bq-schema-version is rejected undecoded: onError, no handler, acknowledged and dropped without a DLQ", async () => {
   // The body is not JSON: decoding it would yield the generic "non-conformant envelope" error,
   // so an error naming the version proves the gate ran before the decode.
   const garbage = "{not json";
@@ -433,16 +433,19 @@ test("an unsupported bq-schema-version is rejected undecoded: onError + nack, no
   for (const value of ["2", "x", "01", " 1", "1.0", "-1", "\u00A0", "\u001C", "\u0085", "\uFEFF", "\u3000"]) {
     const consumer = new FakeConsumer([new FakeMessage(garbage, 0, { "bq-schema-version": value, "bq-job": URN })]);
     const errors: Array<{ error: unknown; envelope: unknown }> = [];
+    const warnings: string[] = [];
     let handled = false;
     await sharedConsumer(
       consumer,
       { [URN]: () => void (handled = true) },
-      { onError: (error, envelope) => void errors.push({ error, envelope }) },
+      { onError: (error, envelope) => void errors.push({ error, envelope }), onWarn: (m) => void warnings.push(m) },
     ).poll();
 
     assert.equal(handled, false, `value ${JSON.stringify(value)}`);
-    assert.equal(consumer.acked.length, 0);
-    assert.equal(consumer.nacked.length, 1);
+    assert.equal(consumer.acked.length, 1, "ADR-0037: acknowledged and dropped on the first delivery");
+    assert.equal(consumer.nacked.length, 0, "never negatively acknowledged");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0] as string, /dropped a version-gated/);
     assert.equal(errors.length, 1);
     const message = (errors[0].error as Error).message;
     assert.match(message, /unsupported bq-schema-version/);
@@ -459,9 +462,80 @@ test("a gated message neither reaches onUnknownUrn nor the routing-mismatch hook
     onUnknownUrn: () => void (unknown = true),
     onRoutingMismatch: () => void (mismatch = true),
     onError: () => undefined,
+    onWarn: () => undefined,
   }).poll();
   assert.equal(unknown, false);
   assert.equal(mismatch, false);
-  assert.equal(consumer.nacked.length, 1);
+  assert.equal(consumer.nacked.length, 0);
+  assert.equal(consumer.acked.length, 1);
+});
+
+test("a gated message goes to the DLQ byte for byte, then is acknowledged (no dead_letter block)", async () => {
+  // Not canonical on purpose: a writer that decodes and re-encodes would change these bytes.
+  const raw = '{\n  "job": "urn:babelqueue:order.created",\n  "data": { "big": 12345678901234567890, "ratio": 1.50 },\n  "meta": {"schema_version": 2}\n}\n';
+  const consumer = new FakeConsumer([new FakeMessage(raw, 0, { "bq-schema-version": "2", "bq-job": URN })]);
+  const dlq = new FakeProducer("persistent://public/default/orders.dlq");
+  let handled = false;
+  await sharedConsumer(consumer, { [URN]: () => void (handled = true) }, {
+    deadLetterProducer: dlq,
+    onUnknownUrn: () => void (handled = true),
+    onError: () => undefined,
+  }).poll();
+
+  assert.equal(handled, false);
+  assert.equal(dlq.sent.length, 1);
+  assert.equal((dlq.sent[0] as PulsarProducerMessage).data.toString("utf8"), raw);
+  assert.ok(!(dlq.sent[0] as PulsarProducerMessage).data.toString("utf8").includes("dead_letter"));
+  assert.equal(consumer.acked.length, 1);
+  assert.equal(consumer.nacked.length, 0);
+});
+
+test("a failed DLQ write leaves a gated message unsettled: nacked, never acknowledged", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(body(), 0, { "bq-schema-version": "2" })]);
+  const warnings: string[] = [];
+  const failing: PulsarProducer = {
+    getTopic: () => "persistent://public/default/orders.dlq",
+    send: async () => {
+      throw new Error("broker down");
+    },
+  };
+  await sharedConsumer(consumer, { [URN]: () => undefined }, {
+    deadLetterProducer: failing,
+    onError: () => undefined,
+    onWarn: (m) => void warnings.push(m),
+  }).poll();
+
   assert.equal(consumer.acked.length, 0);
+  assert.equal(consumer.nacked.length, 1);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] as string, /dead-letter write of a version-gated message .* failed \(broker down\)/);
+});
+
+test("a gated message is settled on its first delivery whatever the attempts, redeliveries or maxAttempts", async () => {
+  // Redelivery count 9 and bq-attempts 7 would exhaust any retry budget; a retry producer must stay unused.
+  for (const maxAttempts of [1, 3, 100]) {
+    const consumer = new FakeConsumer([new FakeMessage(body(7), 9, { "bq-schema-version": "2", "bq-attempts": "7" })]);
+    const dlq = new FakeProducer("persistent://public/default/orders.dlq");
+    const retry = new FakeProducer();
+    await sharedConsumer(consumer, { [URN]: () => undefined }, {
+      maxAttempts,
+      retryProducer: retry,
+      deadLetterProducer: dlq,
+      onError: () => undefined,
+    }).poll();
+    assert.equal(retry.sent.length, 0, `maxAttempts ${maxAttempts}: no retry re-publish`);
+    assert.equal(dlq.sent.length, 1, `maxAttempts ${maxAttempts}`);
+    assert.equal(consumer.acked.length, 1);
+    assert.equal(consumer.nacked.length, 0);
+  }
+});
+
+test("poison: an onUnknownUrn hook does not apply to a poison body (dead-lettered, hook not called)", async () => {
+  let hook = 0;
+  const consumer = new FakeConsumer([new FakeMessage("not-json", 0, {})]);
+  const dlq = new FakeProducer("persistent://public/default/orders.dlq");
+  await sharedConsumer(consumer, {}, { onUnknownUrn: () => void (hook += 1), deadLetterProducer: dlq, onError: () => undefined }).poll();
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(consumer.acked.length, 1);
+  assert.equal(hook, 0);
 });

@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
+### Changed
+- **Behaviour change: `deadLetterQueue: null` no longer drops a poison body (ADR-0037 decision 5).** The setting
+  now disables the dead-letter of an exhausted message and of an unknown URN only (they are acknowledged and
+  dropped; `unknownUrn: "dead_letter"` degrades to `delete`, as before). A poison body (not JSON, not a valid
+  envelope, invalid UTF-8, a non-numeric `attempts`) is dead-lettered as the ADR-0035 record in every
+  configuration, as broker-bindings §1.1 requires: to the configured name, and with `null` to the default
+  `<queue>.dlq`. Anyone who set `null` to keep poison bodies out of Redis must now read or trim `<queue>.dlq`.
+- `RedisQueue.deadLetter(reservation, body?, poison?)` takes a third argument that marks a poison record, and
+  `RedisQueue.poisonDeadLetterKey` exposes where it goes.
+- Conformance v1.8.0 vendored (no Redis section changed).
+
 ## [1.3.0] - 2026-10-25
 
 ### Changed

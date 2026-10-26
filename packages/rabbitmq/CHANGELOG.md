@@ -9,6 +9,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+- Conformance v1.8.0 vendored (no section of this package changed).
+
 ## [1.2.0] - 2026-10-03
 
 ### Fixed

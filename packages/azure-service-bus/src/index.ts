@@ -25,12 +25,21 @@
  * redelivered and `deliveryCount` is incremented; the authoritative attempt count is the
  * native `deliveryCount`, surfaced to handlers as `attempts = deliveryCount − 1`.
  *
- * **Version gate (§4.7).** Before the body is decoded the consumer reads the `bq-schema-version`
+ * **Version gate (§4.7, ADR-0037 decision 1).** Before the body is decoded the consumer reads the `bq-schema-version`
  * application property. A missing or blank value (empty or only ASCII whitespace) changes nothing;
  * the string `"1"` and the integral number `1` (what the producer writes) decode; any other value
- * or type (`"2"`, `"x"`, `"01"`, `2`, `1.5`, ...) rejects the message undecoded — `onError` (with an
- * empty envelope) and an explicit `deadLetterMessage` (reason `unsupported schema version`), never
- * `abandon`, so the message is not redelivered to the same consumer.
+ * or type (`"2"`, `"x"`, `"01"`, `2`, `1.5`, ...) rejects the message undecoded (`onError` with an empty
+ * envelope) and settles it on its **first delivery**: never decoded, never given to a handler or `onUnknownUrn`,
+ * never retried. With a `deadLetterSender` (`<queue>.dlq`) the body, byte for byte and without a `dead_letter`
+ * block, is sent there and the message completed only after the send succeeded (a failed send abandons it, so
+ * the write is tried again); without one it is left to the **native** mechanism — an explicit `deadLetterMessage`
+ * (reason `unsupported schema version`) into `$DeadLetterQueue`, or `abandon` when the receiver cannot dead-letter.
+ * This consumer has no unknown-URN strategy option and an `onUnknownUrn` hook never applies here: it behaves as `fail`.
+ *
+ * **Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope is never given
+ * to a handler. With a `deadLetterSender` the ADR-0035 record (`reason: "poison"`, built with the core's
+ * `buildPoisonRecord`) is sent to `<queue>.dlq` and the message completed only after the send; without one it is
+ * abandoned, so `MaxDeliveryCount` moves it to the native dead-letter sub-queue.
  *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional native `applicationProperties` beside the contract `bq-*`
@@ -40,7 +49,7 @@
  * header-less publish is byte-identical. GR-1: the wire envelope body is never touched.
  */
 
-import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError } from "@babelqueue/core";
+import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, annotate, buildPoisonRecord } from "@babelqueue/core";
 import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
@@ -61,11 +70,20 @@ export interface AsbMessage {
 /** A received message (structural subset of @azure/service-bus `ServiceBusReceivedMessage`). */
 export interface AsbReceivedMessage {
   body: unknown;
+  contentType?: string;
   subject?: string;
   correlationId?: string;
   messageId?: string;
   deliveryCount?: number;
   applicationProperties?: { [key: string]: unknown };
+  /**
+   * Optional (a `ServiceBusReceivedMessage` has it, `readonly _rawAmqpMessage: AmqpAnnotatedMessage`): the raw AMQP
+   * message the SDK decoded this one from. Its `body` is rhea's undecoded view: for a data section a
+   * `Section { typecode: 0x75, content: Buffer }` (`content` an array of Buffers when there are several sections), for an
+   * amqp-value section the plain value itself (rhea does not wrap an amqp-value: a string or a Buffer), whereas {@link body} is the SDK's JSON-parsed view (unless the receiver
+   * was created with `skipParsingBodyAsJson: true`). The consumer reads the exact bytes from here.
+   */
+  _rawAmqpMessage?: { body?: unknown; bodyType?: string };
 }
 
 /**
@@ -83,6 +101,8 @@ export interface AsbSender {
  * from `@azure/service-bus` satisfies it structurally; a fake satisfies it in tests.
  */
 export interface AsbReceiver {
+  /** Optional (a `ServiceBusReceiver` has it): the entity this receiver reads, the default `original_queue` of a poison record. */
+  entityPath?: string;
   receiveMessages(maxMessageCount: number, options?: { maxWaitTimeInMs?: number }): Promise<AsbReceivedMessage[]>;
   completeMessage(message: AsbReceivedMessage): Promise<void>;
   abandonMessage(message: AsbReceivedMessage): Promise<void>;
@@ -100,6 +120,15 @@ export interface AsbReceiver {
 
 /** Blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r) — not `String.prototype.trim()`'s wider set. */
 const BLANK_ASCII = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * Reported (and the message abandoned, never completed) when a DLQ record cannot be written byte-faithfully: the receiver
+ * parsed the body and the message exposes no raw AMQP view to recover the bytes from. Only a receiver or SDK build that
+ * hides both is affected; `skipParsingBodyAsJson: true` always delivers exact bytes.
+ */
+const UNKNOWN_BODY_BYTES =
+  "The message body was already parsed from JSON by the receiver and the message exposes no raw AMQP body, so its exact bytes are " +
+  "unknown and no DLQ record is written. Create the receiver with skipParsingBodyAsJson: true.";
 
 /** Reason recorded on a message dead-lettered by the version gate. */
 const UNSUPPORTED_SCHEMA_VERSION_REASON = "unsupported schema version";
@@ -153,7 +182,9 @@ export function toServiceBusMessage(envelope: Envelope, extra?: HeaderCarrier | 
   }
 
   const message: AsbMessage = {
-    body: EnvelopeCodec.encode(envelope),
+    // Bytes, never a string: `@azure/service-bus` JSON-encodes every body that is not a Buffer / Uint8Array, so a
+    // string would reach the wire as a quoted JSON string literal and the other SDKs would not read an envelope (GR-5).
+    body: Buffer.from(EnvelopeCodec.encode(envelope), "utf8"),
     contentType: "application/json",
   };
   if (envelope.job) message.subject = envelope.job;
@@ -234,6 +265,99 @@ export class AsbPublisher {
 // --- Consumer ------------------------------------------------------------------
 
 /**
+ * The exact bytes held by the raw AMQP body (`_rawAmqpMessage.body`), or `undefined` when it is absent or has a shape this
+ * adapter does not read. rhea hands over a decoded section as `{ typecode, content }`:
+ * - `0x75` (data): `content` is the `Buffer` received; several data sections arrive as an array of Buffers, which are
+ *   concatenated (the AMQP body is the sequence of the sections' bytes);
+ * - an amqp-value is not wrapped by rhea: it arrives as the plain value, a string (its UTF-8 bytes) or a Buffer (its bytes);
+ * - `0x77` `{ typecode, content }` (defensive only, not a shape rhea produces): a string or binary `content` is read the same way;
+ * - `0x76` (amqp-sequence) and everything else are unknown.
+ * Unknown shapes leave the bytes unknown, and
+ * the caller falls back to `message.body` (then to the safe path: report and abandon).
+ */
+function rawAmqpBodyBytes(message: AsbReceivedMessage): Uint8Array | undefined {
+  let raw: unknown;
+  try {
+    raw = message._rawAmqpMessage?.body;
+  } catch {
+    return undefined;
+  }
+  return sectionBytes(raw);
+}
+
+function sectionBytes(raw: unknown): Uint8Array | undefined {
+  if (raw instanceof Uint8Array) return raw;
+  if (typeof raw === "string") return Buffer.from(raw, "utf8");
+  if (raw === null || typeof raw !== "object") return undefined;
+  const { typecode, content } = raw as { typecode?: unknown; content?: unknown };
+  if (typecode === 0x75) {
+    if (content instanceof Uint8Array) return content;
+    if (Array.isArray(content) && content.length > 0 && content.every((part) => part instanceof Uint8Array)) {
+      return Buffer.concat(content as Uint8Array[]);
+    }
+    return undefined;
+  }
+  if (typecode === 0x77) {
+    if (typeof content === "string") return Buffer.from(content, "utf8");
+    if (content instanceof Uint8Array) return content;
+  }
+  return undefined;
+}
+
+/**
+ * The exact bytes of a received body, or `undefined` when they are not known. `@azure/service-bus` parses a data-section
+ * body that holds valid JSON into an object / array / number unless the receiver is created with
+ * `skipParsingBodyAsJson: true`, so `message.body` alone may have lost the original bytes (whitespace, number forms,
+ * key order). The raw AMQP message the SDK keeps (`_rawAmqpMessage`) still holds them, so it is read first (see
+ * {@link rawAmqpBodyBytes} for the rhea section shapes). Otherwise a
+ * string `message.body` is its UTF-8 encoding, a `Buffer` / `Uint8Array` (a binary body, or any body with
+ * `skipParsingBodyAsJson: true`) is returned as is, and an empty body is no bytes. A body that was parsed and has no raw
+ * view has no known bytes.
+ */
+function bodyBytes(message: AsbReceivedMessage): Uint8Array | undefined {
+  const raw = rawAmqpBodyBytes(message);
+  if (raw !== undefined) return raw;
+  const body = message.body;
+  if (body == null) return new Uint8Array(0);
+  if (typeof body === "string") return Buffer.from(body, "utf8");
+  if (body instanceof Uint8Array) return body;
+  return undefined;
+}
+
+/**
+ * Migration step for the double-encoded body that releases before this fix published: `@azure/service-bus` JSON-encoded
+ * the envelope *string*, so the data section held a quoted JSON string literal (`"{\"job\":...}"`). Only a body that is
+ * a quoted JSON string **and** whose content decodes into a valid envelope is opened (once); anything else, a quoted
+ * string that is not an envelope included, is returned unchanged and takes the normal (poison) path.
+ */
+function unwrapLegacyQuotedEnvelope(text: string): string {
+  if (!text.startsWith('"')) return text;
+  try {
+    const inner: unknown = JSON.parse(text);
+    if (typeof inner === "string" && EnvelopeCodec.accepts(EnvelopeCodec.decode(inner))) return inner;
+  } catch {
+    // not a JSON string literal
+  }
+  return text;
+}
+
+/**
+ * The text an envelope is decoded from: the exact bytes when known (the raw AMQP body, or a `skipParsingBodyAsJson: true`
+ * receiver's `Buffer`), the string a default receiver parsed out of a legacy quoted literal, or the JSON of an
+ * already-parsed body. A legacy double-encoded body is opened by {@link unwrapLegacyQuotedEnvelope} on every path.
+ */
+function bodyText(message: AsbReceivedMessage): string {
+  const bytes = bodyBytes(message);
+  if (bytes !== undefined) return unwrapLegacyQuotedEnvelope(Buffer.from(bytes).toString("utf8"));
+  return JSON.stringify(message.body) ?? "";
+}
+
+/** `orders.dlq` -> `orders`: the queue a DLQ entity belongs to (a name without the suffix is kept). */
+function stripDlqSuffix(entityPath: string): string {
+  return entityPath.endsWith(".dlq") && entityPath.length > 4 ? entityPath.slice(0, -4) : entityPath;
+}
+
+/**
  * A URN handler. Receives the validated envelope, the raw Service Bus message, and the out-of-band
  * {@link HeaderCarrier} read from the message's `applicationProperties` (empty when there are none).
  * Pass `headers` to `@babelqueue/core/otel`'s `wrapHandler` to link the consumer span as a child of
@@ -254,6 +378,18 @@ export interface AsbConsumerOptions {
   maxMessages?: number;
   /** Max time to wait for a batch, in ms. */
   maxWaitTimeInMs?: number;
+  /**
+   * A sender on the cross-language `<queue>.dlq` entity (an ordinary Service Bus queue, §4.5); opt-in, default
+   * none. With it a poison body (the ADR-0035 record) and a version-gated delivery (the raw body) are written
+   * there and the source message is completed only after the send succeeded. Without it they are left to the
+   * entity's native mechanism (`MaxDeliveryCount` / `$DeadLetterQueue`).
+   */
+  deadLetterSender?: AsbSender;
+  /**
+   * The queue this consumer reads, written to `dead_letter.original_queue` of a poison record. Defaults to the
+   * receiver's `entityPath`, else the {@link deadLetterSender} entity path without its `.dlq` suffix.
+   */
+  queue?: string;
 }
 
 /**
@@ -289,8 +425,7 @@ export class AsbConsumer {
   }
 
   private async handle(message: AsbReceivedMessage): Promise<void> {
-    // §4.7: gate on bq-schema-version before the body is decoded. The message is dead-lettered
-    // explicitly (never abandoned) so it does not loop back to the same consumer.
+    // §4.7: gate on bq-schema-version before the body is decoded; settled on the first delivery (ADR-0037).
     const rejectedVersion = unsupportedSchemaVersion(message);
     if (rejectedVersion !== undefined) {
       const reported =
@@ -298,27 +433,11 @@ export class AsbConsumer {
           ? `${rejectedVersion.slice(0, MAX_REPORTED_SCHEMA_VERSION_LENGTH)}...`
           : rejectedVersion;
       const description = `Rejected a message from Azure Service Bus with unsupported bq-schema-version "${reported}" (supported: ${SCHEMA_VERSION}).`;
-      const deadLetter = this.receiver.deadLetterMessage?.bind(this.receiver);
-      this.options.onError?.(
-        new BabelQueueError(
-          deadLetter ? description : `${description} The receiver has no deadLetterMessage; degraded to abandon.`,
-        ),
-        {},
-        message,
-      );
-      if (deadLetter) {
-        await deadLetter(message, {
-          deadLetterReason: UNSUPPORTED_SCHEMA_VERSION_REASON,
-          deadLetterErrorDescription: description,
-        });
-      } else {
-        await this.receiver.abandonMessage(message);
-      }
+      await this.settleVersionGated(message, description);
       return;
     }
 
-    const raw = typeof message.body === "string" ? message.body : String(message.body ?? "");
-    const envelope = EnvelopeCodec.decode(raw);
+    const envelope = EnvelopeCodec.decode(bodyText(message));
 
     // attempts = max(current, deliveryCount − 1): deliveryCount (1-based) is the native
     // redelivery floor; the max never lowers a higher body count republished from another SDK.
@@ -330,12 +449,11 @@ export class AsbConsumer {
     }
 
     if (!EnvelopeCodec.accepts(envelope)) {
-      this.options.onError?.(
-        new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Azure Service Bus."),
-        envelope,
+      await this.settlePoison(
         message,
+        envelope,
+        new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Azure Service Bus."),
       );
-      await this.receiver.abandonMessage(message);
       return;
     }
 
@@ -360,5 +478,80 @@ export class AsbConsumer {
       this.options.onError?.(error, envelope, message);
       await this.receiver.abandonMessage(message);
     }
+  }
+
+  /**
+   * Version-gated delivery (ADR-0037 decision 1): with a {@link AsbConsumerOptions.deadLetterSender} the raw body goes
+   * to `<queue>.dlq` and the message is completed only after the send (a failed send is reported and the message
+   * abandoned); without one it is reported and left to the native mechanism.
+   */
+  private async settleVersionGated(message: AsbReceivedMessage, description: string): Promise<void> {
+    const sender = this.options.deadLetterSender;
+    if (sender === undefined) {
+      const deadLetter = this.receiver.deadLetterMessage?.bind(this.receiver);
+      this.options.onError?.(
+        new BabelQueueError(
+          deadLetter ? description : `${description} The receiver has no deadLetterMessage; degraded to abandon.`,
+        ),
+        {},
+        message,
+      );
+      if (deadLetter) {
+        await deadLetter(message, {
+          deadLetterReason: UNSUPPORTED_SCHEMA_VERSION_REASON,
+          deadLetterErrorDescription: description,
+        });
+      } else {
+        await this.receiver.abandonMessage(message);
+      }
+      return;
+    }
+    this.options.onError?.(new BabelQueueError(description), {}, message);
+    try {
+      const bytes = bodyBytes(message);
+      if (bytes === undefined) throw new BabelQueueError(UNKNOWN_BODY_BYTES);
+      // Bytes, never a string: the SDK would JSON-encode a string into a quoted literal.
+      const record: AsbMessage = { body: Buffer.from(bytes) };
+      if (message.contentType !== undefined) record.contentType = message.contentType;
+      await sender.sendMessages(record);
+    } catch (writeError) {
+      this.options.onError?.(writeError, {}, message);
+      await this.receiver.abandonMessage(message); // unsettled: redelivered, the gate rejects it again, the write is retried
+      return;
+    }
+    await this.receiver.completeMessage(message);
+  }
+
+  /**
+   * Poison body (ADR-0037 decision 2): with a {@link AsbConsumerOptions.deadLetterSender} the ADR-0035 record goes to
+   * `<queue>.dlq` and the message is completed only after the send (a failed send is reported and the message
+   * abandoned); without one it is reported and abandoned, so `MaxDeliveryCount` moves it to the native sub-queue.
+   */
+  private async settlePoison(message: AsbReceivedMessage, envelope: IncomingEnvelope, error: BabelQueueError): Promise<void> {
+    this.options.onError?.(error, envelope, message);
+    const sender = this.options.deadLetterSender;
+    if (sender === undefined) {
+      await this.receiver.abandonMessage(message);
+      return;
+    }
+    try {
+      const delivered = Math.max(0, (typeof message.deliveryCount === "number" ? message.deliveryCount : 1) - 1); // informational
+      const original = this.options.queue ?? this.receiver.entityPath ?? stripDlqSuffix(sender.entityPath);
+      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, "poison", original, {
+        attempts: delivered,
+        error: error.message,
+        exception: error.name,
+      }).dead_letter;
+      const bytes = bodyBytes(message);
+      if (bytes === undefined) throw new BabelQueueError(UNKNOWN_BODY_BYTES);
+      const record = buildPoisonRecord(bytes, JSON.stringify(deadLetter));
+      // Bytes, never a string: the SDK would JSON-encode a string into a quoted literal.
+      await sender.sendMessages({ body: Buffer.from(record, "utf8"), contentType: "application/json" });
+    } catch (writeError) {
+      this.options.onError?.(writeError, envelope, message);
+      await this.receiver.abandonMessage(message);
+      return;
+    }
+    await this.receiver.completeMessage(message);
   }
 }

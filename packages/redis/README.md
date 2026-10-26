@@ -90,6 +90,11 @@ const consumer = new RedisConsumer(client, "orders", handlers, {
   (poison), is dead-lettered to `<queue>.dlq` and removed from `:reserved`.
 - A release is one Lua script (`ZREM :reserved` + `ZADD :delayed`) that raises `attempts` by one and
   preserves every other key. Integers above 2^53 lose precision in that rewrite (`JSON.parse`).
+- **`deadLetterQueue: null`** disables the dead-letter of an **exhausted** message and of an **unknown URN**
+  only (they are dropped; `unknownUrn: "dead_letter"` degrades to `delete`). A **poison** body (not JSON, not a
+  valid envelope, not valid UTF-8, a non-numeric `attempts`) is still dead-lettered as the ADR-0035 record in
+  every configuration (ADR-0037 decision 5): to the configured `deadLetterQueue` name, and with `null` to the
+  default `<queue>.dlq`.
 - Cluster hash tags are the operator's responsibility (pass them in the queue name).
 - The handler timeout SHOULD be shorter than `retryAfter`, otherwise a slow handler is redelivered
   while still running. A negative `retryAfter` is rejected with a `BabelQueueError`.

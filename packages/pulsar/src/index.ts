@@ -40,9 +40,12 @@
  *
  * **Version gate (§5.7 step 3).** Before the body is decoded the consumer reads the
  * `bq-schema-version` property. A missing or blank value (empty or only ASCII whitespace) changes nothing; any value other than
- * the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message undecoded
- * through the same path as a non-conformant envelope — `onError` (with an error naming the
- * version, and an empty envelope since nothing was decoded) and a `negativeAcknowledge`.
+ * the core's supported `SCHEMA_VERSION` (`"2"`, `"x"`, `"01"`, ...) rejects the message undecoded:
+ * `onError` (with an error naming the version, and an empty envelope since nothing was decoded),
+ * then it is settled on its first delivery (ADR-0037 decision 1) — with a `deadLetterProducer` the
+ * body, byte for byte, goes to `<queue>.dlq` and the message is acknowledged after the write (a failed
+ * write is a `negativeAcknowledge`, never an acknowledgement); without one it is acknowledged and
+ * dropped (logged). Never retried, whatever `bq-attempts`, the redelivery count or `maxAttempts` say.
  *
  * **Out-of-band headers (ADR-0028).** A `headers` carrier (e.g. a W3C `traceparent` for cross-hop
  * span linkage) rides as additional native Pulsar **message properties** beside the contract `bq-*`
@@ -465,7 +468,7 @@ export class PulsarConsumer {
         {},
         message,
       );
-      await this.consumer.negativeAcknowledge(message);
+      await this.settleVersionGated(message);
       return;
     }
 
@@ -526,6 +529,39 @@ export class PulsarConsumer {
       this.options.onError?.(error, envelope, message);
       await this.settle("failed", attempts + 1, envelope as Envelope, message, error);
     }
+  }
+
+  /**
+   * Settle a version-gated delivery on its first delivery (ADR-0037 decision 1, broker-bindings §5.7): it is
+   * never decoded, never reaches a handler or {@link PulsarConsumerOptions.onUnknownUrn}, and is never retried,
+   * whatever `bq-attempts`, the redelivery count or `maxAttempts` say. This consumer has no unknown-URN
+   * strategy option, so it behaves as `fail`: with a {@link PulsarConsumerOptions.deadLetterProducer} the body is
+   * written to `<queue>.dlq` exactly as received (no `dead_letter` block, no re-encoding) and acknowledged only
+   * after the write; without one it is acknowledged and dropped (logged). A failed write leaves the delivery
+   * negatively acknowledged (never acknowledged, never counted as a retry): the gate rejects the redelivery
+   * again, so the write is tried again.
+   */
+  private async settleVersionGated(message: PulsarReceivedMessage): Promise<void> {
+    const producer = this.options.deadLetterProducer;
+    if (producer === undefined) {
+      this.warn("babelqueue: dropped a version-gated Apache Pulsar message (dead-lettering is off).");
+      await this.consumer.acknowledge(message);
+      return;
+    }
+    try {
+      const data = message.getData();
+      await producer.send({
+        data: typeof data === "string" ? Buffer.from(data, "utf8") : Buffer.from(data),
+        properties: { ...safeProperties(message) },
+      });
+    } catch (writeError) {
+      this.warn(
+        `babelqueue: dead-letter write of a version-gated message to ${producer.getTopic()} failed (${errorText(writeError)}); the message is left for redelivery.`,
+      );
+      await this.consumer.negativeAcknowledge(message);
+      return;
+    }
+    await this.consumer.acknowledge(message);
   }
 
   /**

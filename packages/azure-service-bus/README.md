@@ -67,10 +67,46 @@ Service Bus is purely additive.
 application property. A missing or blank value (empty or only ASCII whitespace) changes nothing;
 the string `"1"` and the integral number `1` decode; any other value or type (`"2"`, `"x"`, `"01"`,
 `2`, `1.5` — strings are never trimmed) rejects the message **undecoded**: it reaches `onError`
-(with an empty envelope) and is **dead-lettered explicitly** (`deadLetterMessage`, reason
-`unsupported schema version`) — never abandoned, so it does not loop back to the same consumer. The
-receiver must provide `deadLetterMessage` (a `ServiceBusReceiver` does); one without it degrades to
-`abandonMessage`.
+(with an empty envelope) and is settled on its **first delivery** (ADR-0037 decision 1) — never decoded,
+never given to a handler or `onUnknownUrn`. With a `deadLetterSender` (a sender on the cross-language
+`<queue>.dlq` queue) the body is sent there exactly as received (no `dead_letter` block) and the message is
+**completed only after the send succeeded**; a failed send is reported and abandons it, so the write is tried
+again. Without a `deadLetterSender` it is left to the **native** mechanism: **dead-lettered explicitly**
+(`deadLetterMessage`, reason `unsupported schema version`, into `$DeadLetterQueue`) — never abandoned into a
+loop. The receiver must provide `deadLetterMessage` (a `ServiceBusReceiver` does); one without it degrades to
+`abandonMessage` (`MaxDeliveryCount` then dead-letters it). This consumer has no unknown-URN strategy option
+and an `onUnknownUrn` hook never applies to a version-gated delivery: it behaves as `fail`.
+
+**Poison (ADR-0037 decision 2, ADR-0035).** A body that does not decode into a valid envelope is never given
+to a handler. With a `deadLetterSender` the **ADR-0035 record** (`reason: "poison"`, built with the core's
+`buildPoisonRecord`: an object body spliced byte for byte, anything else wrapped in `raw`, invalid UTF-8 as
+base64) is sent to `<queue>.dlq` and the message completed only after the send; a failed send abandons it.
+Without a `deadLetterSender` it is reported and abandoned, so `MaxDeliveryCount` moves it to the native
+dead-letter sub-queue. `dead_letter.original_queue` is the `queue` option, else the receiver's `entityPath`,
+else the sender's entity path without `.dlq`.
+
+**Bodies, the default receiver and `skipParsingBodyAsJson`.** `@azure/service-bus` parses a data-section body that holds
+valid JSON into an object unless the receiver is created with `skipParsingBodyAsJson: true`. The consumer does not
+depend on that setting: it reads the exact bytes from the raw AMQP message the SDK keeps on every received message
+(`_rawAmqpMessage.body`, rhea's decoded section: `{ typecode: 0x75, content: Buffer }` for a data section, an array of
+Buffers for several, which are concatenated; an amqp-value body arrives unwrapped, as a plain string or Buffer, and is read as is). With a
+`deadLetterSender`, a poison or version-gated delivery is therefore written to `<queue>.dlq` byte for byte even on a
+default receiver. A shape the adapter does not recognise (an amqp-sequence, a non-text amqp-value, no raw message at all)
+leaves the bytes unknown: no record is written and the delivery is reported and abandoned (the native mechanism keeps
+it), never completed. `skipParsingBodyAsJson: true` always delivers exact bytes. DLQ records are always sent as bytes (the
+SDK would otherwise JSON-encode a string into a quoted literal).
+
+**Upgrading from a release before the publisher fix.** Upgrade every consumer first, then the publishers: an old
+consumer (`<= 1.2.0`) cannot read the new wire body and would abandon every message to the native dead-letter queue.
+A new consumer also reads the quoted JSON string literal that old publishers left in the queue (a body that is a
+quoted JSON string whose content is a valid envelope is opened once, with either receiver setting); any other
+quoted string is poison. With the default receiver the SDK's `JSON.parse` has already rounded integers above 2^53
+and `1e400`-style numbers in the parsed view; the consumer decodes the envelope from the raw bytes when it can, but the
+core codec's own decode follows `JSON.parse` semantics for `data`, so use `skipParsingBodyAsJson: true` where exact
+number forms matter to your handler.
+
+**Publisher wire format.** `AsbPublisher` / `toServiceBusMessage` send the envelope as bytes (a `Buffer`), so the data
+section holds the envelope JSON itself, byte-identical to the other SDKs (GR-5).
 
 The sender/receiver are injected, so the unit tests use fakes — no Azure, no broker. Dual
 ESM + CJS.

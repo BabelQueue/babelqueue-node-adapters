@@ -9,6 +9,54 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-26
+
+### Added
+- **`deadLetterSender` option (ADR-0037 decision 2): a BabelQueue `<queue>.dlq` for this consumer** (an ordinary
+  Service Bus queue, §4.5; opt-in, default none), and the `queue` option for `dead_letter.original_queue`.
+
+### Fixed
+- **Wire behaviour: the publisher no longer double-encodes the envelope (GR-5).** `AsbPublisher` / `toServiceBusMessage`
+  put the envelope JSON in `body` as a *string*, and `@azure/service-bus` JSON-encodes every body that is not a
+  `Buffer` / `Uint8Array`, so the data section held a quoted JSON string literal (`"{\"job\":...}"`) instead of the envelope
+  bytes the .NET / Java / Go / Python SDKs write and read. The body is now a `Buffer` of the envelope's UTF-8 bytes,
+  so the data section is the envelope JSON itself. A conformance test checks that the publisher hands the codec's
+  output to the SDK as bytes.
+  **Upgrade order (ships as a MINOR): upgrade every Node consumer first, then the publishers.** Two migration cases:
+  1. *New publisher, old consumer.* A consumer on `<= 1.2.0` read the body with `String(body)`; the new wire body
+     reaches a default receiver as a parsed object (`"[object Object]"`), so the old consumer treats every message as
+     poison and abandons it until `MaxDeliveryCount` moves it to the native `$DeadLetterQueue`: work stops. Never
+     run a new publisher against an old consumer.
+  2. *Old messages still in the queue, new consumer.* Messages published before this fix hold a quoted JSON string
+     literal. The new consumer **opens such a body once** (migration step, on both the default receiver, which parses
+     the literal into its inner string, and `skipParsingBodyAsJson: true`, which delivers the literal's bytes) when
+     it is a quoted JSON string whose content is a valid envelope; any other quoted string stays poison, as before.
+     The step is meant for draining and can be dropped in a later major.
+- A data-section body that `@azure/service-bus` already parsed into an object (the default receiver) used to be
+  decoded via `String(object)` (`"[object Object]"`) and treated as poison. It is now decoded from the exact bytes (the raw AMQP
+  body; re-serialised only when no raw view exists), so an envelope written by another SDK routes to its handler.
+- DLQ writes (`deadLetterSender`) send bytes, never a string the SDK would quote.
+- **A default receiver (JSON-parsed body) together with a `deadLetterSender` now writes to `<queue>.dlq` (ADR-0037
+  decision 2).** The consumer reads the exact bytes from the raw AMQP message the SDK keeps on the received message
+  (`_rawAmqpMessage.body`, rhea's decoded section: `{ typecode: 0x75, content: Buffer }`, an array of Buffers for several
+  data sections (concatenated), or, for an amqp-value, the plain string / Buffer rhea gives unwrapped), so a poison body (the ADR-0035
+  record) and a version-gated delivery (the raw body) are written byte for byte and the message is completed, instead of
+  being abandoned to the native sub-queue until `MaxDeliveryCount`. Envelopes are decoded from those bytes too. A
+  shape that is not recognised (amqp-sequence, a non-text amqp-value, no raw message) is still reported and abandoned,
+  never completed.
+
+### Changed
+- **Behaviour change (only with a `deadLetterSender`): poison bodies and version-gated deliveries go to
+  `<queue>.dlq` on their first delivery.** A poison body is sent as the ADR-0035 record (`reason: "poison"`)
+  instead of being abandoned until `MaxDeliveryCount`; a version-gated delivery is sent as its raw body (byte
+  for byte, no `dead_letter` block) instead of being dead-lettered into the native sub-queue. The source
+  message is completed only after the send succeeded; a failed send is reported and abandons it. **Without a
+  `deadLetterSender` nothing changes**: poison is abandoned, a version-gated delivery is dead-lettered
+  natively. The version gate never reads an `onUnknownUrn` hook.
+- `@babelqueue/core` dependency range raised from `^1.4.0` to `^1.13.0` (`buildPoisonRecord`).
+- Conformance v1.8.0 vendored; the `poison_dlq` and `version_gate_asb` sections run (the 9 rows that set an
+  `on_unknown_urn` option other than `fail` belong to SDKs with that option and are reported as skipped).
+
 ## [1.2.0] - 2026-10-10
 
 ### Fixed

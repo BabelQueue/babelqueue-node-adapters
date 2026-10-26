@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/azure-service-bus",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Azure Service Bus adapter for BabelQueue — canonical-envelope publisher and a URN-routed consumer.",
   "keywords": [
     "babelqueue",
@@ -51,7 +51,7 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
-    "@babelqueue/core": "^1.4.0"
+    "@babelqueue/core": "^1.13.0"
   },
   "peerDependencies": {
     "@azure/service-bus": "^7.0.0"

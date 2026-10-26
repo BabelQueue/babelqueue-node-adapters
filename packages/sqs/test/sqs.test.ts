@@ -591,6 +591,149 @@ test("gate: the version is decided before decode - an undecodable body with vers
   assert.match((captured as Error).message, /unsupported bq-schema-version "2"/);
 });
 
+// --- ADR-0037: version gate and poison settle (DLQ on = BabelQueue DLQ, off = native) ---------------------
+
+const DLQ_URL = "https://sqs.eu-central-1.amazonaws.com/123456789012/orders.dlq";
+const GATE_BODY = '{\n  "job": "urn:babel:orders:created",\n  "data": { "big": 12345678901234567890, "ratio": 1.50 },\n  "meta": {"schema_version": 2}\n}\n';
+
+/** A client that records the order of sends and deletes; `sendFails` makes the DLQ write reject. */
+function settleApi(message: SqsMessage, sendFails = false) {
+  const events: string[] = [];
+  const sent: SendMessageInput[] = [];
+  const visibility: ChangeMessageVisibilityInput[] = [];
+  const api: SqsApi = {
+    async sendMessage(input) {
+      if (sendFails) throw new Error("dlq down");
+      events.push("send");
+      sent.push(input);
+      return {};
+    },
+    async receiveMessage() { return { Messages: [message] }; },
+    async deleteMessage() { events.push("delete"); return {}; },
+    async changeMessageVisibility(input) { visibility.push(input); return {}; },
+  };
+  return { api, events, sent, visibility };
+}
+
+test("gate: with a DLQ the raw body goes to <queue>.dlq byte for byte and is deleted only after the send", async () => {
+  const { api, events, sent, visibility } = settleApi(gateMessage(GATE_BODY, "2"));
+  let handled = 0;
+  await new SqsConsumer(api, URL, { "urn:babel:orders:created": () => { handled += 1; } }, { deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.equal(handled, 0);
+  assert.deepEqual(events, ["send", "delete"]);
+  assert.equal(sent[0]!.QueueUrl, DLQ_URL);
+  assert.equal(sent[0]!.MessageBody, GATE_BODY);
+  assert.ok(!sent[0]!.MessageBody.includes("dead_letter"));
+  assert.equal(visibility.length, 0);
+});
+
+test("gate: a failed DLQ write leaves the message undeleted and unreleased, and reports the failure", async () => {
+  const { api, events, visibility } = settleApi(gateMessage(GATE_BODY, "2"), true);
+  const errors: unknown[] = [];
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: (e) => void errors.push(e) }).poll();
+  assert.deepEqual(events, []);
+  assert.equal(visibility.length, 0);
+  assert.equal(errors.length, 2); // the gate error, then the failed write
+  assert.match((errors[1] as Error).message, /dlq down/);
+});
+
+test("gate: unknownUrn=delete deletes without a record; release and fail behave as fail", async () => {
+  const deleted = settleApi(gateMessage(GATE_BODY, "2"));
+  await new SqsConsumer(deleted.api, URL, {}, { unknownUrn: "delete", deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.deepEqual(deleted.events, ["delete"]);
+  assert.equal(deleted.sent.length, 0);
+
+  for (const unknownUrn of ["fail", "release", "dead_letter"]) {
+    const run = settleApi(gateMessage(GATE_BODY, "2"));
+    await new SqsConsumer(run.api, URL, {}, { unknownUrn, deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+    assert.deepEqual(run.events, ["send", "delete"], unknownUrn);
+    assert.equal(run.visibility.length, 0, "a version-gated delivery is never released");
+  }
+
+  const native = settleApi(gateMessage(GATE_BODY, "2"));
+  await new SqsConsumer(native.api, URL, {}, { unknownUrn: "dead_letter", onError: () => undefined }).poll();
+  assert.deepEqual(native.events, [], "the dead_letter strategy without a DLQ URL is native");
+});
+
+test("gate: a hook-only consumer (onUnknownUrn, no unknownUrn) settles a version-gated delivery as fail, never as delete", async () => {
+  // Without a strategy the hook alone implies `delete` for an unknown URN; the version gate must not read that.
+  let hook = 0;
+  const on = settleApi(gateMessage(GATE_BODY, "2"));
+  await new SqsConsumer(on.api, URL, {}, { onUnknownUrn: () => { hook += 1; }, deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.deepEqual(on.events, ["send", "delete"], "DLQ on: dlq_raw (the raw record, then delete)");
+  assert.equal(on.sent[0]!.MessageBody, GATE_BODY);
+
+  const off = settleApi(gateMessage(GATE_BODY, "2"));
+  await new SqsConsumer(off.api, URL, {}, { onUnknownUrn: () => { hook += 1; }, onError: () => undefined }).poll();
+  assert.deepEqual(off.events, [], "DLQ off: native (no DeleteMessage, nothing sent)");
+  assert.equal(off.visibility.length, 0);
+  assert.equal(hook, 0, "the hook is for an unknown URN only");
+});
+
+test("gate: a FIFO DLQ record carries the source queue as group and a dedup id", async () => {
+  const message = gateMessage(GATE_BODY, "2");
+  message.MessageId = "src-msg-1";
+  const { api, sent } = settleApi(message);
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: `${DLQ_URL}.fifo`, onError: () => undefined }).poll();
+  assert.equal(sent[0]!.MessageGroupId, "orders");
+  assert.equal(sent[0]!.MessageDeduplicationId, "src-msg-1");
+});
+
+function poisonMessage(body: string, receiveCount = "3"): SqsMessage {
+  return { Body: body, ReceiptHandle: "rh-poison", Attributes: { ApproximateReceiveCount: receiveCount } };
+}
+
+test("poison: with a DLQ the ADR-0035 record is sent and the message deleted only after the send", async () => {
+  const original = '{"job": 5, "big": 12345678901234567890}';
+  const { api, events, sent } = settleApi(poisonMessage(original));
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.deepEqual(events, ["send", "delete"]);
+  const record = sent[0]!.MessageBody;
+  assert.ok(record.startsWith(original.slice(0, -1) + ',"dead_letter":'), record);
+  const deadLetter = (JSON.parse(record) as { dead_letter: Record<string, unknown> }).dead_letter;
+  assert.equal(deadLetter["reason"], "poison");
+  assert.equal(deadLetter["original_queue"], "orders");
+  assert.equal(deadLetter["attempts"], 2);
+
+  const wrapped = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(wrapped.api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  const wrapper = JSON.parse(wrapped.sent[0]!.MessageBody) as { raw: string; dead_letter: { reason: string } };
+  assert.equal(wrapper.raw, "not-json");
+  assert.equal(wrapper.dead_letter.reason, "poison");
+});
+
+test("poison: a failed DLQ write leaves it undeleted (native redrive is the fallback)", async () => {
+  const { api, events } = settleApi(poisonMessage("not-json"), true);
+  const errors: unknown[] = [];
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: (e) => void errors.push(e) }).poll();
+  assert.deepEqual(events, []);
+  assert.equal(errors.length, 2);
+});
+
+test("poison: without a DLQ it is native (not deleted, not sent); unknownUrn=delete drops it; a hook changes nothing", async () => {
+  const native = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(native.api, URL, {}, { onUnknownUrn: () => undefined, onError: () => undefined }).poll();
+  assert.deepEqual(native.events, []);
+  assert.equal(native.visibility.length, 0);
+
+  const dropped = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(dropped.api, URL, {}, { unknownUrn: "delete", deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.deepEqual(dropped.events, ["delete"]);
+});
+
+test("poison: a hook-only consumer (onUnknownUrn, no unknownUrn) never drops it - the hook's implied delete does not apply", async () => {
+  let hook = 0;
+  const withDlq = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(withDlq.api, URL, {}, { onUnknownUrn: () => { hook += 1; }, deadLetterQueueUrl: DLQ_URL, onError: () => undefined }).poll();
+  assert.deepEqual(withDlq.events, ["send", "delete"], "DLQ on: the ADR-0035 record is written, then deleted");
+  assert.equal((JSON.parse(withDlq.sent[0]!.MessageBody) as { dead_letter: { reason: string } }).dead_letter.reason, "poison");
+
+  const noDlq = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(noDlq.api, URL, {}, { onUnknownUrn: () => { hook += 1; }, onError: () => undefined }).poll();
+  assert.deepEqual(noDlq.events, [], "DLQ off: native, not deleted");
+  assert.equal(hook, 0, "the hook is for an unknown URN only");
+});
+
 // --- A9 retry backoff (retryBackoff* options; releaseDelay stays as an alias) ---------------
 
 const failingHandlers = { "urn:babel:orders:created": () => { throw new Error("boom"); } };

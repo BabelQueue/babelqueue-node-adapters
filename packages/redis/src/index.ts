@@ -335,7 +335,12 @@ export interface RedisQueueOptions {
   keyPrefix?: string;
   /** Suffix for the legacy reservation list (default `":processing"`). */
   processingSuffix?: string;
-  /** The dead-letter list (default `<queue>.dlq`); `null` drops on terminal failure. */
+  /**
+   * The dead-letter list (default `<queue>.dlq`). `null` disables the dead-letter of an **exhausted** message and of
+   * an **unknown URN** only (they are dropped; `on_unknown_urn: dead_letter` degrades to `delete`). A **poison** body
+   * is still dead-lettered as the ADR-0035 record in every configuration (broker-bindings §1.1, ADR-0037 decision 5):
+   * to the configured name, and with `null` to the default `<queue>.dlq`.
+   */
   deadLetterQueue?: string | null;
   /** Receives the "reservation expired" warning (default `console.warn`). */
   onWarn?: (message: string) => void;
@@ -426,6 +431,8 @@ export class RedisQueue {
   readonly retryAfter: number | null;
   readonly migrationBatchSize: number;
   readonly deadLetterKey: string | null;
+  /** Where a poison record goes: the configured dead-letter list, or `<queue>.dlq` when it is `null` (ADR-0037 decision 5). */
+  readonly poisonDeadLetterKey: string;
   /** The zset keys (zset layout) — also usable to inspect the legacy ready list via `ready`. */
   readonly keys: ZsetKeys;
   readonly processingKey: string;
@@ -449,6 +456,7 @@ export class RedisQueue {
     this.clock = options.clock ?? (() => Date.now() / 1000);
     this.warn = options.onWarn ?? ((message) => console.warn(message));
     this.deadLetterKey = options.deadLetterQueue === undefined ? `${queue}.dlq` : options.deadLetterQueue;
+    this.poisonDeadLetterKey = this.deadLetterKey ?? `${queue}.dlq`;
     this.keys = this.layout === "zset" ? zsetKeys(queue, options.keyPrefix) : { ready: queue, delayed: "", reserved: "", notify: "" };
     this.processingKey = queue + (options.processingSuffix ?? ":processing");
     this.deadlinesKey = `${this.processingKey}:deadlines`;
@@ -612,16 +620,21 @@ export class RedisQueue {
     return this.liveOrWarn(live, reservation);
   }
 
-  /** Write `body` (default: `raw`) to the dead-letter list and settle the reservation. */
-  async deadLetter(reservation: Reservation, body?: string): Promise<boolean> {
+  /**
+   * Write `body` (default: `raw`) to the dead-letter list and settle the reservation. With the dead-letter list
+   * disabled (`deadLetterQueue: null`) the message is acknowledged and dropped — except a `poison` record, which is
+   * always written, to `<queue>.dlq` (broker-bindings §1.1, ADR-0037 decision 5).
+   */
+  async deadLetter(reservation: Reservation, body?: string, poison = false): Promise<boolean> {
     const payload = body ?? reservation.raw;
-    if (this.deadLetterKey === null) return this.ack(reservation);
+    const deadLetterKey = poison ? this.poisonDeadLetterKey : this.deadLetterKey;
+    if (deadLetterKey === null) return this.ack(reservation);
     if (reservation.layout === "zset" && reservation.poison === true) {
       // Poison (section 1.1): always write to the DLQ and ZREM, even when a byte-equal twin already
       // removed the shared `:reserved` member.
       await this.run(
         LUA.zsetDeadLetterPoison,
-        [this.keys.reserved, this.deadLetterKey],
+        [this.keys.reserved, deadLetterKey],
         [zsetMember(reservation), payload],
       );
       return true;
@@ -629,7 +642,7 @@ export class RedisQueue {
     if (reservation.layout === "zset") {
       const settled = await this.run(
         LUA.zsetDeadLetter,
-        [this.keys.reserved, this.deadLetterKey],
+        [this.keys.reserved, deadLetterKey],
         [zsetMember(reservation), payload],
       );
       if (Number(settled) === 1) return true;
@@ -640,7 +653,7 @@ export class RedisQueue {
     }
     const live = await this.run(
       LUA.legacyDeadLetter,
-      [this.processingKey, this.deadlinesKey, this.deadLetterKey],
+      [this.processingKey, this.deadlinesKey, deadLetterKey],
       [reservation.token, storedValue(reservation), payload],
     );
     return this.liveOrWarn(live, reservation);
@@ -918,7 +931,7 @@ export class RedisConsumer {
       // (ADR-0035) and leave no residue.
       const error = new BabelQueueError("Rejected an undecodable BabelQueue message from Redis.");
       this.report(error, null, reservation.raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
       return;
     }
     await this.handle(reservation);
@@ -937,7 +950,7 @@ export class RedisConsumer {
       // Invalid UTF-8 is poison (broker-bindings section 1.1): never decoded, handled or re-published.
       const error = new BabelQueueError("Rejected a non-UTF-8 BabelQueue message from Redis.");
       this.report(error, null, raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
       return;
     }
     const [body, headers] = reservation.layout === "legacy" ? unframe(raw) : [raw, {} as HeaderCarrier];
@@ -946,7 +959,7 @@ export class RedisConsumer {
     if (!EnvelopeCodec.accepts(decoded)) {
       const error = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis.");
       this.report(error, decoded, raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error));
+      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
       return;
     }
 
