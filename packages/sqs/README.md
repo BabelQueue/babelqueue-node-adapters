@@ -92,7 +92,7 @@ URL it is left to the native `RedrivePolicy`, as above. Like the version gate, t
 > that always fails is retried back-to-back until the queue's native `RedrivePolicy`
 > (`maxReceiveCount`) moves the message to its dead-letter queue. Without one, such a
 > message loops forever. Give every consumed queue a `RedrivePolicy` (e.g.
-> `maxReceiveCount` 3–5 → `<queue>.dlq`), and/or pass a backoff:
+> `maxReceiveCount` 3–5 → `<queue>-dlq`), and/or pass a backoff:
 >
 > ```ts
 > new SqsConsumer(sqs, url, handlers, {

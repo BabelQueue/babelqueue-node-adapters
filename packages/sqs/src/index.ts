@@ -332,7 +332,7 @@ export interface SqsConsumerOptions extends RetryBackoffOptions {
    */
   releaseDelay?: number | ((attempts: number) => number);
   /**
-   * The cross-language `<queue>.dlq` URL (opt-in; default none): the `dead_letter` strategy, poison bodies
+   * The cross-language `<queue>-dlq` URL (opt-in; default none; SQS names cannot contain a dot): the `dead_letter` strategy, poison bodies
    * (ADR-0035 record) and version-gated deliveries (the raw body) are written here. Without it a poison or
    * version-gated delivery is left to the queue's native `RedrivePolicy` (ADR-0037). A
    * `.fifo` DLQ is sent with `MessageGroupId` (the source queue name) and `MessageDeduplicationId`
@@ -493,7 +493,7 @@ export class SqsConsumer {
 
   /**
    * Version-gated delivery (ADR-0037 decision 1). `unknownUrn: "delete"` deletes it; with a DLQ the raw body goes
-   * to `<queue>.dlq` and the message is deleted only after the send; otherwise it is reported and left for the
+   * to `<queue>-dlq` and the message is deleted only after the send; otherwise it is reported and left for the
    * queue's native mechanism (never deleted, never released by the SDK). Only the configured strategy is read.
    */
   private async settleVersionGated(message: SqsMessage, gateError: BabelQueueError): Promise<void> {
@@ -630,7 +630,7 @@ export class SqsConsumer {
       MessageAttributes: toMessageAttributes(annotated),
     };
     if (dlq.endsWith(".fifo")) {
-      // A FIFO DLQ (`<queue>.dlq.fifo`) rejects a send without a group; dedup on meta.id (§3.2).
+      // A FIFO DLQ (`<queue>-dlq.fifo`) rejects a send without a group; dedup on meta.id (§3.2).
       input.MessageGroupId = source;
       if (annotated.meta?.id) input.MessageDeduplicationId = annotated.meta.id;
     }
