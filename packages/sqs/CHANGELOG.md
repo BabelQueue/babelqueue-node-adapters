@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
 ### Changed
 - **Behaviour change: poison bodies and version-gated deliveries are settled by the SDK when a BabelQueue DLQ is
   configured (ADR-0037 decisions 1 and 2).** Before, both were only reported and left undeleted, so SQS

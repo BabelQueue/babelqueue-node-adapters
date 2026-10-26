@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-26
+
 ### Changed
 - **Behaviour change: a poison body is dead-lettered as the ADR-0035 record (ADR-0037 decision 2).** A body
   that does not decode into a valid envelope used to be forwarded to the DLQ as its raw bytes, with no

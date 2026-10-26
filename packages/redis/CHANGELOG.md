@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
 ### Changed
 - **Behaviour change: `deadLetterQueue: null` no longer drops a poison body (ADR-0037 decision 5).** The setting
   now disables the dead-letter of an exhausted message and of an unknown URN only (they are acknowledged and

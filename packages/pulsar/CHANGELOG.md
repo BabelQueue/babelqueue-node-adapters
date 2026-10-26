@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-26
+
 ### Changed
 - **Behaviour change: version-gated deliveries are settled, not looped (ADR-0037 decision 1).** A message
   whose `bq-schema-version` property is present, not blank and not the supported version used to be

@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-26
+
 ### Added
 - **`deadLetterSender` option (ADR-0037 decision 2): a BabelQueue `<queue>.dlq` for this consumer** (an ordinary
   Service Bus queue, §4.5; opt-in, default none), and the `queue` option for `dead_letter.original_queue`.

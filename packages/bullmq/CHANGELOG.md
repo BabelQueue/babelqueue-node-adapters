@@ -6,6 +6,8 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-26
+
 ### Changed
 - **Behaviour change: a poison job is no longer retried (ADR-0037 decision 3).** A job whose data does not decode
   into a valid envelope used to throw a `BabelQueueError`, so BullMQ retried it as an ordinary failure up to the
