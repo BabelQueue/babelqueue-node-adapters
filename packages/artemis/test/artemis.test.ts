@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   ArtemisConsumer,
@@ -734,4 +734,112 @@ test("gate: concurrent rejections settle independently by delivery", async () =>
   assert.deepEqual(b.delivery.released, [{}]);
   assert.equal(dlq.forwarded.length, 0);
   assert.equal(dlq.listenerCount(), 0);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) --------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+class NamedSender extends FakeSender {
+  target = { address: "orders.dlq" };
+}
+
+test("observer: an exhausted delivery is reported once with queue, dlq and reason", async () => {
+  const dlq = new NamedSender();
+  const seen = recorder();
+  const { context: ctx, delivery } = context(incoming(envelope(2)));
+  await new ArtemisConsumer({ [URN]: () => { throw new Error("boom"); } }, { maxTries: 3, deadLetterSender: dlq, deadLetterObserver: seen.observer, onError: () => undefined }).handle(ctx);
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(delivery.accepted, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an unknown URN under dead_letter is reported once", async () => {
+  const seen = recorder();
+  const { context: ctx } = context(incoming(envelope(0)));
+  await new ArtemisConsumer({}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterSender: new NamedSender(), deadLetterObserver: seen.observer }).handle(ctx);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: a poison record is reported once with reason poison and the configured queue", async () => {
+  const seen = recorder();
+  const { context: ctx } = context({ body: "not-json" });
+  await new ArtemisConsumer({}, { queue: "billing", deadLetterSender: new NamedSender(), deadLetterObserver: seen.observer, onError: () => undefined }).handle(ctx);
+  assert.deepEqual(seen.events, [{ queue: "billing", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: a version-gated raw body is reported once with an empty reason; a sender without target reports an empty dlq", async () => {
+  const seen = recorder();
+  const { context: ctx } = context(gated("2"));
+  ctx.receiver = { source: { address: "orders" } };
+  await new ArtemisConsumer({}, { deadLetterSender: new NamedSender(), deadLetterObserver: seen.observer, onError: () => undefined }).handle(ctx);
+  const { context: ctx2 } = context(gated("2"));
+  await new ArtemisConsumer({}, { queue: "orders", deadLetterSender: new FakeSender(), deadLetterObserver: seen.observer, onError: () => undefined }).handle(ctx2);
+  assert.deepEqual(seen.events, [
+    { queue: "orders", deadLetterQueue: "orders.dlq", reason: "" },
+    { queue: "orders", deadLetterQueue: "", reason: "" },
+  ]);
+});
+
+test("observer: reported only after the broker accepted the DLQ delivery", async () => {
+  const seen = recorder();
+  const dlq = new EventSender("accepted");
+  const { context: ctx, delivery } = context(gated("2"));
+  await new ArtemisConsumer({}, { queue: "orders", deadLetterSender: dlq, deadLetterObserver: seen.observer }).handle(ctx);
+  assert.equal(delivery.accepted, 1);
+  assert.equal(seen.events.length, 1);
+});
+
+test("observer: a refused or failed DLQ write is not reported (all write paths)", async () => {
+  const seen = recorder();
+  const options = { deadLetterObserver: seen.observer, deadLetterRetryDelayMs: 0, onError: () => undefined };
+  for (const verdict of ["rejected", "released", "sender_close"]) {
+    await new ArtemisConsumer({}, { ...options, deadLetterSender: new EventSender(verdict) }).handle(context(gated("2")).context);
+    await new ArtemisConsumer({}, { ...options, deadLetterSender: new EventSender(verdict) }).handle(context({ body: "not-json" }).context);
+    await new ArtemisConsumer({ [URN]: () => { throw new Error("x"); } }, { ...options, maxTries: 1, deadLetterSender: new EventSender(verdict) }).handle(context(incoming(envelope(0))).context);
+  }
+  const throwing = new FakeSender();
+  throwing.send = () => { throw new Error("send failed"); };
+  await new ArtemisConsumer({}, { ...options, deadLetterSender: throwing }).handle(context(gated("2")).context);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: not called on success, release for redelivery, delete, or without a DLQ sender", async () => {
+  const seen = recorder();
+  const options = { deadLetterObserver: seen.observer, deadLetterRetryDelayMs: 0, onError: () => undefined };
+  await new ArtemisConsumer({ [URN]: () => undefined }, options).handle(context(incoming(envelope(0))).context);
+  await new ArtemisConsumer({ [URN]: () => { throw new Error("x"); } }, { ...options, maxTries: 3, deadLetterSender: new FakeSender() }).handle(context(incoming(envelope(0))).context);
+  await new ArtemisConsumer({}, { ...options, unknownUrn: UnknownUrnStrategy.DELETE, deadLetterSender: new FakeSender() }).handle(context(gated("2")).context);
+  await new ArtemisConsumer({}, { ...options, unknownUrn: UnknownUrnStrategy.DELETE, deadLetterSender: new FakeSender() }).handle(context({ body: "not-json" }).context);
+  await new ArtemisConsumer({ [URN]: () => { throw new Error("x"); } }, { ...options, maxTries: 1 }).handle(context(incoming(envelope(0))).context);
+  await new ArtemisConsumer({}, options).handle(context(gated("2")).context);
+  await new ArtemisConsumer({}, options).handle(context({ body: "not-json" }).context);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const dlq = new FakeSender();
+  const { context: ctx, delivery } = context({ body: "not-json" });
+  await new ArtemisConsumer({}, { deadLetterSender: dlq, onError: () => undefined, deadLetterObserver: () => { throw new Error("observer boom"); } }).handle(ctx);
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(delivery.accepted, 1);
+  assert.equal(delivery.released.length, 0);
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const dlq = new FakeSender();
+  const { context: ctx, delivery } = context(gated("2"));
+  await new ArtemisConsumer({}, { deadLetterSender: dlq, onError: () => undefined, deadLetterObserver: () => Promise.reject(new Error("async boom")) }).handle(ctx);
+  await settleTicks();
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(delivery.accepted, 1);
+  assert.equal(warn.mock.callCount(), 1);
 });

@@ -23,6 +23,8 @@ import {
   UnknownUrnError,
   annotate,
   buildPoisonRecord,
+  type DeadLetterEvent,
+  type DeadLetterObserver,
   type Envelope,
   type HeaderCarrier,
   type IncomingEnvelope,
@@ -126,6 +128,26 @@ export interface ProcessorOptions {
   queue?: string;
   /** Called when adding the poison record to {@link deadLetterQueue} fails. The job still fails as unrecoverable. */
   onError?: (error: unknown, job: Job) => void;
+  /**
+   * Called once per poison record added to {@link deadLetterQueue}, after the `add` succeeded (ADR-0039 section 5.1):
+   * `queue` is the `dead_letter.original_queue` (see {@link queue}), `deadLetterQueue` the DLQ's name, `reason`
+   * `poison`. It is NOT called when the add fails, when no `deadLetterQueue` is set, or for a job BullMQ itself
+   * retries or fails. An error thrown, or a promise rejected, by the observer is logged (`console.warn`) and never
+   * changes the outcome: the job still fails as unrecoverable.
+   */
+  deadLetterObserver?: DeadLetterObserver;
+}
+
+/** Call the dead-letter observer without letting it affect the outcome: a throw or a rejection is logged, not propagated. */
+function notifyDeadLetter(observer: DeadLetterObserver | undefined, event: DeadLetterEvent): void {
+  if (!observer) return;
+  const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+  try {
+    const pending = observer(event);
+    if (pending && typeof pending.then === "function") pending.then(undefined, warn);
+  } catch (error) {
+    warn(error);
+  }
 }
 
 /** The worker's `Queue` connection options and prefix, read from the job's queue (BullMQ keeps them on `queue.opts`). */
@@ -175,13 +197,15 @@ export function processor(
       // The body is the job data serialised as JSON (BullMQ already parsed what it stored).
       const body = JSON.stringify(job.data) ?? "null";
       const delivered = typeof job.attemptsMade === "number" ? job.attemptsMade : 0; // informational
-      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, "poison", options.queue ?? job.queueName, {
+      const original = options.queue ?? job.queueName;
+      const deadLetter = annotate({ attempts: delivered } as unknown as Envelope, "poison", original, {
         attempts: delivered,
         error: error.message,
         exception: error.name,
       }).dead_letter;
       const record = buildPoisonRecord(Buffer.from(body, "utf8"), JSON.stringify(deadLetter));
       await dlq.add(job.name, JSON.parse(record) as Record<string, unknown>);
+      notifyDeadLetter(options.deadLetterObserver, { queue: original, deadLetterQueue: dlq.name, reason: "poison" });
     } catch (writeError) {
       try {
         options.onError?.(writeError, job);

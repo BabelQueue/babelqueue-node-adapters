@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   RedisConsumer,
@@ -481,4 +481,128 @@ test("consuming without evalBuffer throws before anything is popped (invalid UTF
 
   await assert.rejects(() => queue.reserve(), /evalBuffer/);
   assert.equal(client.calls.length, 0, "no script ran, nothing was reserved");
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) -------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const failing = { [URN]: () => { throw new Error("boom"); } };
+
+test("observer: an exhausted legacy message is reported once with queue, dlq and reason", async () => {
+  const client = new FakeRedis();
+  const seen = recorder();
+  await new RedisConsumer(client, "orders", failing, { maxTries: 3, deadLetterObserver: seen.observer }).handle(legacy(EnvelopeCodec.encode(envelope(2))));
+  assert.equal(client.called("legacyDeadLetter").length, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an exhausted zset message is reported once", async () => {
+  const client = new FakeRedis();
+  const seen = recorder();
+  await new RedisConsumer(client, "orders", failing, { layout: "zset", maxTries: 3, deadLetterObserver: seen.observer }).handle(zset(EnvelopeCodec.encode(envelope(2))));
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an unknown URN under dead_letter is reported once", async () => {
+  const client = new FakeRedis();
+  const seen = recorder();
+  await new RedisConsumer(client, "orders", {}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterObserver: seen.observer }).handle(
+    legacy(EnvelopeCodec.encode(envelope())),
+  );
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: poison records are reported with reason poison (legacy, zset outcome, invalid UTF-8)", async () => {
+  const seen = recorder();
+  await new RedisConsumer(new FakeRedis(), "orders", {}, { deadLetterObserver: seen.observer }).handle(legacy("not-json"));
+  const zsetClient = new FakeRedis();
+  zsetClient.zsetReserves.push(["[1,2]", "[1,2]", "1"]);
+  await new RedisConsumer(zsetClient, "orders", {}, { layout: "zset", blockTimeout: 0, deadLetterObserver: seen.observer }).poll();
+  await new RedisConsumer(new FakeRedis(), "orders", {}, { deadLetterObserver: seen.observer }).handle({
+    layout: "legacy",
+    raw: BAD_BYTES.toString("utf8"),
+    token: TOKEN,
+    rawBytes: BAD_BYTES,
+  });
+  const expected = { queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" };
+  assert.deepEqual(seen.events, [expected, expected, expected]);
+});
+
+test("observer: a configured deadLetterQueue name is reported", async () => {
+  const seen = recorder();
+  await new RedisConsumer(new FakeRedis(), "orders", failing, { maxTries: 1, deadLetterQueue: "orders.failed", deadLetterObserver: seen.observer }).handle(
+    legacy(EnvelopeCodec.encode(envelope(0))),
+  );
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.failed", reason: "failed" }]);
+});
+
+test("observer: deadLetterQueue null is not reported for the ack branches, but a poison record still is", async () => {
+  const seen = recorder();
+  const options = { deadLetterQueue: null, deadLetterObserver: seen.observer };
+  const exhausted = new FakeRedis();
+  await new RedisConsumer(exhausted, "orders", failing, { ...options, maxTries: 3 }).handle(legacy(EnvelopeCodec.encode(envelope(2))));
+  const unknown = new FakeRedis();
+  await new RedisConsumer(unknown, "orders", {}, { ...options, unknownUrn: UnknownUrnStrategy.DEAD_LETTER }).handle(legacy(EnvelopeCodec.encode(envelope())));
+  assert.equal(exhausted.called("legacyAck").length, 1);
+  assert.equal(unknown.called("legacyAck").length, 1);
+  assert.deepEqual(seen.events, [], "the ack-and-drop branches write nothing");
+
+  await new RedisConsumer(new FakeRedis(), "orders", {}, options).handle(legacy("not-json"));
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: not called on success, retry, delete, or when the reservation expired", async () => {
+  const seen = recorder();
+  const options = { deadLetterObserver: seen.observer, onWarn: () => undefined };
+  await new RedisConsumer(new FakeRedis(), "orders", { [URN]: () => undefined }, options).handle(legacy(EnvelopeCodec.encode(envelope())));
+  await new RedisConsumer(new FakeRedis(), "orders", failing, { ...options, maxTries: 3 }).handle(legacy(EnvelopeCodec.encode(envelope(0))));
+  await new RedisConsumer(new FakeRedis(), "orders", {}, { ...options, unknownUrn: UnknownUrnStrategy.DELETE }).handle(legacy(EnvelopeCodec.encode(envelope())));
+
+  const expired = new FakeRedis();
+  expired.gateReply = 0;
+  await new RedisConsumer(expired, "orders", failing, { ...options, layout: "zset", maxTries: 1 }).handle(zset(EnvelopeCodec.encode(envelope(0))));
+  await new RedisConsumer(expired, "orders", failing, { ...options, maxTries: 1 }).handle(legacy(EnvelopeCodec.encode(envelope(0))));
+  assert.equal(expired.called("zsetDeadLetter").length, 1, "the write was attempted but did not happen");
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a failed write is not reported", async () => {
+  class FailingRedis extends FakeRedis {
+    override async eval(): Promise<never> {
+      throw new Error("redis down");
+    }
+  }
+  const seen = recorder();
+  await assert.rejects(
+    new RedisConsumer(new FailingRedis(), "orders", failing, { maxTries: 1, deadLetterObserver: seen.observer }).handle(legacy(EnvelopeCodec.encode(envelope(0)))),
+    /redis down/,
+  );
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing or rejecting observer does not change the settle outcome and is logged through onWarn", async () => {
+  const warnings: string[] = [];
+  const throwing = new FakeRedis();
+  await new RedisConsumer(throwing, "orders", failing, {
+    maxTries: 1,
+    onWarn: (m) => warnings.push(m),
+    deadLetterObserver: () => { throw new Error("observer boom"); },
+  }).handle(legacy(EnvelopeCodec.encode(envelope(0))));
+  assert.equal(throwing.called("legacyDeadLetter").length, 1);
+
+  const rejecting = new FakeRedis();
+  await new RedisConsumer(rejecting, "orders", {}, {
+    onWarn: (m) => warnings.push(m),
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  }).handle(legacy("not-json"));
+  await settleTicks();
+  assert.equal(rejecting.called("legacyDeadLetter").length, 1);
+  assert.equal(warnings.length, 2);
+  assert.match(warnings[0]!, /observer boom/);
+  assert.match(warnings[1]!, /async boom/);
 });

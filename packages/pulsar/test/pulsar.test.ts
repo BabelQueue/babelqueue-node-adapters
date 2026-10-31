@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   PulsarPublisher,
@@ -538,4 +538,117 @@ test("poison: an onUnknownUrn hook does not apply to a poison body (dead-lettere
   assert.equal(dlq.sent.length, 1);
   assert.equal(consumer.acked.length, 1);
   assert.equal(hook, 0);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) --------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const DLQ_TOPIC = "persistent://public/default/orders.dlq";
+const GATED = (): FakeMessage => new FakeMessage('{"meta":{"schema_version":2}}', 0, { "bq-schema-version": "2" });
+const failingProducer: PulsarProducer = {
+  getTopic: () => DLQ_TOPIC,
+  send: async () => {
+    throw new Error("broker down");
+  },
+};
+
+test("observer: an exhausted delivery is reported once with queue, dlq and reason", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(body(2), 2, {})]);
+  const dlq = new FakeProducer(DLQ_TOPIC);
+  const seen = recorder();
+  await sharedConsumer(consumer, { [URN]: () => { throw new Error("boom"); } }, { maxAttempts: 3, deadLetterProducer: dlq, deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.equal(dlq.sent.length, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an unknown URN reaching maxAttempts is reported once", async () => {
+  const consumer = new FakeConsumer([new FakeMessage(body(0), 0, {})]);
+  const seen = recorder();
+  await sharedConsumer(consumer, {}, { maxAttempts: 1, deadLetterProducer: new FakeProducer(DLQ_TOPIC), deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: a poison body is reported once with reason poison and the configured queue", async () => {
+  const consumer = new FakeConsumer([new FakeMessage("not-json", 0, {})]);
+  const seen = recorder();
+  await sharedConsumer(consumer, {}, { deadLetterProducer: new FakeProducer(DLQ_TOPIC), deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+
+  const named = recorder();
+  await sharedConsumer(new FakeConsumer([new FakeMessage("not-json", 0, {})]), {}, {
+    queue: "billing",
+    deadLetterProducer: new FakeProducer(DLQ_TOPIC),
+    deadLetterObserver: named.observer,
+    onError: () => undefined,
+  }).poll();
+  assert.deepEqual(named.events, [{ queue: "billing", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: a version-gated raw body is reported once with an empty reason", async () => {
+  const consumer = new FakeConsumer([GATED()]);
+  const dlq = new FakeProducer(DLQ_TOPIC);
+  const seen = recorder();
+  await sharedConsumer(consumer, { [URN]: () => undefined }, { deadLetterProducer: dlq, deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.equal(dlq.sent.length, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "" }]);
+});
+
+test("observer: a failed DLQ write is not reported (version gate and exhausted)", async () => {
+  const seen = recorder();
+  const options = { deadLetterProducer: failingProducer, deadLetterObserver: seen.observer, onError: () => undefined, onWarn: () => undefined };
+  await sharedConsumer(new FakeConsumer([GATED()]), { [URN]: () => undefined }, options).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage("not-json", 0, {})]), {}, options).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage(body(0), 0, {})]), {}, { ...options, maxAttempts: 1 }).poll();
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: not called on success, retry, or when dead-lettering is off (drop)", async () => {
+  const seen = recorder();
+  const quiet = { onError: () => undefined, onWarn: () => undefined };
+  await sharedConsumer(new FakeConsumer([new FakeMessage(body(0), 0, {})]), { [URN]: () => undefined }, { deadLetterProducer: new FakeProducer(DLQ_TOPIC), deadLetterObserver: seen.observer, ...quiet }).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage(body(0), 0, {})]), { [URN]: () => { throw new Error("x"); } }, { maxAttempts: 3, deadLetterProducer: new FakeProducer(DLQ_TOPIC), deadLetterObserver: seen.observer, ...quiet }).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage("not-json", 0, {})]), {}, { deadLetterObserver: seen.observer, ...quiet }).poll();
+  await sharedConsumer(new FakeConsumer([GATED()]), {}, { deadLetterObserver: seen.observer, ...quiet }).poll();
+  await sharedConsumer(new FakeConsumer([new FakeMessage(body(0), 0, {})]), { [URN]: () => { throw new Error("x"); } }, { maxAttempts: 1, deadLetterObserver: seen.observer, ...quiet }).poll();
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the settle outcome and is logged through onWarn", async () => {
+  const consumer = new FakeConsumer([new FakeMessage("not-json", 0, {})]);
+  const dlq = new FakeProducer(DLQ_TOPIC);
+  const warnings: string[] = [];
+  await sharedConsumer(consumer, {}, {
+    deadLetterProducer: dlq,
+    onError: () => undefined,
+    onWarn: (m) => void warnings.push(m),
+    deadLetterObserver: () => { throw new Error("observer boom"); },
+  }).poll();
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(consumer.acked.length, 1);
+  assert.equal(consumer.nacked.length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] as string, /observer boom/);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async () => {
+  const consumer = new FakeConsumer([GATED()]);
+  const dlq = new FakeProducer(DLQ_TOPIC);
+  const warnings: string[] = [];
+  await sharedConsumer(consumer, {}, {
+    deadLetterProducer: dlq,
+    onError: () => undefined,
+    onWarn: (m) => void warnings.push(m),
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  }).poll();
+  await settleTicks();
+  assert.equal(dlq.sent.length, 1);
+  assert.equal(consumer.acked.length, 1);
+  assert.equal(consumer.nacked.length, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0] as string, /async boom/);
 });

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   AsbConsumer,
@@ -604,4 +604,121 @@ test("default receiver + deadLetterSender without any raw view: still abandoned 
   await new AsbConsumer(loggingReceiver({ body: { foo: 1 }, deliveryCount: 1 }, log), {}, { deadLetterSender: dlq, onError: (e) => void errors.push(e) }).poll();
   assert.deepEqual(log, ["abandon"]);
   assert.match((errors[errors.length - 1] as Error).message, /no raw AMQP body/);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) --------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+test("observer: a version-gated raw body written to the DLQ is reported once with an empty reason, after the send", async () => {
+  const log: string[] = [];
+  const seen = recorder();
+  const dlq = new DlqSender(log);
+  await new AsbConsumer(loggingReceiver(gated("2"), log), {}, { deadLetterSender: dlq, deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.deepEqual(log, ["send", "complete"]);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "" }]);
+});
+
+test("observer: a poison record is reported once with reason poison and the configured queue", async () => {
+  const seen = recorder();
+  const dlq = new DlqSender([]);
+  await new AsbConsumer(
+    loggingReceiver({ body: "not-json", deliveryCount: 3 }, []),
+    {},
+    { queue: "billing", deadLetterSender: dlq, deadLetterObserver: seen.observer, onError: () => undefined },
+  ).poll();
+  assert.equal(dlq.sent.length, 1);
+  assert.deepEqual(seen.events, [{ queue: "billing", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: the SDK-initiated native dead-letter is reported once with an empty dlq and reason", async () => {
+  const seen = recorder();
+  const receiver = new FakeReceiver([gated("2")]);
+  await new AsbConsumer(receiver, {}, { queue: "orders", deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.equal(receiver.deadLettered.length, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "", reason: "" }]);
+
+  const named = recorder();
+  const withPath = new FakeReceiver([gated("2")]);
+  (withPath as { entityPath?: string }).entityPath = "invoices";
+  await new AsbConsumer(withPath, {}, { deadLetterObserver: named.observer, onError: () => undefined }).poll();
+  assert.deepEqual(named.events, [{ queue: "invoices", deadLetterQueue: "", reason: "" }]);
+});
+
+test("observer: not called when the native dead-letter call fails, or for the abandon fallback", async () => {
+  const seen = recorder();
+  const failingReceiver: AsbReceiver = {
+    async receiveMessages() { return [gated("2")]; },
+    async completeMessage() {},
+    async abandonMessage() {},
+    async deadLetterMessage() { throw new Error("link closed"); },
+  };
+  await assert.rejects(new AsbConsumer(failingReceiver, {}, { deadLetterObserver: seen.observer, onError: () => undefined }).poll(), /link closed/);
+
+  const abandoned: AsbReceivedMessage[] = [];
+  const noNative: AsbReceiver = {
+    async receiveMessages() { return [gated("2")]; },
+    async completeMessage() {},
+    async abandonMessage(m) { abandoned.push(m); },
+  };
+  await new AsbConsumer(noNative, {}, { deadLetterObserver: seen.observer, onError: () => undefined }).poll();
+  assert.equal(abandoned.length, 1);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a failed DLQ write is not reported (gate and poison)", async () => {
+  const seen = recorder();
+  const options = { deadLetterSender: new DlqSender([], true), deadLetterObserver: seen.observer, onError: () => undefined };
+  await new AsbConsumer(loggingReceiver(gated("2"), []), {}, options).poll();
+  await new AsbConsumer(loggingReceiver({ body: "not-json", deliveryCount: 1 }, []), {}, options).poll();
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: not called on success, abandon (retry, MaxDeliveryCount), a poison body without a DLQ sender, or a hook completion", async () => {
+  const seen = recorder();
+  const options = { deadLetterObserver: seen.observer, onError: () => undefined };
+  await new AsbConsumer(new FakeReceiver([received(1, EnvelopeCodec.encode(envelope()))]), { [URN]: () => undefined }, options).poll();
+  await new AsbConsumer(new FakeReceiver([received(1, EnvelopeCodec.encode(envelope()))]), { [URN]: () => { throw new Error("x"); } }, options).poll();
+  await new AsbConsumer(new FakeReceiver([received(1, EnvelopeCodec.encode(envelope()))]), {}, options).poll();
+  await new AsbConsumer(new FakeReceiver([received(1, EnvelopeCodec.encode(envelope()))]), {}, { ...options, onUnknownUrn: () => undefined }).poll();
+  const poison = new FakeReceiver([received(1, "not-json")]);
+  await new AsbConsumer(poison, {}, options).poll();
+  assert.equal(poison.abandoned.length, 1);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const log: string[] = [];
+  await new AsbConsumer(loggingReceiver(gated("2"), log), {}, {
+    deadLetterSender: new DlqSender(log),
+    onError: () => undefined,
+    deadLetterObserver: () => { throw new Error("observer boom"); },
+  }).poll();
+  assert.deepEqual(log, ["send", "complete"]);
+  assert.equal(warn.mock.callCount(), 1);
+
+  const receiver = new FakeReceiver([gated("2")]);
+  await new AsbConsumer(receiver, {}, { onError: () => undefined, deadLetterObserver: () => { throw new Error("observer boom"); } }).poll();
+  assert.equal(receiver.deadLettered.length, 1);
+  assert.equal(receiver.abandoned.length, 0);
+  assert.equal(warn.mock.callCount(), 2);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const log: string[] = [];
+  await new AsbConsumer(loggingReceiver({ body: "not-json", deliveryCount: 1 }, log), {}, {
+    deadLetterSender: new DlqSender(log),
+    onError: () => undefined,
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  }).poll();
+  await settleTicks();
+  assert.deepEqual(log, ["send", "complete"]);
+  assert.equal(warn.mock.callCount(), 1);
 });

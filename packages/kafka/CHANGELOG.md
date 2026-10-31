@@ -9,6 +9,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `KafkaConsumerOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per record written to the DLQ topic,
+  after the produce succeeds: an exhausted retry (`failed`), an unknown URN under `dead_letter`
+  (`unknown_urn`), a poison record (`poison`) and a version-gated raw record (empty `reason`). `queue` is
+  the original topic. It is not called for a failed produce, when no DLQ topic is configured, or for a
+  retry-tier republish. A throwing or rejecting observer is logged with `console.warn` and never changes
+  the settle outcome. Optional: without it nothing changes. This feeds the `babelqueue.dlq.messages`
+  counter of `@babelqueue/core/otel` (`createDeadLetterObserver`).
+
 ### Changed
 - Conformance v1.8.0 vendored (no section of this package changed).
 

@@ -6,6 +6,15 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `ProcessorOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per poison record added to
+  `deadLetterQueue`, after the `add` succeeded (`reason` `poison`, `queue` the `original_queue`,
+  `deadLetterQueue` the DLQ name). It is not called when the add fails or when no `deadLetterQueue` is
+  set. A throwing or rejecting observer is logged with `console.warn`; the job still fails with
+  `UnrecoverableError`. Optional: without it nothing changes. This feeds the `babelqueue.dlq.messages`
+  counter of `@babelqueue/core/otel` (`createDeadLetterObserver`).
+
 ## [1.2.0] - 2026-10-26
 
 ### Changed

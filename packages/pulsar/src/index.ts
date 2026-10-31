@@ -56,7 +56,7 @@
  */
 
 import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, annotate, buildPoisonRecord } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { mergeInto } from "./headers.js";
 
@@ -300,6 +300,15 @@ export interface PulsarConsumerOptions {
   queue?: string;
   /** Receives the "message dropped" and "dead-letter write failed" warnings (default `console.warn`). */
   onWarn?: (message: string) => void;
+  /**
+   * Called once per record written through {@link deadLetterProducer}, after the send succeeds (ADR-0039 section 5.1):
+   * an exhausted retry (`failed`), an unknown URN (`unknown_urn`), a poison body (`poison`) and a version-gated raw
+   * body (empty `reason`). `queue` is the source queue (see {@link queue}), `deadLetterQueue` the DLQ topic name. It is
+   * NOT called for a failed send, when no `deadLetterProducer` is set (the message is dropped), or for a retry
+   * re-publish. An error thrown, or a promise rejected, by the observer is logged through {@link onWarn} and never
+   * changes the settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
 }
 
 /** What a retryable outcome is about: the reason written to `dead_letter.reason`. */
@@ -561,6 +570,7 @@ export class PulsarConsumer {
       await this.consumer.negativeAcknowledge(message);
       return;
     }
+    this.notifyDeadLetter({ queue: this.sourceQueue(producer, null), deadLetterQueue: topicName(producer.getTopic()), reason: "" });
     await this.consumer.acknowledge(message);
   }
 
@@ -659,7 +669,36 @@ export class PulsarConsumer {
       await this.consumer.negativeAcknowledge(message);
       return;
     }
+    this.notifyDeadLetter({
+      queue: this.sourceQueue(producer, envelope),
+      deadLetterQueue: topicName(producer.getTopic()),
+      reason: kind,
+    });
     await this.consumer.acknowledge(message);
+  }
+
+  /** The source queue of a dead-letter record: the envelope's `meta.queue`, else {@link PulsarConsumerOptions.queue}, else the DLQ topic without `.dlq`. */
+  private sourceQueue(producer: PulsarProducer, envelope: Envelope | null): string {
+    return envelope?.meta?.queue || this.options.queue || stripDlqSuffix(topicName(producer.getTopic()));
+  }
+
+  /** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+  private notifyDeadLetter(event: DeadLetterEvent): void {
+    const observer = this.options.deadLetterObserver;
+    if (!observer) return;
+    const fail = (error: unknown): void => {
+      try {
+        this.warn(`babelqueue: dead-letter observer failed: ${errorText(error)}`);
+      } catch {
+        // a failing warning sink must not reach the settle path either
+      }
+    };
+    try {
+      const returned = observer(event);
+      if (returned && typeof returned.then === "function") returned.then(undefined, fail);
+    } catch (error) {
+      fail(error);
+    }
   }
 
   private deadLetterMessage(

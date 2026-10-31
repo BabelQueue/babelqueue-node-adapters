@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `RabbitMQConsumerOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per record the consumer wrote to
+  the DLQ, after the write: exhausted retries (`failed`), an unknown URN under `dead_letter`, and a
+  non-conformant body forwarded raw (empty `reason`). It is not called for a failed write or when
+  `deadLetterQueue` is `null`. A throwing or rejecting observer is logged with `console.warn` and never
+  changes the settle outcome. Optional: without it nothing changes. This feeds the
+  `babelqueue.dlq.messages` counter of `@babelqueue/core/otel` (`createDeadLetterObserver`).
+
 ### Changed
 - Conformance v1.8.0 vendored (no section of this package changed).
 

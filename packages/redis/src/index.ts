@@ -42,7 +42,7 @@
 import { randomBytes } from "node:crypto";
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 import { buildPoisonRecord } from "./poison-record.js";
@@ -854,6 +854,36 @@ export interface RedisConsumerOptions extends RedisQueueOptions {
   unknownUrn?: string;
   /** Called for a non-conformant message, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, raw: string) => void;
+  /**
+   * Called once per record this consumer actually wrote to the dead-letter list (ADR-0039 section 5.1): an exhausted
+   * message (`failed`), an unknown URN (`unknown_urn`) and a poison record (`poison`). It is NOT called when
+   * `deadLetterQueue` is `null` and the message is acknowledged and dropped instead (a poison record is still written,
+   * so it is still reported), or when the write did not happen (an expired reservation). An error thrown, or a promise
+   * rejected, by the observer is logged through `onWarn` (default `console.warn`) and never changes the settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
+}
+
+/** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+function notifyDeadLetter(
+  observer: DeadLetterObserver | undefined,
+  event: DeadLetterEvent,
+  warn: (message: string) => void,
+): void {
+  if (!observer) return;
+  const fail = (error: unknown): void => {
+    try {
+      warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+    } catch {
+      // a failing warning sink must not reach the settle path either
+    }
+  };
+  try {
+    const pending = observer(event);
+    if (pending && typeof pending.then === "function") pending.then(undefined, fail);
+  } catch (error) {
+    fail(error);
+  }
 }
 
 const SLEEP_START_MS = 100;
@@ -875,6 +905,7 @@ export class RedisConsumer {
   private readonly blockTimeout: number;
   private readonly maxTries: number;
   private readonly unknownUrn: string;
+  private readonly warn: (message: string) => void;
 
   constructor(
     private readonly client: RedisClient,
@@ -886,6 +917,7 @@ export class RedisConsumer {
     this.blockTimeout = options.blockTimeout ?? 5;
     this.maxTries = options.maxTries ?? 3;
     this.unknownUrn = options.unknownUrn ?? UnknownUrnStrategy.FAIL;
+    this.warn = options.onWarn ?? ((message) => console.warn(message));
   }
 
   /** The underlying transport (for diagnostics and tests). */
@@ -931,7 +963,7 @@ export class RedisConsumer {
       // (ADR-0035) and leave no residue.
       const error = new BabelQueueError("Rejected an undecodable BabelQueue message from Redis.");
       this.report(error, null, reservation.raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
+      await this.deadLetterPoison(reservation, error);
       return;
     }
     await this.handle(reservation);
@@ -950,7 +982,7 @@ export class RedisConsumer {
       // Invalid UTF-8 is poison (broker-bindings section 1.1): never decoded, handled or re-published.
       const error = new BabelQueueError("Rejected a non-UTF-8 BabelQueue message from Redis.");
       this.report(error, null, raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
+      await this.deadLetterPoison(reservation, error);
       return;
     }
     const [body, headers] = reservation.layout === "legacy" ? unframe(raw) : [raw, {} as HeaderCarrier];
@@ -959,7 +991,7 @@ export class RedisConsumer {
     if (!EnvelopeCodec.accepts(decoded)) {
       const error = new BabelQueueError("Rejected a non-conformant BabelQueue envelope from Redis.");
       this.report(error, decoded, raw);
-      await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
+      await this.deadLetterPoison(reservation, error);
       return;
     }
 
@@ -1051,7 +1083,28 @@ export class RedisConsumer {
       error: error instanceof Error ? error.message : null,
       exception: error instanceof Error ? error.name : null,
     });
-    await this.transport.deadLetter(reservation, redisValue(annotated));
+    // `deadLetterQueue: null` makes the transport acknowledge and drop: nothing was written, so nothing is reported.
+    const target = this.transport.deadLetterKey;
+    const written = await this.transport.deadLetter(reservation, redisValue(annotated));
+    if (target !== null && written) {
+      notifyDeadLetter(
+        this.options.deadLetterObserver,
+        { queue: envelope.meta?.queue ?? this.queue, deadLetterQueue: target, reason },
+        this.warn,
+      );
+    }
+  }
+
+  /** Write the ADR-0035 poison record (always written, even with `deadLetterQueue: null`) and report it. */
+  private async deadLetterPoison(reservation: Reservation, error: BabelQueueError): Promise<void> {
+    const written = await this.transport.deadLetter(reservation, this.poisonRecord(reservation, error), true);
+    if (written) {
+      notifyDeadLetter(
+        this.options.deadLetterObserver,
+        { queue: this.queue, deadLetterQueue: this.transport.poisonDeadLetterKey, reason: "poison" },
+        this.warn,
+      );
+    }
   }
 
   /**

@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `RedisConsumerOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per record the consumer actually
+  wrote to the dead-letter list: an exhausted message (`failed`), an unknown URN under `dead_letter`
+  (`unknown_urn`) and a poison record (`poison`), in both layouts. It is not called when
+  `deadLetterQueue` is `null` and the message is acknowledged and dropped (a poison record is still
+  written, so it is still reported), when the write did not happen (an expired reservation) or when it
+  fails. A throwing or rejecting observer is logged through `onWarn` (default `console.warn`) and never
+  changes the settle outcome. Optional: without it nothing changes. This feeds the
+  `babelqueue.dlq.messages` counter of `@babelqueue/core/otel` (`createDeadLetterObserver`).
+
 ## [1.4.0] - 2026-10-26
 
 ### Changed
