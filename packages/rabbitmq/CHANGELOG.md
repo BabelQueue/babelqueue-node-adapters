@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-03
+
 ### Added
 - **Dead-letter observer (ADR-0039 section 5.1).** `RabbitMQConsumerOptions.deadLetterObserver` (the
   `DeadLetterObserver` type from `@babelqueue/core`) is called once per record the consumer wrote to
@@ -20,6 +22,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Changed
 - Conformance v1.8.0 vendored (no section of this package changed).
+- `@babelqueue/core` dependency range raised from `^1.8.0` to `^1.14.0`.
 
 ## [1.2.0] - 2026-10-03
 
