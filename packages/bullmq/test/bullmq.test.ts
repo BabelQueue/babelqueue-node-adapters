@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver } from "@babelqueue/core";
 import { UnknownUrnError } from "@babelqueue/core";
 import { Queue, UnrecoverableError } from "bullmq";
 import { processor, publish } from "../src/index.js";
@@ -133,6 +134,70 @@ test("deadLetterQueue: a failed add is reported to onError and the job still fai
 
 test("no deadLetterQueue: a poison job is only failed (nothing is added anywhere)", async () => {
   await assert.rejects(() => processor({})(fakeJob({})), UnrecoverableError);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) --------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const namedDlq = (fails = false) => ({ ...fakeDlq(fails), name: "orders.dlq" });
+
+test("observer: a poison record added to the DLQ is reported once with queue, dlq and reason poison", async () => {
+  const seen = recorder();
+  const dlq = namedDlq();
+  const run = processor({}, { deadLetterQueue: dlq as unknown as Queue, deadLetterObserver: seen.observer });
+  await assert.rejects(() => run(fakeJob({ job: 5 })), UnrecoverableError);
+  assert.equal(dlq.added.length, 1);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+
+  const named = recorder();
+  const configured = processor({}, { deadLetterQueue: namedDlq() as unknown as Queue, queue: "billing", deadLetterObserver: named.observer });
+  await assert.rejects(() => configured(fakeJob("text")), UnrecoverableError);
+  assert.deepEqual(named.events, [{ queue: "billing", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: not called for a failed add, with no deadLetterQueue, or for a valid job or unknown URN", async () => {
+  const seen = recorder();
+  const failing = processor({}, { deadLetterQueue: namedDlq(true) as unknown as Queue, deadLetterObserver: seen.observer, onError: () => undefined });
+  await assert.rejects(() => failing(fakeJob({})), UnrecoverableError);
+  await assert.rejects(() => processor({}, { deadLetterObserver: seen.observer })(fakeJob({})), UnrecoverableError);
+
+  const valid = EnvelopeCodec.make("urn:babel:orders:created", { id: 1 }, { queue: "orders" });
+  const dlq = namedDlq();
+  const ok = processor({ "urn:babel:orders:created": () => undefined }, { deadLetterQueue: dlq as unknown as Queue, deadLetterObserver: seen.observer });
+  await ok(fakeJob(valid));
+  await assert.rejects(() => processor({}, { deadLetterQueue: dlq as unknown as Queue, deadLetterObserver: seen.observer })(fakeJob(valid)), UnknownUrnError);
+  assert.equal(dlq.added.length, 0);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the outcome: the job still fails as unrecoverable", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const dlq = namedDlq();
+  const run = processor({}, { deadLetterQueue: dlq as unknown as Queue, deadLetterObserver: () => { throw new Error("observer boom"); } });
+  await assert.rejects(() => run(fakeJob({})), UnrecoverableError);
+  assert.equal(dlq.added.length, 1);
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test("observer: a rejecting observer does not change the outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const errors: unknown[] = [];
+  const dlq = namedDlq();
+  const run = processor({}, {
+    deadLetterQueue: dlq as unknown as Queue,
+    onError: (e) => void errors.push(e),
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  });
+  await assert.rejects(() => run(fakeJob({})), UnrecoverableError);
+  await settleTicks();
+  assert.equal(dlq.added.length, 1);
+  assert.equal(errors.length, 0, "an observer failure is not an add failure");
+  assert.equal(warn.mock.callCount(), 1);
 });
 
 // Needs a live Redis (BullMQ creates the Queue it adds the record to); skipped without BABELQUEUE_REDIS_URL, like the

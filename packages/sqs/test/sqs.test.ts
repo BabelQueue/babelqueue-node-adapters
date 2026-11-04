@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver } from "@babelqueue/core";
 import {
   SqsConsumer,
   SqsDeleteError,
@@ -788,4 +789,87 @@ test("retryBackoff* needs a client with changeMessageVisibility, like releaseDel
   const { changeMessageVisibility: _drop, ...legacy } = fakeSqs();
   void _drop;
   assert.throws(() => new SqsConsumer(legacy as SqsApi, URL, {}, { retryBackoff: 5 }), /changeMessageVisibility/);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) -------------------------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const unknownMessage = (): SqsMessage => ({
+  Body: EnvelopeCodec.encode(unknownEnv()),
+  ReceiptHandle: "rh-unknown",
+  Attributes: { ApproximateReceiveCount: "1" },
+});
+
+test("observer: unknown_urn dead-letter is reported once after the send", async () => {
+  const { api, events } = settleApi(unknownMessage());
+  const seen = recorder();
+  await new SqsConsumer(api, URL, {}, { unknownUrn: "dead_letter", deadLetterQueueUrl: DLQ_URL, deadLetterObserver: seen.observer }).poll();
+  assert.deepEqual(events, ["send", "delete"]);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: a version-gated raw body is reported once with an empty reason", async () => {
+  const { api } = settleApi(gateMessage(GATE_BODY, "2"));
+  const seen = recorder();
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: () => undefined, deadLetterObserver: seen.observer }).poll();
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "" }]);
+});
+
+test("observer: a poison body is reported once with reason poison", async () => {
+  const { api } = settleApi(poisonMessage("not-json"));
+  const seen = recorder();
+  await new SqsConsumer(api, URL, {}, { deadLetterQueueUrl: DLQ_URL, onError: () => undefined, deadLetterObserver: seen.observer }).poll();
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: a failed DLQ write is not reported", async () => {
+  const seen = recorder();
+  for (const message of [gateMessage(GATE_BODY, "2"), poisonMessage("not-json"), unknownMessage()]) {
+    const { api } = settleApi(message, true);
+    await new SqsConsumer(api, URL, {}, { unknownUrn: "dead_letter", deadLetterQueueUrl: DLQ_URL, onError: () => undefined, deadLetterObserver: seen.observer }).poll();
+  }
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: not called without a DLQ URL (native RedrivePolicy), on delete, release, success", async () => {
+  const seen = recorder();
+  const options = { onError: () => undefined, deadLetterObserver: seen.observer };
+  await new SqsConsumer(settleApi(gateMessage(GATE_BODY, "2")).api, URL, {}, options).poll();
+  await new SqsConsumer(settleApi(poisonMessage("not-json")).api, URL, {}, options).poll();
+  await new SqsConsumer(settleApi(unknownMessage()).api, URL, {}, { ...options, unknownUrn: "dead_letter" }).poll(); // degrades to delete
+  await new SqsConsumer(settleApi(gateMessage(GATE_BODY, "2")).api, URL, {}, { ...options, unknownUrn: "delete", deadLetterQueueUrl: DLQ_URL }).poll();
+  await new SqsConsumer(settleApi(unknownMessage()).api, URL, {}, { ...options, unknownUrn: "release", deadLetterQueueUrl: DLQ_URL }).poll();
+  await new SqsConsumer(settleApi(unknownMessage()).api, URL, { "urn:babel:orders:created": () => undefined }, { ...options, deadLetterQueueUrl: DLQ_URL }).poll();
+  await new SqsConsumer(settleApi(unknownMessage()).api, URL, failingHandlers, { ...options, releaseDelay: 0, deadLetterQueueUrl: DLQ_URL }).poll();
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const { api, events } = settleApi(poisonMessage("not-json"));
+  await new SqsConsumer(api, URL, {}, {
+    deadLetterQueueUrl: DLQ_URL,
+    onError: () => undefined,
+    deadLetterObserver: () => { throw new Error("observer boom"); },
+  }).poll();
+  assert.deepEqual(events, ["send", "delete"]);
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const { api, events } = settleApi(gateMessage(GATE_BODY, "2"));
+  await new SqsConsumer(api, URL, {}, {
+    deadLetterQueueUrl: DLQ_URL,
+    onError: () => undefined,
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  }).poll();
+  await settleTicks();
+  assert.deepEqual(events, ["send", "delete"]);
+  assert.equal(warn.mock.callCount(), 1);
 });

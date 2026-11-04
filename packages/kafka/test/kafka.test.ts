@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mock, test } from "node:test";
 
 import { EnvelopeCodec, UnknownUrnStrategy, annotate, redrive } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   KafkaConsumer,
@@ -1468,4 +1468,112 @@ test("poison: member names are case-sensitive like the core decoder - a folded o
   assert.notEqual(envelopeViolation('{"attempts":"x"}'), null);
   assert.notEqual(envelopeViolation('{"meta":{"schema_version":"x"}}'), null);
   assert.notEqual(envelopeViolation('{"meta":{"id":5}}'), null);
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) --------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const settleTicks = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const failingHandlers: BabelHandlers = { [URN]: () => { throw new Error("boom"); } };
+
+test("observer: an exhausted record is reported once with queue, dlq and reason, after the produce", async () => {
+  const producer = new FakeProducer();
+  const seen = recorder();
+  await new KafkaConsumer(new FakeConsumer(), failingHandlers, { producer, retryTopics: topology(), maxTries: 3, deadLetterObserver: seen.observer }).handle(
+    payloadFor(envelope(2)),
+  );
+  assert.equal(producer.sent[0]!.topic, "orders.dlq");
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an unknown URN under dead_letter is reported once", async () => {
+  const seen = recorder();
+  await new KafkaConsumer(new FakeConsumer(), {}, {
+    producer: new FakeProducer(),
+    retryTopics: topology(),
+    unknownUrn: UnknownUrnStrategy.DEAD_LETTER,
+    deadLetterObserver: seen.observer,
+  }).handle(payloadFor(envelope(0)));
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: a poison record is reported once with reason poison", async () => {
+  const seen = recorder();
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer: new FakeProducer(), retryTopics: topology(), deadLetterObserver: seen.observer }).handle(
+    rawPayload("not-json"),
+  );
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: a poison record of a retried topic reports the original topic", async () => {
+  const seen = recorder();
+  const payload = rawPayload("not-json", { "bq-original-topic": Buffer.from("orders") });
+  payload.topic = "orders.retry.1";
+  await new KafkaConsumer(new FakeConsumer(), {}, { producer: new FakeProducer(), retryTopics: topology(), deadLetterObserver: seen.observer }).handle(payload);
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "poison" }]);
+});
+
+test("observer: a version-gated raw record is reported once with an empty reason", async () => {
+  const seen = recorder();
+  await new KafkaConsumer(new FakeConsumer(), { [URN]: () => undefined }, { producer: new FakeProducer(), retryTopics: topology(), deadLetterObserver: seen.observer }).handle(
+    gatePayload("2"),
+  );
+  assert.deepEqual(seen.events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "" }]);
+});
+
+test("observer: a failed produce is not reported (all three write points)", async () => {
+  const seen = recorder();
+  const producer: KafkaProducerClient = { send: async () => { throw new Error("broker down"); } };
+  const options = { producer, retryTopics: topology(), maxTries: 3, deadLetterObserver: seen.observer };
+  await assert.rejects(new KafkaConsumer(new FakeConsumer(), failingHandlers, options).handle(payloadFor(envelope(2))), /broker down/);
+  await assert.rejects(new KafkaConsumer(new FakeConsumer(), {}, options).handle(rawPayload("not-json")), /broker down/);
+  await assert.rejects(new KafkaConsumer(new FakeConsumer(), {}, options).handle(gatePayload("2")), /broker down/);
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: not called on success, retry-tier republish, delete, release, or with no DLQ topic", async () => {
+  const seen = recorder();
+  const base = { producer: new FakeProducer(), retryTopics: topology(), deadLetterObserver: seen.observer };
+  await new KafkaConsumer(new FakeConsumer(), { [URN]: () => undefined }, base).handle(payloadFor(envelope(0)));
+  await new KafkaConsumer(new FakeConsumer(), failingHandlers, base).handle(payloadFor(envelope(0))); // retry tier
+  await new KafkaConsumer(new FakeConsumer(), {}, { ...base, unknownUrn: UnknownUrnStrategy.DELETE }).handle(payloadFor(envelope(0)));
+  await new KafkaConsumer(new FakeConsumer(), {}, { ...base, unknownUrn: UnknownUrnStrategy.RELEASE }).handle(payloadFor(envelope(0)));
+  const noDlq = { producer: new FakeProducer(), retryTopics: new RetryTopics("orders", [], null), deadLetterObserver: seen.observer };
+  await new KafkaConsumer(new FakeConsumer(), {}, noDlq).handle(rawPayload("not-json"));
+  await new KafkaConsumer(new FakeConsumer(), {}, noDlq).handle(gatePayload("2"));
+  await new KafkaConsumer(new FakeConsumer(), {}, { ...noDlq, unknownUrn: UnknownUrnStrategy.DEAD_LETTER }).handle(payloadFor(envelope(0)));
+  assert.deepEqual(seen.events, []);
+});
+
+test("observer: a throwing observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  await new KafkaConsumer(consumer, {}, {
+    producer,
+    retryTopics: topology(),
+    deadLetterObserver: () => { throw new Error("observer boom"); },
+  }).handle(rawPayload("not-json"));
+  assert.equal(producer.sent.length, 1);
+  assert.deepEqual(consumer.committed, [{ topic: "orders", partition: 0, offset: "5" }]);
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const consumer = new FakeConsumer();
+  const producer = new FakeProducer();
+  await new KafkaConsumer(consumer, { [URN]: () => undefined }, {
+    producer,
+    retryTopics: topology(),
+    deadLetterObserver: () => Promise.reject(new Error("async boom")),
+  }).handle(gatePayload("2"));
+  await settleTicks();
+  assert.equal(producer.sent.length, 1);
+  assert.equal(consumer.committed.length, 1);
+  assert.equal(warn.mock.callCount(), 1);
 });

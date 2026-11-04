@@ -50,7 +50,7 @@
  */
 
 import { BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, annotate, buildPoisonRecord } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
@@ -390,6 +390,20 @@ export interface AsbConsumerOptions {
    * receiver's `entityPath`, else the {@link deadLetterSender} entity path without its `.dlq` suffix.
    */
   queue?: string;
+  /**
+   * Called once per dead-letter the SDK itself carried out (ADR-0039 section 5.1), after it is confirmed:
+   * - a record written through {@link deadLetterSender} (the ADR-0035 poison record, `reason` `poison`; a version-gated
+   *   raw body, empty `reason`), after the send succeeded: `deadLetterQueue` is the sender's entity path;
+   * - the SDK-initiated native dead-letter of a version-gated delivery (no `deadLetterSender`), when the receiver has
+   *   `deadLetterMessage` and the call succeeded: `deadLetterQueue` and `reason` are empty (the broker's own
+   *   `$DeadLetterQueue`, no further attribute).
+   *
+   * It is NOT called for a failed send or a failed `deadLetterMessage`, for the abandon fallback of a receiver without
+   * `deadLetterMessage`, for a poison body without a `deadLetterSender` (abandoned; `MaxDeliveryCount` decides), or
+   * for a dead-letter the broker performs on its own. An error thrown, or a promise rejected, by the observer is logged
+   * (`console.warn`) and never changes the settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
 }
 
 /**
@@ -501,6 +515,8 @@ export class AsbConsumer {
           deadLetterReason: UNSUPPORTED_SCHEMA_VERSION_REASON,
           deadLetterErrorDescription: description,
         });
+        // The SDK-initiated native dead-letter, confirmed: `$DeadLetterQueue` is the broker's own, so no queue name.
+        this.notifyDeadLetter({ queue: this.sourceQueue(undefined), deadLetterQueue: "", reason: "" });
       } else {
         await this.receiver.abandonMessage(message);
       }
@@ -519,6 +535,7 @@ export class AsbConsumer {
       await this.receiver.abandonMessage(message); // unsettled: redelivered, the gate rejects it again, the write is retried
       return;
     }
+    this.notifyDeadLetter({ queue: this.sourceQueue(sender), deadLetterQueue: sender.entityPath, reason: "" });
     await this.receiver.completeMessage(message);
   }
 
@@ -552,6 +569,25 @@ export class AsbConsumer {
       await this.receiver.abandonMessage(message);
       return;
     }
+    this.notifyDeadLetter({ queue: this.sourceQueue(sender), deadLetterQueue: sender.entityPath, reason: "poison" });
     await this.receiver.completeMessage(message);
+  }
+
+  /** The source queue of a dead-letter: the configured queue, else the receiver's entity path, else the DLQ entity without `.dlq`. */
+  private sourceQueue(sender: AsbSender | undefined): string {
+    return this.options.queue ?? this.receiver.entityPath ?? (sender === undefined ? "" : stripDlqSuffix(sender.entityPath));
+  }
+
+  /** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+  private notifyDeadLetter(event: DeadLetterEvent): void {
+    const observer = this.options.deadLetterObserver;
+    if (!observer) return;
+    const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+    try {
+      const returned = observer(event);
+      if (returned && typeof returned.then === "function") returned.then(undefined, warn);
+    } catch (error) {
+      warn(error);
+    }
   }
 }

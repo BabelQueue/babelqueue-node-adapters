@@ -39,7 +39,7 @@
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, SCHEMA_VERSION, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { envelopeViolation, resolveIdentity } from "./envelope-shape.js";
 import { mergeInto } from "./headers.js";
@@ -548,6 +548,15 @@ export interface KafkaConsumerOptions {
   unknownUrn?: string;
   /** Called for a poison record, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, payload: EachMessagePayload) => void;
+  /**
+   * Called once per record this consumer wrote to the DLQ topic (`retryTopics.dlqTopic`), after the produce succeeds
+   * (ADR-0039 section 5.1): an exhausted retry (`failed`), an unknown URN under `dead_letter` (`unknown_urn`), a poison
+   * record (`poison`) and a version-gated raw record (empty `reason`). `queue` is the original topic. It is NOT called
+   * for a failed produce, when no DLQ topic is configured (the record is committed and dropped), or for a retry-tier
+   * republish. An error thrown, or a promise rejected, by the observer is logged (`console.warn`) and never changes the
+   * settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
 }
 
 // --- Poison handling (contract §6.5) --------------------------------------------
@@ -767,6 +776,7 @@ export class KafkaConsumer {
     const headers = kafkaHeaders(annotated);
     headers["bq-original-topic"] = original;
     await this.produce(dlq, annotated, headers, payload.message.key);
+    this.notifyDeadLetter({ queue: original, deadLetterQueue: dlq, reason });
   }
 
   /** Dead-letter a poison record (wrapped), commit it, then report: settle first so `onError` cannot bypass it. */
@@ -792,6 +802,7 @@ export class KafkaConsumer {
     const record = poisonRecord(payload.message.value ?? Buffer.alloc(0), cause, original, attempts);
     const headers = poisonHeaders(record, original, attempts);
     await this.produceRaw(dlq, record, headers, payload.message.key);
+    this.notifyDeadLetter({ queue: original, deadLetterQueue: dlq, reason: "poison" });
   }
 
   private async deadLetterRaw(payload: EachMessagePayload): Promise<void> {
@@ -809,6 +820,20 @@ export class KafkaConsumer {
     };
     if (message.key !== undefined && message.key !== null) forwarded.key = Buffer.from(message.key);
     await this.options.producer!.send({ topic: dlq, messages: [forwarded] });
+    this.notifyDeadLetter({ queue: this.originalTopic(payload), deadLetterQueue: dlq, reason: "" });
+  }
+
+  /** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+  private notifyDeadLetter(event: DeadLetterEvent): void {
+    const observer = this.options.deadLetterObserver;
+    if (!observer) return;
+    const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+    try {
+      const returned = observer(event);
+      if (isThenable(returned)) returned.then(undefined, warn);
+    } catch (error) {
+      warn(error);
+    }
   }
 
   /**

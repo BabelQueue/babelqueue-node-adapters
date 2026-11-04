@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-03
+
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `ArtemisConsumerOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per record written through
+  `deadLetterSender`, after the broker accepted the DLQ delivery: an exhausted retry (`failed`), an
+  unknown URN under `dead_letter` (`unknown_urn`), a poison record (`poison`) and a version-gated raw
+  body (empty `reason`). `deadLetterQueue` is the sender's `target.address` (empty when the sender does
+  not expose it; `AmqpSender` gains an optional `target`). It is not called for a failed or refused DLQ
+  write, when no `deadLetterSender` is set (the message is dropped) or for a release for redelivery. A
+  throwing or rejecting observer is logged with `console.warn` and never changes the settle outcome.
+  Optional: without it nothing changes. This feeds the `babelqueue.dlq.messages` counter of
+  `@babelqueue/core/otel` (`createDeadLetterObserver`).
+
+### Changed
+- `@babelqueue/core` dependency range raised from `^1.13.0` to `^1.14.0`.
+
 ## [1.3.0] - 2026-10-26
 
 ### Changed

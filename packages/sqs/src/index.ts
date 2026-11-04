@@ -66,7 +66,14 @@ import {
   retryBackoffBound,
   retryBackoffDelay,
 } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope, RetryBackoffOptions } from "@babelqueue/core";
+import type {
+  DeadLetterEvent,
+  DeadLetterObserver,
+  Envelope,
+  HeaderCarrier,
+  IncomingEnvelope,
+  RetryBackoffOptions,
+} from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
@@ -340,6 +347,14 @@ export interface SqsConsumerOptions extends RetryBackoffOptions {
    */
   deadLetterQueueUrl?: string | null;
   /**
+   * Called once per record this consumer wrote to {@link deadLetterQueueUrl}, after the `SendMessage` succeeds
+   * (ADR-0039 section 5.1): the `dead_letter` unknown-URN strategy, a poison body and a version-gated raw body (empty
+   * `reason`). `queue` and `deadLetterQueue` are queue names. It is NOT called for a failed send, when no DLQ URL is
+   * set (the queue's native `RedrivePolicy` moves the message, outside the SDK), or for a delete. An error thrown, or a
+   * promise rejected, by the observer is logged (`console.warn`) and never changes the settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
+  /**
    * Called for a non-conformant envelope, an unmapped URN (no `onUnknownUrn`), a throwing handler,
    * a throwing `onUnknownUrn` under an `unknownUrn` strategy, a failed release / dead-letter send, or
    * a failed delete after successful processing (an {@link SqsDeleteError} wrapping the broker
@@ -377,6 +392,18 @@ function hasRetryBackoff(options: RetryBackoffOptions): boolean {
     options.retryBackoffMax !== undefined ||
     options.retryJitter !== undefined
   );
+}
+
+/** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+function notifyDeadLetter(observer: DeadLetterObserver | undefined, event: DeadLetterEvent): void {
+  if (!observer) return;
+  const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+  try {
+    const pending = observer(event);
+    if (pending && typeof pending.then === "function") pending.then(undefined, warn);
+  } catch (error) {
+    warn(error);
+  }
 }
 
 /**
@@ -505,7 +532,7 @@ export class SqsConsumer {
     }
     if (!dlq) return; // native: SQS redelivers on visibility expiry, RedrivePolicy moves it after maxReceiveCount
     await this.guard({}, message, async () => {
-      await this.sendRaw(dlq, message, message.Body ?? "");
+      await this.sendRaw(dlq, message, message.Body ?? "", "");
       await this.deleteHandled(message);
     });
   }
@@ -532,19 +559,24 @@ export class SqsConsumer {
         exception: error.name,
       }).dead_letter;
       const record = buildPoisonRecord(Buffer.from(message.Body ?? "", "utf8"), JSON.stringify(deadLetter));
-      await this.sendRaw(dlq, message, record);
+      await this.sendRaw(dlq, message, record, "poison");
       await this.deleteHandled(message);
     });
   }
 
   /** Send `body` to the DLQ as is (a `.fifo` DLQ gets the source queue as group and a stable dedup id). */
-  private async sendRaw(dlq: string, message: SqsMessage, body: string): Promise<void> {
+  private async sendRaw(dlq: string, message: SqsMessage, body: string, reason: string): Promise<void> {
     const input: SendMessageInput = { QueueUrl: dlq, MessageBody: body };
     if (dlq.endsWith(".fifo")) {
       input.MessageGroupId = queueNameFromUrl(this.queueUrl);
       input.MessageDeduplicationId = message.MessageId ?? createHash("sha256").update(message.Body ?? "").digest("hex");
     }
     await this.client.sendMessage(input);
+    notifyDeadLetter(this.options.deadLetterObserver, {
+      queue: queueNameFromUrl(this.queueUrl),
+      deadLetterQueue: queueNameFromUrl(dlq),
+      reason,
+    });
   }
 
   /** The release delay (seconds) for a failed handler: `releaseDelay` (alias) wins, else the A9 backoff, else 0. */
@@ -635,6 +667,11 @@ export class SqsConsumer {
       if (annotated.meta?.id) input.MessageDeduplicationId = annotated.meta.id;
     }
     await this.client.sendMessage(input);
+    notifyDeadLetter(this.options.deadLetterObserver, {
+      queue: source,
+      deadLetterQueue: queueNameFromUrl(dlq),
+      reason,
+    });
   }
 
   /** Delete a message whose processing already succeeded; a broker failure becomes an SqsDeleteError. */

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 
 import {
   RabbitMQConsumer,
@@ -231,4 +231,101 @@ test("non-finite idle backoff bounds are rejected at construction", () => {
   assert.throws(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMinMs: Number.NaN }), /finite/);
   assert.throws(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMaxMs: Number.POSITIVE_INFINITY }), /finite/);
   assert.doesNotThrow(() => new RabbitMQConsumer(channel, "orders", {}, { idleBackoffMinMs: -5 }));
+});
+
+// --- dead-letter observer (ADR-0039 section 5.1) -------------------------------
+
+function recorder(): { events: DeadLetterEvent[]; observer: DeadLetterObserver } {
+  const events: DeadLetterEvent[] = [];
+  return { events, observer: (event) => { events.push(event); } };
+}
+
+const throwing = (): void => { throw new Error("observer boom"); };
+const settle = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+test("observer: a terminal failure is reported once with queue, dlq and reason", async () => {
+  const channel = new FakeChannel();
+  const { events, observer } = recorder();
+  await new RabbitMQConsumer(channel, "orders", { [URN]: () => { throw new Error("boom"); } }, { maxTries: 3, deadLetterObserver: observer }).handle(
+    incoming(envelope(2)),
+  );
+  assert.deepEqual(events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "failed" }]);
+});
+
+test("observer: an unknown URN under dead_letter is reported once", async () => {
+  const channel = new FakeChannel();
+  const { events, observer } = recorder();
+  await new RabbitMQConsumer(channel, "orders", {}, { unknownUrn: UnknownUrnStrategy.DEAD_LETTER, deadLetterObserver: observer }).handle(
+    incoming(envelope()),
+  );
+  assert.deepEqual(events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "unknown_urn" }]);
+});
+
+test("observer: a non-conformant body forwarded raw is reported once with an empty reason", async () => {
+  const channel = new FakeChannel();
+  const { events, observer } = recorder();
+  await new RabbitMQConsumer(channel, "orders", {}, { deadLetterObserver: observer }).handle({ content: Buffer.from("not-json", "utf8") });
+  assert.deepEqual(events, [{ queue: "orders", deadLetterQueue: "orders.dlq", reason: "" }]);
+});
+
+test("observer: a custom deadLetterQueue is reported", async () => {
+  const channel = new FakeChannel();
+  const { events, observer } = recorder();
+  await new RabbitMQConsumer(channel, "orders", { [URN]: () => { throw new Error("x"); } }, { maxTries: 1, deadLetterQueue: "graveyard", deadLetterObserver: observer }).handle(
+    incoming(envelope(0)),
+  );
+  assert.deepEqual(events, [{ queue: "orders", deadLetterQueue: "graveyard", reason: "failed" }]);
+});
+
+test("observer: not called on success, retry, drop (dlq null) or delete", async () => {
+  const { events, observer } = recorder();
+  const ok = new FakeChannel();
+  await new RabbitMQConsumer(ok, "orders", { [URN]: () => {} }, { deadLetterObserver: observer }).handle(incoming(envelope()));
+  const retry = new FakeChannel();
+  await new RabbitMQConsumer(retry, "orders", { [URN]: () => { throw new Error("x"); } }, { maxTries: 3, deadLetterObserver: observer }).handle(incoming(envelope(0)));
+  const drop = new FakeChannel();
+  await new RabbitMQConsumer(drop, "orders", { [URN]: () => { throw new Error("x"); } }, { maxTries: 1, deadLetterQueue: null, deadLetterObserver: observer }).handle(incoming(envelope(0)));
+  const dropRaw = new FakeChannel();
+  await new RabbitMQConsumer(dropRaw, "orders", {}, { deadLetterQueue: null, deadLetterObserver: observer }).handle({ content: Buffer.from("not-json", "utf8") });
+  const del = new FakeChannel();
+  await new RabbitMQConsumer(del, "orders", {}, { unknownUrn: UnknownUrnStrategy.DELETE, deadLetterObserver: observer }).handle(incoming(envelope()));
+  assert.deepEqual(events, []);
+});
+
+test("observer: not called when the DLQ write fails", async () => {
+  class FailingChannel extends FakeChannel {
+    override sendToQueue(queue: string, content: Buffer, options?: AmqpProperties): boolean {
+      if (queue === "orders.dlq") throw new Error("broker down");
+      return super.sendToQueue(queue, content, options);
+    }
+  }
+  const channel = new FailingChannel();
+  const { events, observer } = recorder();
+  await assert.rejects(
+    new RabbitMQConsumer(channel, "orders", { [URN]: () => { throw new Error("x"); } }, { maxTries: 1, deadLetterObserver: observer }).handle(incoming(envelope(0))),
+    /broker down/,
+  );
+  assert.deepEqual(events, []);
+  assert.equal(channel.acked, 0);
+});
+
+test("observer: a throwing observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const channel = new FakeChannel();
+  await new RabbitMQConsumer(channel, "orders", { [URN]: () => { throw new Error("x"); } }, { maxTries: 1, deadLetterObserver: throwing }).handle(incoming(envelope(0)));
+  assert.equal(channel.sent.filter((s) => s.queue === "orders.dlq").length, 1);
+  assert.equal(channel.acked, 1);
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test("observer: a rejecting observer does not change the settle outcome", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const channel = new FakeChannel();
+  await new RabbitMQConsumer(channel, "orders", {}, { deadLetterObserver: () => Promise.reject(new Error("async boom")) }).handle({
+    content: Buffer.from("not-json", "utf8"),
+  });
+  await settle();
+  assert.equal(channel.sent.filter((s) => s.queue === "orders.dlq").length, 1);
+  assert.equal(channel.acked, 1);
+  assert.equal(warn.mock.callCount(), 1);
 });

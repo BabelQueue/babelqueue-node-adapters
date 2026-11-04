@@ -9,6 +9,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-03
+
+### Added
+- **Dead-letter observer (ADR-0039 section 5.1).** `SqsConsumerOptions.deadLetterObserver` (the
+  `DeadLetterObserver` type from `@babelqueue/core`) is called once per record written to
+  `deadLetterQueueUrl`, after the `SendMessage` succeeds: the `dead_letter` unknown-URN strategy
+  (`unknown_urn`), a poison body (`poison`) and a version-gated raw body (empty `reason`). `queue` and
+  `deadLetterQueue` are queue names. It is not called for a failed send, without a DLQ URL (the queue's
+  `RedrivePolicy` moves the message outside the SDK), or for a delete or release. A throwing or rejecting
+  observer is logged with `console.warn` and never changes the settle outcome. Optional: without it
+  nothing changes. This feeds the `babelqueue.dlq.messages` counter of `@babelqueue/core/otel`
+  (`createDeadLetterObserver`).
+
+### Changed
+- `@babelqueue/core` dependency range raised from `^1.13.0` to `^1.14.0`.
+
 ## [1.4.0] - 2026-10-26
 
 ### Changed

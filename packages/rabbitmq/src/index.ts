@@ -25,7 +25,7 @@
  */
 
 import { annotate, BabelQueueError, EnvelopeCodec, UnknownUrnError, UnknownUrnStrategy } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
@@ -180,6 +180,24 @@ export interface RabbitMQConsumerOptions {
   idleBackoffMinMs?: number;
   /** Ceiling (ms) for the exponential idle backoff (default 1000). */
   idleBackoffMaxMs?: number;
+  /**
+   * Called once per dead-letter record this consumer wrote to the DLQ, after the write (ADR-0039 section 5.1).
+   * An error thrown, or a promise rejected, by the observer is logged (`console.warn`) and never changes the
+   * settle outcome. Never called when the write fails or when `deadLetterQueue` is `null` (the message is dropped).
+   */
+  deadLetterObserver?: DeadLetterObserver;
+}
+
+/** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+function notifyDeadLetter(observer: DeadLetterObserver | undefined, event: DeadLetterEvent): void {
+  if (!observer) return;
+  const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+  try {
+    const pending = observer(event);
+    if (pending && typeof pending.then === "function") pending.then(undefined, warn);
+  } catch (error) {
+    warn(error);
+  }
 }
 
 const DEFAULT_IDLE_BACKOFF_MIN_MS = 50;
@@ -320,11 +338,17 @@ export class RabbitMQConsumer {
       exception: error instanceof Error ? error.name : null,
     });
     this.channel.sendToQueue(this.dlq, Buffer.from(EnvelopeCodec.encode(annotated), "utf8"), amqpProperties(annotated));
+    notifyDeadLetter(this.options.deadLetterObserver, {
+      queue: envelope.meta?.queue ?? this.queue,
+      deadLetterQueue: this.dlq,
+      reason,
+    });
   }
 
   private async deadLetterRaw(raw: string): Promise<void> {
     if (!this.dlq) return;
     this.channel.sendToQueue(this.dlq, Buffer.from(raw, "utf8"));
+    notifyDeadLetter(this.options.deadLetterObserver, { queue: this.queue, deadLetterQueue: this.dlq, reason: "" });
   }
 
   private report(error: unknown, envelope: IncomingEnvelope | null, message: AmqpMessage): void {

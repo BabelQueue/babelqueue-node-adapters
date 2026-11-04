@@ -56,7 +56,7 @@ import {
   UnknownUrnError,
   UnknownUrnStrategy,
 } from "@babelqueue/core";
-import type { Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope, HeaderCarrier, IncomingEnvelope } from "@babelqueue/core";
 
 import { sanitizeHeaders } from "./headers.js";
 
@@ -101,6 +101,11 @@ export interface AmqpLinkEventContext {
 
 /** The subset of a rhea sender this adapter calls. */
 export interface AmqpSender {
+  /**
+   * Optional (a rhea sender has it): its `address` names the DLQ in a dead-letter observer event
+   * ({@link ArtemisConsumerOptions.deadLetterObserver}); empty when the sender does not expose it.
+   */
+  target?: { address?: string } | null;
   /** Queue a delivery. rhea returns the delivery synchronously; the broker's verdict arrives later as an event. */
   send(message: AmqpMessage): unknown;
   /**
@@ -467,6 +472,16 @@ export interface ArtemisConsumerOptions {
   queue?: string;
   /** Called for a non-conformant message, an unmapped URN, or a throwing handler. */
   onError?: (error: unknown, envelope: IncomingEnvelope | null, context: AmqpEventContext) => void;
+  /**
+   * Called once per record written through {@link deadLetterSender}, after the broker accepted the DLQ delivery
+   * (ADR-0039 section 5.1): an exhausted retry (`failed`), an unknown URN under `dead_letter` (`unknown_urn`), a poison
+   * record (`poison`) and a version-gated raw body (empty `reason`). `queue` is the source queue, `deadLetterQueue` the
+   * sender's `target.address` (empty when the sender does not expose it). It is NOT called for a failed or refused DLQ
+   * write (the message is released), when no `deadLetterSender` is set (the message is dropped), or for a release
+   * for redelivery. An error thrown, or a promise rejected, by the observer is logged (`console.warn`) and never changes
+   * the settle outcome.
+   */
+  deadLetterObserver?: DeadLetterObserver;
 }
 
 /**
@@ -552,7 +567,7 @@ export class ArtemisConsumer {
         delivery?.accept();
         return;
       case UnknownUrnStrategy.DEAD_LETTER:
-        await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(envelope, "unknown_urn"));
+        await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(context, envelope, "unknown_urn"));
         return;
       case UnknownUrnStrategy.RELEASE:
         delivery?.release({ delivery_failed: true });
@@ -572,7 +587,7 @@ export class ArtemisConsumer {
       // Release with delivery-failed leaves it for redelivery — the broker bumps delivery-count.
       delivery?.release({ delivery_failed: true });
     } else if (this.options.deadLetterSender) {
-      await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(envelope, "failed", error));
+      await this.settleAfterDeadLetter(context, envelope, () => this.deadLetter(context, envelope, "failed", error));
     } else {
       delivery?.accept(); // terminal, no DLQ → drop
     }
@@ -598,7 +613,7 @@ export class ArtemisConsumer {
     context.delivery?.accept();
   }
 
-  private async deadLetter(envelope: Envelope, reason: string, error?: unknown): Promise<void> {
+  private async deadLetter(context: AmqpEventContext, envelope: Envelope, reason: string, error?: unknown): Promise<void> {
     const sender = this.options.deadLetterSender;
     if (!sender) return;
     const original = envelope.meta?.queue ?? "";
@@ -608,6 +623,7 @@ export class ArtemisConsumer {
       exception: error instanceof Error ? error.name : null,
     });
     await sendConfirmed(sender, artemisMessage(annotated), this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
+    this.notifyDeadLetter({ queue: this.sourceQueue(context, envelope), deadLetterQueue: sender.target?.address ?? "", reason });
   }
 
   /**
@@ -626,7 +642,7 @@ export class ArtemisConsumer {
     }
     try {
       // The body as received (a data-section object or Buffer is forwarded as is, never decoded to text and back).
-      await this.sendToDeadLetter(this.options.deadLetterSender, { body: message.body ?? "" });
+      await this.sendToDeadLetter(this.options.deadLetterSender, { body: message.body ?? "" }, this.sourceQueue(context, null), "");
     } catch (dlqError) {
       this.safeReport(gateError, null, context);
       this.safeReport(dlqError, null, context);
@@ -663,7 +679,7 @@ export class ArtemisConsumer {
         exception: error.name,
       }).dead_letter;
       const record = buildPoisonRecord(messageBodyBytes(message), JSON.stringify(deadLetter));
-      await this.sendToDeadLetter(sender, { body: record });
+      await this.sendToDeadLetter(sender, { body: record }, this.sourceQueue(context, null), "poison");
     } catch (dlqError) {
       this.safeReport(dlqError, decoded, context);
       await this.releaseAfterBackoff(delivery);
@@ -673,8 +689,27 @@ export class ArtemisConsumer {
   }
 
   /** Send to the DLQ and wait for the broker's `accepted`. */
-  private sendToDeadLetter(sender: AmqpSender, message: AmqpMessage): Promise<void> {
-    return sendConfirmed(sender, message, this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
+  private async sendToDeadLetter(sender: AmqpSender, message: AmqpMessage, queue: string, reason: string): Promise<void> {
+    await sendConfirmed(sender, message, this.options.deadLetterTimeoutMs ?? DEFAULT_DLQ_CONFIRM_TIMEOUT_MS);
+    this.notifyDeadLetter({ queue, deadLetterQueue: sender.target?.address ?? "", reason });
+  }
+
+  /** The source queue of a dead-letter record: the envelope's `meta.queue`, else the configured or listened queue. */
+  private sourceQueue(context: AmqpEventContext, envelope: Envelope | null): string {
+    return envelope?.meta?.queue || this.options.queue || context.receiver?.source?.address || this.listenedQueue || "";
+  }
+
+  /** Call the dead-letter observer without letting it affect settlement: a throw or a rejection is logged, not propagated. */
+  private notifyDeadLetter(event: DeadLetterEvent): void {
+    const observer = this.options.deadLetterObserver;
+    if (!observer) return;
+    const warn = (error: unknown): void => console.warn(`BabelQueue: dead-letter observer failed: ${String(error)}`);
+    try {
+      const returned = observer(event);
+      if (returned && typeof returned.then === "function") returned.then(undefined, warn);
+    } catch (error) {
+      warn(error);
+    }
   }
 
   /** Plain `released` outcome (the broker's delivery counter is not touched), after the retry delay. */
