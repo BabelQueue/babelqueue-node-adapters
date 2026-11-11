@@ -265,6 +265,12 @@ export interface PublishOptions {
   headers?: HeaderCarrier;
 }
 
+/**
+ * Options for {@link KafkaPublisher.publishEnvelope}: {@link PublishOptions} minus `traceId`
+ * (a ready envelope already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
 /** Sends canonical-envelope messages to one Kafka work topic with the §6 projection. */
 export class KafkaPublisher {
   private constructor(
@@ -286,6 +292,17 @@ export class KafkaPublisher {
   /** Build + send the canonical envelope; returns the message id (`meta.id`). */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.workTopic, traceId: options.traceId });
+    return this.publishEnvelope(envelope, { delayMs: options.delayMs, headers: options.headers });
+  }
+
+  /**
+   * Send an already-built envelope exactly as given — `meta.id`, `trace_id` and any extension are
+   * encoded untouched, never rebuilt — with the §6 projection, the out-of-band `headers` and the
+   * optional `delayMs` retry-tier routing of {@link KafkaPublisher.publish}. Returns the message id
+   * (`meta.id`). This is the target for `@babelqueue/core/otel`'s `publish` send callback, so the
+   * producer span's `messaging.message.id` equals the wire `meta.id`.
+   */
+  async publishEnvelope(envelope: Envelope, options: PublishEnvelopeOptions = {}): Promise<string> {
     if (options.delayMs != null && options.delayMs > 0) {
       if (!this.retryTopics) {
         throw new BabelQueueError("Kafka has no native delayed delivery; a delay requires retry topics (none configured).");

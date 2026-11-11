@@ -84,9 +84,19 @@ fake in the unit suite — no RabbitMQ, no network.
 
 Cross-hop **span** linkage rides on the out-of-band `HeaderCarrier` from
 [`@babelqueue/core@^1.4.0`](https://www.npmjs.com/package/@babelqueue/core). Pass the carrier produced by
-`@babelqueue/core/otel`'s `publish` to this adapter's `publish({ headers })`; it is carried on
+`@babelqueue/core/otel`'s `publish` to this adapter's `publishEnvelope(envelope, { headers })`; it is carried on
 the native AMQP message header table (`properties.headers`), beside the contract `x-*` headers (the contract wins a key collision). On consume, the consumer surfaces a delivered message's headers to the handler's third argument (and a `headersOf(...)` extractor reads them back),
 so the core's `otel` `wrapHandler` starts the consumer span as a true **child** of the producer span.
+
+`publishEnvelope(envelope, options?)` sends an already-built envelope **as given** — `meta.id`, `trace_id` and extensions are never
+rebuilt (`options` is `publish`'s minus `traceId`) — and returns its `meta.id`. Hand the envelope the traced `publish`
+passes to its callback to it, so the producer span's `messaging.message.id` equals the `meta.id` on the wire; calling
+`publish(urn, data)` inside the callback would build a second envelope with a different id. `publish(urn, data, ...)`
+itself builds the envelope and delegates to `publishEnvelope`.
+
+`publishEnvelope` does **not** stamp `meta.queue` (the envelope is sent as given), so pass `queue` to the traced
+`publish` equal to this publisher's destination — the queue passed to `RabbitMQPublisher.create`. Without it `make` writes `meta.queue: "default"`: the span is
+named `send default`, and a dead-letter record's `original_queue` (and a redrive) points at the wrong queue.
 
 ```ts
 import { trace } from "@opentelemetry/api";
@@ -95,7 +105,7 @@ import type { HeaderCarrier } from "@babelqueue/core";
 
 const headers: HeaderCarrier = {};
 await tracedPublish(trace.getTracer("orders"), urn, data,
-  () => adapterPublish(urn, data, { headers }), { headers });
+  (envelope) => publisher.publishEnvelope(envelope, { headers }), { queue: "orders", headers });
 ```
 
 ## License

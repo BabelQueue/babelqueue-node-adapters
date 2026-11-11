@@ -784,6 +784,12 @@ export interface PublishOptions {
   delay?: number;
 }
 
+/**
+ * Options for {@link RedisPublisher.publishEnvelope}: {@link PublishOptions} minus `traceId`
+ * (a ready envelope already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
 /** Sends canonical-envelope messages to one Redis queue. */
 export class RedisPublisher {
   private readonly transport: RedisQueue;
@@ -808,14 +814,20 @@ export class RedisPublisher {
    * it goes to `<q>:delayed` instead of the ready list.
    */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
-    const delay = options.delay ?? 0;
-    if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
-      throw new BabelQueueError(`Invalid delay ${String(delay)}: must be a non-negative number of seconds.`);
-    }
-    if (delay > 0 && this.transport.layout !== "zset") {
-      throw new BabelQueueError("A delayed publish requires layout \"zset\"; the legacy layout has no delayed set.");
-    }
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
+    return this.publishEnvelope(envelope, { headers: options.headers, delay: options.delay });
+  }
+
+  /**
+   * Push an already-built envelope exactly as given — `meta.id`, `trace_id` and any extension are
+   * encoded untouched, never rebuilt. Same layout rules as {@link RedisPublisher.publish}: legacy
+   * layout frames a non-empty `headers` carrier (ADR-0028), zset layout drops it (A3) and honours
+   * `delay`. Returns the message id (`meta.id`). This is the target for `@babelqueue/core/otel`'s
+   * `publish` send callback, so the producer span's `messaging.message.id` equals the wire `meta.id`.
+   */
+  async publishEnvelope(envelope: Envelope, options: PublishEnvelopeOptions = {}): Promise<string> {
+    const delay = options.delay ?? 0;
+    this.assertDelay(delay);
     const body = redisValue(envelope);
     if (this.transport.layout === "zset") {
       if (delay > 0) await this.transport.pushDelayed(body, delay);
@@ -824,6 +836,15 @@ export class RedisPublisher {
       await this.transport.push(frameValue(body, options.headers));
     }
     return envelope.meta.id;
+  }
+
+  private assertDelay(delay: unknown): void {
+    if (typeof delay !== "number" || !Number.isFinite(delay) || delay < 0) {
+      throw new BabelQueueError(`Invalid delay ${String(delay)}: must be a non-negative number of seconds.`);
+    }
+    if (delay > 0 && this.transport.layout !== "zset") {
+      throw new BabelQueueError("A delayed publish requires layout \"zset\"; the legacy layout has no delayed set.");
+    }
   }
 }
 

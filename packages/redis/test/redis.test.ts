@@ -10,10 +10,14 @@ import {
   RedisQueue,
   frameValue,
   redisValue,
+  unframe,
   type BabelHandlers,
   type RedisClient,
   type Reservation,
 } from "../src/index.js";
+import { publish as otelPublish } from "@babelqueue/core/otel";
+
+import { producerMessageId, recordingTracer } from "../../../test-support/otel.js";
 import { FakeRedis } from "./fake-redis.js";
 import { assertPoisonRecord } from "./poison-assert.js";
 
@@ -605,4 +609,49 @@ test("observer: a throwing or rejecting observer does not change the settle outc
   assert.equal(warnings.length, 2);
   assert.match(warnings[0]!, /observer boom/);
   assert.match(warnings[1]!, /async boom/);
+});
+
+// --- publishEnvelope / otel seam (ADR-0038 messaging.message.id == wire meta.id) ----------
+
+test("publishEnvelope sends the given envelope unchanged: id, trace_id and extensions kept (GR-1/GR-4)", async () => {
+  const built = EnvelopeCodec.make("urn:babel:orders:created", { order_id: 7 }, { queue: "orders", traceId: "trace-ext", meta: { tenant: "acme" } });
+  const client = new FakeRedis();
+  const publisher = RedisPublisher.create(client, "orders");
+  const id = await publisher.publishEnvelope(built);
+  const wire = EnvelopeCodec.decode(unframe(client.pushed[0]!.value)[0]) as Envelope;
+  assert.deepEqual(wire, built);
+  assert.equal(wire.meta.id, built.meta.id);
+  assert.equal(wire.trace_id, "trace-ext");
+  assert.equal(wire.meta.schema_version, 1);
+  assert.equal(id, built.meta.id);
+});
+
+test("otel publish: the producer span's messaging.message.id equals the wire meta.id and traceparent rides out of band", async () => {
+  const { tracer, exporter } = recordingTracer();
+  const client = new FakeRedis();
+  const publisher = RedisPublisher.create(client, "orders");
+  const headers: Record<string, string> = {};
+  const id = await otelPublish(
+    tracer,
+    "urn:babel:orders:created",
+    { order_id: 7 },
+    (env) => publisher.publishEnvelope(env, { headers }),
+    { queue: "orders", headers },
+  );
+  const wire = EnvelopeCodec.decode(unframe(client.pushed[0]!.value)[0]) as Envelope;
+  assert.equal(producerMessageId(exporter), wire.meta.id);
+  assert.equal(id, wire.meta.id);
+  assert.equal(wire.trace_id.length > 0, true);
+  assert.match(headers["traceparent"] ?? "", /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  assert.equal(unframe(client.pushed[0]!.value)[1]["traceparent"], headers["traceparent"]);
+});
+
+test("publishEnvelope honours delay on the zset layout and rejects it on legacy, like publish", async () => {
+  const built = EnvelopeCodec.make(URN, { order_id: 7 }, { queue: "orders" });
+  const zset = new FakeRedis();
+  await RedisPublisher.create(zset, "orders", { layout: "zset" }).publishEnvelope(built, { delay: 30 });
+  assert.equal(zset.zadded.length, 1);
+  assert.equal(zset.zadded[0]!.key, "queues:orders:delayed");
+  assert.equal((EnvelopeCodec.decode(zset.zadded[0]!.member) as Envelope).meta.id, built.meta.id);
+  await assert.rejects(RedisPublisher.create(new FakeRedis(), "orders").publishEnvelope(built, { delay: 30 }), /zset/);
 });

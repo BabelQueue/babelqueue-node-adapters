@@ -6,6 +6,19 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+### Added
+- `publishEnvelope(queue, envelope, options?)`: sends an already-built envelope exactly as given (`meta.id`, `trace_id` and
+  extensions are never rebuilt), with the same out-of-band `headers` handling as `publish`. It is the target for
+  `@babelqueue/core/otel`'s `publish` send callback, so the producer span's `messaging.message.id` equals the wire
+  `meta.id`. `publish(urn, data, ...)` now builds the envelope and delegates to it — observable behaviour is unchanged.
+  Additive; no wire or envelope change (`schema_version` stays 1).
+
+### Changed
+- `publish` now names the job after the built envelope's `job` (the URN as `EnvelopeCodec.make` normalises it, i.e.
+  trimmed) instead of the raw `urn` argument. Only a URN with leading/trailing whitespace differs.
+- `publishEnvelope` rejects an envelope carrying a forbidden key (e.g. `timestamp`) with `InvalidEnvelopeKeyError`,
+  matching the other adapters.
+
 ## [1.3.0] - 2026-11-03
 
 ### Added

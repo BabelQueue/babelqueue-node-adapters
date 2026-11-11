@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
-import type { DeadLetterEvent, DeadLetterObserver } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
 import {
   SqsConsumer,
   SqsDeleteError,
@@ -14,6 +14,9 @@ import {
   type SqsApi,
   type SqsMessage,
 } from "../src/index.js";
+import { publish as otelPublish } from "@babelqueue/core/otel";
+
+import { producerMessageId, recordingTracer } from "../../../test-support/otel.js";
 
 const URL = "https://sqs.eu-central-1.amazonaws.com/123456789012/orders";
 
@@ -872,4 +875,39 @@ test("observer: a rejecting observer does not change the settle outcome", async 
   await settleTicks();
   assert.deepEqual(events, ["send", "delete"]);
   assert.equal(warn.mock.callCount(), 1);
+});
+
+// --- publishEnvelope / otel seam (ADR-0038 messaging.message.id == wire meta.id) ----------
+
+test("publishEnvelope sends the given envelope unchanged: id, trace_id and extensions kept (GR-1/GR-4)", async () => {
+  const built = EnvelopeCodec.make("urn:babel:orders:created", { order_id: 7 }, { queue: "orders", traceId: "trace-ext", meta: { tenant: "acme" } });
+  const sqs = fakeSqs();
+  const publisher = new SqsPublisher(sqs, URL);
+  const id = await publisher.publishEnvelope(built);
+  const wire = EnvelopeCodec.decode(sqs.sent[0]!.MessageBody) as Envelope;
+  assert.deepEqual(wire, built);
+  assert.equal(wire.meta.id, built.meta.id);
+  assert.equal(wire.trace_id, "trace-ext");
+  assert.equal(wire.meta.schema_version, 1);
+  assert.equal(id, built.meta.id);
+});
+
+test("otel publish: the producer span's messaging.message.id equals the wire meta.id and traceparent rides out of band", async () => {
+  const { tracer, exporter } = recordingTracer();
+  const sqs = fakeSqs();
+  const publisher = new SqsPublisher(sqs, URL);
+  const headers: Record<string, string> = {};
+  const id = await otelPublish(
+    tracer,
+    "urn:babel:orders:created",
+    { order_id: 7 },
+    (env) => publisher.publishEnvelope(env, { headers }),
+    { queue: "orders", headers },
+  );
+  const wire = EnvelopeCodec.decode(sqs.sent[0]!.MessageBody) as Envelope;
+  assert.equal(producerMessageId(exporter), wire.meta.id);
+  assert.equal(id, wire.meta.id);
+  assert.equal(wire.trace_id.length > 0, true);
+  assert.match(headers["traceparent"] ?? "", /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  assert.equal(sqs.sent[0]!.MessageAttributes!["traceparent"]?.StringValue, headers["traceparent"]);
 });

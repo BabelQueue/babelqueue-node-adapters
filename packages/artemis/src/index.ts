@@ -262,6 +262,12 @@ export interface PublishOptions {
   headers?: HeaderCarrier;
 }
 
+/**
+ * Options for {@link ArtemisPublisher.publishEnvelope}: {@link PublishOptions} minus `traceId`
+ * (a ready envelope already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
 /** Sends canonical-envelope messages to one Artemis address with the §7 projection. */
 export class ArtemisPublisher {
   private constructor(
@@ -277,6 +283,17 @@ export class ArtemisPublisher {
   /** Build + send the canonical envelope; returns the message id (`meta.id`). */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
+    return this.publishEnvelope(envelope, { delayMs: options.delayMs, headers: options.headers });
+  }
+
+  /**
+   * Send an already-built envelope exactly as given — `meta.id`, `trace_id` and any extension are
+   * encoded untouched, never rebuilt — with the §7 projection, the out-of-band `headers` and the
+   * optional `delayMs` scheduled delivery. Returns the message id (`meta.id`). This is the target
+   * for `@babelqueue/core/otel`'s `publish` send callback, so the producer span's
+   * `messaging.message.id` equals the wire `meta.id`.
+   */
+  async publishEnvelope(envelope: Envelope, options: PublishEnvelopeOptions = {}): Promise<string> {
     await this.sender.send(artemisMessage(envelope, options.delayMs, options.headers));
     return envelope.meta.id;
   }

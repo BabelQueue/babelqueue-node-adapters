@@ -89,7 +89,32 @@ export async function publish(
     queue: queue.name,
     traceId: options.traceId,
   });
-  await queue.add(urn, envelope, withHeaders(options.jobsOptions, options.headers));
+  return publishEnvelope(queue, envelope, { jobsOptions: options.jobsOptions, headers: options.headers });
+}
+
+/**
+ * Options for {@link publishEnvelope}: {@link PublishOptions} minus `traceId` (a ready envelope
+ * already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
+/**
+ * Add an already-built envelope as a BullMQ job exactly as given — `meta.id`, `trace_id` and any
+ * extension are carried untouched, never rebuilt (the job name is the URN, the job data is the
+ * envelope). Out-of-band `headers` go into `telemetry.metadata` as in {@link publish}. Returns the
+ * message id (`meta.id`); throws like the other adapters' `publishEnvelope` when the envelope carries a forbidden
+ * (ADR-0031 / §10) key. This is the target for `@babelqueue/core/otel`'s `publish` send callback,
+ * so the producer span's `messaging.message.id` equals the wire `meta.id`.
+ */
+export async function publishEnvelope(
+  queue: Queue,
+  envelope: Envelope,
+  options: PublishEnvelopeOptions = {},
+): Promise<string> {
+  // Same §10 guard as the other transports' encode path (forbidden keys, non-JSON values): the job data stays
+  // the envelope object itself, but a non-canonical envelope is rejected before it reaches Redis.
+  EnvelopeCodec.encode(envelope);
+  await queue.add(envelope.job, envelope, withHeaders(options.jobsOptions, options.headers));
   return envelope.meta.id;
 }
 
