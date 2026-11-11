@@ -18,6 +18,9 @@ import {
   type KafkaProducerMessage,
   type KafkaRedriveMessage,
 } from "../src/index.js";
+import { publish as otelPublish } from "@babelqueue/core/otel";
+
+import { producerMessageId, recordingTracer } from "../../../test-support/otel.js";
 
 const URN = "urn:babel:orders:created";
 
@@ -1576,4 +1579,47 @@ test("observer: a rejecting observer does not change the settle outcome", async 
   assert.equal(producer.sent.length, 1);
   assert.equal(consumer.committed.length, 1);
   assert.equal(warn.mock.callCount(), 1);
+});
+
+// --- publishEnvelope / otel seam (ADR-0038 messaging.message.id == wire meta.id) ----------
+
+test("publishEnvelope sends the given envelope unchanged: id, trace_id and extensions kept (GR-1/GR-4)", async () => {
+  const built = EnvelopeCodec.make("urn:babel:orders:created", { order_id: 7 }, { queue: "orders", traceId: "trace-ext", meta: { tenant: "acme" } });
+  const producer = new FakeProducer();
+  const publisher = KafkaPublisher.create(producer, "orders");
+  const id = await publisher.publishEnvelope(built);
+  const wire = EnvelopeCodec.decode(String(producer.sent[0]!.messages[0]!.value)) as Envelope;
+  assert.deepEqual(wire, built);
+  assert.equal(wire.meta.id, built.meta.id);
+  assert.equal(wire.trace_id, "trace-ext");
+  assert.equal(wire.meta.schema_version, 1);
+  assert.equal(id, built.meta.id);
+});
+
+test("otel publish: the producer span's messaging.message.id equals the wire meta.id and traceparent rides out of band", async () => {
+  const { tracer, exporter } = recordingTracer();
+  const producer = new FakeProducer();
+  const publisher = KafkaPublisher.create(producer, "orders");
+  const headers: Record<string, string> = {};
+  const id = await otelPublish(
+    tracer,
+    "urn:babel:orders:created",
+    { order_id: 7 },
+    (env) => publisher.publishEnvelope(env, { headers }),
+    { queue: "orders", headers },
+  );
+  const wire = EnvelopeCodec.decode(String(producer.sent[0]!.messages[0]!.value)) as Envelope;
+  assert.equal(producerMessageId(exporter), wire.meta.id);
+  assert.equal(id, wire.meta.id);
+  assert.equal(wire.trace_id.length > 0, true);
+  assert.match(headers["traceparent"] ?? "", /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  assert.equal(producer.sent[0]!.messages[0]!.headers!["traceparent"], headers["traceparent"]);
+});
+
+test("publishEnvelope routes delayMs through the retry tier like publish and raises without retry topics", async () => {
+  const built = EnvelopeCodec.make(URN, { order_id: 7 }, { queue: "orders" });
+  await assert.rejects(
+    KafkaPublisher.create(new FakeProducer(), "orders").publishEnvelope(built, { delayMs: 30000 }),
+    /retry topics/,
+  );
 });

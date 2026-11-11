@@ -2,10 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { EnvelopeCodec } from "@babelqueue/core";
-import type { DeadLetterEvent, DeadLetterObserver } from "@babelqueue/core";
-import { UnknownUrnError } from "@babelqueue/core";
+import type { DeadLetterEvent, DeadLetterObserver, Envelope } from "@babelqueue/core";
+import { InvalidEnvelopeKeyError, UnknownUrnError } from "@babelqueue/core";
 import { Queue, UnrecoverableError } from "bullmq";
-import { processor, publish } from "../src/index.js";
+import { decodeMetadata, processor, publish, publishEnvelope } from "../src/index.js";
+import { publish as otelPublish } from "@babelqueue/core/otel";
+
+import { producerMessageId, recordingTracer } from "../../../test-support/otel.js";
 
 // A duck-typed BullMQ Queue: records add() calls; no Redis.
 function fakeQueue(name = "orders") {
@@ -256,3 +259,44 @@ test(
     }
   },
 );
+
+// --- publishEnvelope / otel seam (ADR-0038 messaging.message.id == wire meta.id) ----------
+
+test("publishEnvelope sends the given envelope unchanged: id, trace_id and extensions kept (GR-1/GR-4)", async () => {
+  const built = EnvelopeCodec.make("urn:babel:orders:created", { order_id: 7 }, { queue: "orders", traceId: "trace-ext", meta: { tenant: "acme" } });
+  const queue = fakeQueue("orders");
+  const id = await publishEnvelope(queue as never, built);
+  const wire = EnvelopeCodec.decode(JSON.stringify(queue.added[0]!.data)) as Envelope;
+  assert.deepEqual(wire, built);
+  assert.equal(wire.meta.id, built.meta.id);
+  assert.equal(wire.trace_id, "trace-ext");
+  assert.equal(wire.meta.schema_version, 1);
+  assert.equal(id, built.meta.id);
+});
+
+test("otel publish: the producer span's messaging.message.id equals the wire meta.id and traceparent rides out of band", async () => {
+  const { tracer, exporter } = recordingTracer();
+  const queue = fakeQueue("orders");
+  const headers: Record<string, string> = {};
+  const id = await otelPublish(
+    tracer,
+    "urn:babel:orders:created",
+    { order_id: 7 },
+    (env) => publishEnvelope(queue as never, env, { headers }),
+    { queue: "orders", headers },
+  );
+  const wire = EnvelopeCodec.decode(JSON.stringify(queue.added[0]!.data)) as Envelope;
+  assert.equal(producerMessageId(exporter), wire.meta.id);
+  assert.equal(id, wire.meta.id);
+  assert.equal(wire.trace_id.length > 0, true);
+  assert.match(headers["traceparent"] ?? "", /^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/);
+  const metadata = (queue.added[0]!.opts as { telemetry?: { metadata?: string } }).telemetry?.metadata;
+  assert.equal(decodeMetadata(metadata)["traceparent"], headers["traceparent"]);
+});
+
+test("publishEnvelope rejects an envelope with a forbidden (§10) key before it reaches the queue, like the other adapters", async () => {
+  const queue = fakeQueue("orders");
+  const built = EnvelopeCodec.make("urn:babel:orders:created", { order_id: 7 }, { queue: "orders" });
+  await assert.rejects(publishEnvelope(queue as never, { ...built, timestamp: 1 } as unknown as Envelope), InvalidEnvelopeKeyError);
+  assert.equal(queue.added.length, 0);
+});

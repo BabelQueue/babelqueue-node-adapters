@@ -253,6 +253,12 @@ export interface PublishOptions {
   headers?: HeaderCarrier;
 }
 
+/**
+ * Options for {@link SqsPublisher.publishEnvelope}: {@link PublishOptions} minus `traceId`
+ * (a ready envelope already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
 /** Sends canonical-envelope messages to one SQS queue with the §3 attribute projection. */
 export class SqsPublisher {
   constructor(
@@ -274,6 +280,16 @@ export class SqsPublisher {
       queue: queueNameFromUrl(this.queueUrl),
       traceId: options.traceId,
     });
+    return this.publishEnvelope(envelope, { headers: options.headers });
+  }
+
+  /**
+   * Send an already-built envelope exactly as given — `meta.id`, `trace_id` and any extension are
+   * encoded untouched, never rebuilt — with the projected `MessageAttributes` and the out-of-band
+   * `headers`. Returns the message id (`meta.id`). This is the target for `@babelqueue/core/otel`'s
+   * `publish` send callback, so the producer span's `messaging.message.id` equals the wire `meta.id`.
+   */
+  async publishEnvelope(envelope: Envelope, options: PublishEnvelopeOptions = {}): Promise<string> {
     const input: SendMessageInput = {
       QueueUrl: this.queueUrl,
       MessageBody: EnvelopeCodec.encode(envelope),

@@ -125,6 +125,12 @@ export interface PublishOptions {
   headers?: HeaderCarrier;
 }
 
+/**
+ * Options for {@link RabbitMQPublisher.publishEnvelope}: {@link PublishOptions} minus `traceId`
+ * (a ready envelope already carries its own `trace_id`).
+ */
+export type PublishEnvelopeOptions = Omit<PublishOptions, "traceId">;
+
 /** Sends canonical-envelope messages to one RabbitMQ queue with the §2 projection. */
 export class RabbitMQPublisher {
   private constructor(
@@ -140,6 +146,16 @@ export class RabbitMQPublisher {
   /** Build + publish the canonical envelope; returns the message id (`meta.id`). */
   async publish(urn: string, data: Record<string, unknown>, options: PublishOptions = {}): Promise<string> {
     const envelope = EnvelopeCodec.make(urn, data, { queue: this.queue, traceId: options.traceId });
+    return this.publishEnvelope(envelope, { headers: options.headers });
+  }
+
+  /**
+   * Send an already-built envelope exactly as given — `meta.id`, `trace_id` and any extension are
+   * encoded untouched, never rebuilt — with the §2 projection and the out-of-band `headers`.
+   * Returns the message id (`meta.id`). This is the target for `@babelqueue/core/otel`'s `publish`
+   * send callback, so the producer span's `messaging.message.id` equals the wire `meta.id`.
+   */
+  async publishEnvelope(envelope: Envelope, options: PublishEnvelopeOptions = {}): Promise<string> {
     this.channel.sendToQueue(
       this.queue,
       Buffer.from(EnvelopeCodec.encode(envelope), "utf8"),

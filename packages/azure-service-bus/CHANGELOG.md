@@ -9,6 +9,13 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+- `AsbPublisher.publishEnvelope(envelope, options?)`: sends an already-built envelope exactly as given (`meta.id`, `trace_id` and
+  extensions are never rebuilt), with the same out-of-band `headers` handling as `publish`. It is the target for
+  `@babelqueue/core/otel`'s `publish` send callback, so the producer span's `messaging.message.id` equals the wire
+  `meta.id`. `publish(urn, data, ...)` now builds the envelope and delegates to it — observable behaviour is unchanged.
+  Additive; no wire or envelope change (`schema_version` stays 1).
+
 ## [1.4.0] - 2026-11-03
 
 ### Added
