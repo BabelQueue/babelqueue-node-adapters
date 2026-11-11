@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-11
+
 ### Added
 - `KafkaPublisher.publishEnvelope(envelope, options?)`: sends an already-built envelope exactly as given (`meta.id`, `trace_id` and
   extensions are never rebuilt), with the same out-of-band `headers` handling as `publish`. It is the target for

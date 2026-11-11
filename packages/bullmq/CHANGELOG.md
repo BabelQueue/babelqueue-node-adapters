@@ -6,6 +6,8 @@ All notable changes to `@babelqueue/bullmq` are documented here. The format foll
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-11
+
 ### Added
 - `publishEnvelope(queue, envelope, options?)`: sends an already-built envelope exactly as given (`meta.id`, `trace_id` and
   extensions are never rebuilt), with the same out-of-band `headers` handling as `publish`. It is the target for

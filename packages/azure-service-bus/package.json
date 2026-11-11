@@ -1,6 +1,6 @@
 {
   "name": "@babelqueue/azure-service-bus",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Azure Service Bus adapter for BabelQueue — canonical-envelope publisher and a URN-routed consumer.",
   "keywords": [
     "babelqueue",
