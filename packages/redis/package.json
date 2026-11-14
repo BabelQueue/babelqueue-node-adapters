@@ -53,10 +53,10 @@
     "@babelqueue/core": "^1.14.0"
   },
   "devDependencies": {
-    "ioredis": "^5.0.0"
+    "ioredis": "^6.0.0"
   },
   "peerDependencies": {
-    "ioredis": "^5.0.0"
+    "ioredis": "^6.0.0"
   },
   "peerDependenciesMeta": {
     "ioredis": {
